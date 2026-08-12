@@ -255,6 +255,14 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             continue;
         }
 
+        // CONVERSATION MODE (08-12, ALLOW_PLAIN_TEXT=true — second instance):
+        // personal threads reply like a friend, not a tool loop. Any plain-text
+        // reply is the final answer; fenced tool JSON still works when the
+        // model emits it (hybrid).
+        if (config.allowPlainText) {
+            return cleanWebchatText(response);
+        }
+
         // Always-tool mode: ANY plain-text reply is a format error, yap or not.
         // Progress reports get a sharper correction: DeepSeek's chat behavior is
         // to pause after tool work and summarize ("I added X, next I will Y") —
