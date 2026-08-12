@@ -1,0 +1,27 @@
+// ─────────────────────────────────────────────────────────────
+//  WEBCHAT CONFIG — the only file you need to touch.
+//  Copy this file to chat.js (gitignored — it holds YOUR thread URL
+//  and browser connection, which are machine-specific), then edit.
+//
+//  1. Open your webchat in a browser and copy the tab's URL.
+//  2. Paste it below.
+//  3. Start the server. Done.
+//
+//  Your login persists in .cookies.json after the first session,
+//  so you only log in manually once.
+// ─────────────────────────────────────────────────────────────
+module.exports = {
+    // Paste the URL of your webchat tab here (the full conversation
+    // URL or just the base like https://chat.deepseek.com):
+    url: 'https://chat.deepseek.com',
+
+    // ── OPTIONAL: reuse a tab that is ALREADY OPEN in your browser ──
+    // Launch your browser with --remote-debugging-port=9223, then paste
+    // the ws endpoint it prints (ws://127.0.0.1:9223/devtools/browser/…).
+    // The server will attach to your running browser and drive the tab
+    // matching `url` above — no login dance at all. The ws id changes on
+    // every Chrome relaunch: browser.js resolves the live id from
+    // http://127.0.0.1:9223/json/version on every attach, so the value
+    // below is only a FALLBACK.
+    cdpWsUrl: null,
+};
