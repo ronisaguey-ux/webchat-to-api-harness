@@ -285,6 +285,33 @@ async function sendMessage(input, text) {
                 if (btn) {
                     await btn.scrollIntoView();
                     await sleep(300);
+                    // ⚠️ STOP-MORPH GUARD (08-12): while a generation is running
+                    // the primary button morphs into STOP (same element, square
+                    // glyph). Clicking it then KILLS the live answer — observed
+                    // when a retried send landed mid-generation ("Stopped" toast,
+                    // the in-flight reply destroyed, the retry's prompt stranded).
+                    // A generation outliving its request happens when a client
+                    // disconnects mid-reply: the abort stops the gateway loop but
+                    // never stops the tab, so the next send's click is the first
+                    // thing to touch the running generation. Only click once the
+                    // button is back in SEND state (arrow glyph, d starts
+                    // M8.3125; any other glyph = busy/stop, wait for it).
+                    const sendGlyph = 'M8.3125';
+                    const isSendState = await page.evaluate((el) => {
+                        const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                        return d.startsWith('M8.3125');
+                    }, btn).catch(() => true);
+                    if (!isSendState) {
+                        console.log('🛑 send button in STOP state — waiting for generation to finish');
+                        for (let w = 0; w < 60; w++) {
+                            await sleep(1000);
+                            const ready = await page.evaluate((el) => {
+                                const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                                return d.startsWith('M8.3125');
+                            }, btn).catch(() => true);
+                            if (ready) break;
+                        }
+                    }
                     await btn.click();
                     return;
                 }
