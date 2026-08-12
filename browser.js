@@ -561,11 +561,44 @@ async function waitForResponse(before, typedText) {
         if (state.mode === 'vl' && lastText !== null && state.text !== lastText) {
             deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
         }
+        // Silent-generation signal (08-12 23:55): with DeepThink off the model
+        // cogitates SILENTLY — no text movement for minutes while the send
+        // button shows STOP (a generation is running). The text-activity reset
+        // above misses that, so long cogitations died on the 180s deadline
+        // with a complete answer arriving seconds later. Poll the button
+        // (handle-free): STOP state extends the deadline exactly like text
+        // activity does.
+        if (state.mode === 'vl') {
+            const busy = await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (!el) continue;
+                    const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                    return d.length > 0 && !d.startsWith('M8.3125');
+                }
+                return false;
+            }, config.selectors.send).catch(() => false);
+            if (busy) {
+                deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
+            }
+        }
         lastText = state.text;
         lastLen = state.text.length;
         if (state.mode === 'vl') lastAnswerLen = state.answer ? state.answer.length : -1;
         await sleep(1500);
     }
+    // Rescue (08-12): the deadline expired but a complete answer is sitting on
+    // the tab (the model finished just after the last poll). Deliver it
+    // instead of failing the request — the answer is real model output and
+    // the round logic (tool parse / format check) handles it normally.
+    try {
+        const last = await snapshotChat();
+        const ans = (last.answer || '').trim();
+        if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans)) {
+            console.log('⏱ timeout — rescuing the answer already on the tab');
+            return last.answer;
+        }
+    } catch {}
     throw new Error(`Timed out after ${config.timeout}ms waiting for a response`);
 }
 
