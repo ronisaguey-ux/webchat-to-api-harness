@@ -1,0 +1,5 @@
+node_modules/
+.env
+.cookies.json
+*.log
+chat.js
