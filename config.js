@@ -13,8 +13,20 @@ const cfg = {
     host: process.env.HOST || '127.0.0.1',
     port: parseInt(process.env.PORT) || 8080,
 
-    // Webchat target
-    webchatUrl: chat.url || process.env.WEBCHAT_URL || 'https://chat.deepseek.com',
+    // Webchat target — WEBCHAT_URL_OVERRIDE=true lets a second instance
+    // (different PORT) pin its own thread even though chat.js exists
+    // (chat.js normally wins). Multi-instance pattern 08-12.
+    webchatUrl: process.env.WEBCHAT_URL_OVERRIDE === 'true'
+        ? process.env.WEBCHAT_URL
+        : (chat.url || process.env.WEBCHAT_URL || 'https://chat.deepseek.com'),
+    // Second-instance tab matching: when set, pick the tab whose URL CONTAINS
+    // this substring instead of first-tab-with-matching-origin — lets two
+    // instances share one browser, each pinned to its own thread.
+    tabUrlSubstring: process.env.TAB_URL_SUBSTRING || null,
+    // Conversation mode (08-12): accept plain-text replies as the final answer
+    // instead of demanding fenced tool JSON — for personal threads whose model
+    // talks like a friend. Tool calls still work when the model makes them.
+    allowPlainText: process.env.ALLOW_PLAIN_TEXT === 'true',
     headless: process.env.HEADLESS === 'true',
     modelName: process.env.MODEL_NAME || 'anymodel',
     cdpWsUrl: chat.cdpWsUrl || process.env.CDP_WS_URL || null,

@@ -123,17 +123,29 @@ async function connectToWebchat(webchatUrl) {
 
     if (config.cdpWsUrl) {
         const pages = await browser.pages();
-        page =
-            pages.find((p) => p.url().startsWith(new URL(webchatUrl).origin)) ||
-            pages.find(
-                (p) =>
-                    p.url() !== 'about:blank' &&
-                    !p.url().startsWith('chrome://') &&
-                    !p.url().startsWith('devtools://')
-            );
-        if (!page) {
-            page = await browser.newPage();
-            await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // TAB_URL_SUBSTRING mode (second instance, 08-12): match the tab whose
+        // URL contains the pinned thread id, never an arbitrary deepseek tab —
+        // two gateway instances share one browser, each driving its own thread.
+        if (config.tabUrlSubstring) {
+            page = pages.find((p) => p.url().includes(config.tabUrlSubstring));
+            if (!page) {
+                console.log(`🆕 No tab matching ${config.tabUrlSubstring} — opening one`);
+                page = await browser.newPage();
+                await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            }
+        } else {
+            page =
+                pages.find((p) => p.url().startsWith(new URL(webchatUrl).origin)) ||
+                pages.find(
+                    (p) =>
+                        p.url() !== 'about:blank' &&
+                        !p.url().startsWith('chrome://') &&
+                        !p.url().startsWith('devtools://')
+                );
+            if (!page) {
+                page = await browser.newPage();
+                await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            }
         }
         console.log(`🟢 Reusing tab: ${page.url()}`);
         await waitForChatInput(page);
