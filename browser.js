@@ -234,32 +234,40 @@ async function sendPrompt(prompt, toolDefinitions) {
 // ⚠️ NEVER use page.keyboard.type() for multi-line prompts: it translates
 // "\n" into Enter keypresses, which SENDS the partial message mid-prompt.
 async function typePrompt(text) {
-    const input = await firstMatch(config.selectors.input);
-    if (!input) throw new Error('Chat input not found — is the session logged in?');
-
-    const set = await page.evaluate((el, t) => {
-        const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
-        if (desc && desc.set) {
-            desc.set.call(el, t);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            return true;
+    // 08-12 23:30 handle-free (see sendMessage): query the LIVE element inside
+    // the evaluate — no JSHandle args, nothing to detach when the SPA remounts
+    // the composer on the input event.
+    const set = await page.evaluate((sels, t) => {
+        for (const sel of sels) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+            if (desc && desc.set) {
+                desc.set.call(el, t);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                return true;
+            }
+            return false; // found an element but it's not a value-setter input
         }
         return false;
-    }, input, text);
+    }, config.selectors.input, text);
 
-    if (set) return input;
+    if (set) return;
 
     // contenteditable: focus, clear, then insertText — newlines are
     // inserted literally (sendCharacter never synthesizes Enter).
-    await input.scrollIntoView();
+    await page.evaluate((sels) => {
+        for (const sel of sels) {
+            const el = document.querySelector(sel);
+            if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return; }
+        }
+    }, config.selectors.input);
     await sleep(400);
-    await input.click();
     await page.keyboard.down('Control');
     await page.keyboard.press('KeyA');
     await page.keyboard.up('Control');
     await page.keyboard.press('Backspace');
     await page.keyboard.sendCharacter(text);
-    return input;
 }
 
 // ── Send: Enter on the focused input, click-fallback if it stays full. ──
@@ -276,26 +284,63 @@ async function typePrompt(text) {
 // RELOAD wipes the typed text entirely, so each retry re-checks the box and
 // re-types if it came back empty.
 async function sendMessage(input, text) {
+    // 08-12 23:30 HANDLE-FREE REWRITE: JSHandle-argument evaluates
+    // (page.evaluate(fn, elementHandle)) HANG on this DeepSeek build — the
+    // composer's input event remounts the textarea, the handle goes detached,
+    // and Chromium's callFunctionOn on a detached objectId times out at the
+    // 120s protocolTimeout instead of erroring (observed: every request dying
+    // on "Runtime.callFunctionOn timed out" while handle-free probes answered
+    // in milliseconds — the typed prompt sat in the composer unsent). This
+    // version uses page-level evaluates (querySelector inside, serializable
+    // args only), CDP Input for the Enter press, and page.mouse.click by
+    // fresh coordinates for the send button — no JSHandles, nothing to detach.
     for (let attempt = 0; ; attempt++) {
         try {
             // Headless tabs restore a deep scroll position (thread URL reload)
             // — the composer can be OFF-VIEWPORT (boundingBox y negative), and
-            // clicking an out-of-view element throws "Node is either not
-            // clickable or not an Element". Scroll it into view first.
-            await input.scrollIntoView();
+            // clicks on it throw "Node is either not clickable or not an
+            // Element". Scroll the LIVE composer into view and focus it.
+            await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return true; }
+                }
+                return false;
+            }, config.selectors.input);
             await sleep(400);
-            await input.click(); // focus without pressing the send button
             await page.keyboard.press('Enter');
             await sleep(1500);
             // If the text is still in the box, Enter didn't send — click the button.
-            const stillFull = await page.evaluate((el) => {
-                const v = el.value !== undefined ? el.value : el.innerText || '';
-                return v.trim().length > 0;
-            }, input);
+            const stillFull = await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (!el) continue;
+                    const v = el.value !== undefined ? el.value : el.innerText || '';
+                    if (v.trim().length > 0) return true;
+                }
+                return false;
+            }, config.selectors.input);
             if (stillFull) {
-                const btn = await firstMatch(config.selectors.send);
-                if (btn) {
-                    await btn.scrollIntoView();
+                const btnInfo = await page.evaluate((sels) => {
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        return { x: r.x + r.width / 2, y: r.y + r.height / 2, glyph: d.slice(0, 8) };
+                    }
+                    return null;
+                }, config.selectors.send);
+                if (btnInfo) {
+                    // scroll the button into view before clicking (off-viewport
+                    // clicks land nowhere)
+                    await page.evaluate((sels) => {
+                        for (const sel of sels) {
+                            const el = document.querySelector(sel);
+                            if (el) { el.scrollIntoView({ block: 'center' }); return; }
+                        }
+                    }, config.selectors.send);
                     await sleep(300);
                     // ⚠️ STOP-MORPH GUARD (08-12): while a generation is running
                     // the primary button morphs into STOP (same element, square
@@ -308,23 +353,45 @@ async function sendMessage(input, text) {
                     // thing to touch the running generation. Only click once the
                     // button is back in SEND state (arrow glyph, d starts
                     // M8.3125; any other glyph = busy/stop, wait for it).
-                    const sendGlyph = 'M8.3125';
-                    const isSendState = await page.evaluate((el) => {
-                        const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
-                        return d.startsWith('M8.3125');
-                    }, btn).catch(() => true);
-                    if (!isSendState) {
+                    let ready = btnInfo.glyph.startsWith('M8.3125');
+                    if (!ready) {
                         console.log('🛑 send button in STOP state — waiting for generation to finish');
-                        for (let w = 0; w < 60; w++) {
+                        for (let w = 0; w < 120; w++) {
                             await sleep(1000);
-                            const ready = await page.evaluate((el) => {
-                                const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
-                                return d.startsWith('M8.3125');
-                            }, btn).catch(() => true);
+                            ready = await page.evaluate((sels) => {
+                                for (const sel of sels) {
+                                    const el = document.querySelector(sel);
+                                    if (!el) continue;
+                                    const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                                    return d.startsWith('M8.3125');
+                                }
+                                return false;
+                            }, config.selectors.send);
                             if (ready) break;
                         }
+                        // 08-12 23:15 NEVER click a still-STOP button: the click
+                        // would STOP the live generation ("Stopped" toast, reply
+                        // destroyed) and wedge the next retry — the exact chain
+                        // that ate the 2nd session's requests after a mid-flight
+                        // kill. Fail fast instead; the generation keeps running,
+                        // the client's retry finds a clean SEND button.
+                        if (!ready) {
+                            throw new Error('webchat tab still generating from a previous request — retry after it finishes');
+                        }
                     }
-                    await btn.click();
+                    // Re-read fresh coordinates right before the click (the SPA
+                    // may have re-laid-out since the first read).
+                    const pos = await page.evaluate((sels) => {
+                        for (const sel of sels) {
+                            const el = document.querySelector(sel);
+                            if (!el) continue;
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                        }
+                        return null;
+                    }, config.selectors.send);
+                    if (!pos) throw new Error('send button vanished before click');
+                    await page.mouse.click(pos.x, pos.y);
                     return;
                 }
                 await page.keyboard.press('Enter');
@@ -333,19 +400,9 @@ async function sendMessage(input, text) {
         } catch (e) {
             const stale = /not clickable|not an Element|detached|context destroyed/i.test(e.message);
             if (!stale || attempt >= 2) throw e;
-            console.log(`🔄 send handle went stale — re-resolving input (attempt ${attempt + 2})`);
+            console.log(`🔄 send flow hit a stale handle — re-typing (attempt ${attempt + 2})`);
             await sleep(1500);
-            const fresh = await firstMatch(config.selectors.input);
-            if (!fresh) throw e;
-            const empty = await page.evaluate((el) => {
-                const v = el.value !== undefined ? el.value : el.innerText || '';
-                return v.trim().length === 0;
-            }, fresh);
-            input = fresh;
-            if (empty) {
-                console.log('🔄 composer was wiped (SPA reload?) — re-typing');
-                input = await typePrompt(text);
-            }
+            input = await typePrompt(text);
         }
     }
 }
