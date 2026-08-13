@@ -176,6 +176,24 @@ function buildExecutableToolDefs() {
 // reasoning BODY is handled upstream: browser.js's snapshotChat removes the
 // .ds-think-content block from the extracted answer (08-12 — it was poison-
 // ing parseToolCall with prose braces and every tool call got rejected).
+
+// 08-13: last-resort rescue for submit_answer envelopes that even the
+// brace-repairing parser rejected (cut mid-string, artifacts mangled, etc.).
+// Pulls the text field out of the "tool":"submit_answer" envelope WITHOUT
+// requiring the surrounding JSON to parse — a broken row degrades to its
+// answer text instead of leaking the raw envelope to the client.
+function extractSubmitText(text) {
+    if (typeof text !== 'string') return null;
+    const m = text.match(/"tool"\s*:\s*"submit_answer"[\s\S]*?"text"\s*:\s*"((?:[^"\\]|\\[\s\S])*)"/);
+    if (!m) return null;
+    return m[1]
+        .replace(/\\n/g, '\n')
+        .replace(/\\r/g, '\r')
+        .replace(/\\t/g, '\t')
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\')
+        .trim() || null;
+}
 function cleanWebchatText(text) {
     if (typeof text !== 'string') return text;
     return text
@@ -227,7 +245,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // whether the request needed work — no min-call gate).
             if (parsed.toolName === SUBMIT_TOOL) {
                 const answer = cleanWebchatText(parsed.args?.text ?? parsed.args?.message ?? parsed.args?.content ?? '');
-                return answer || response;
+                return answer || extractSubmitText(response) || response;
             }
             const result = await executeTool(parsed.toolName, parsed.args);
             onProgress?.({ type: 'tool', name: parsed.toolName, args: parsed.args });
@@ -258,8 +276,19 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // CONVERSATION MODE (08-12, ALLOW_PLAIN_TEXT=true — second instance):
         // personal threads reply like a friend, not a tool loop. Any plain-text
         // reply is the final answer; fenced tool JSON still works when the
-        // model emits it (hybrid).
+        // model emits it (hybrid). 08-13: the model DOES emit submit_answer
+        // JSON here (the thread's wrapper rows keep advertising tools), and a
+        // brace-truncated envelope used to leak VERBATIM as
+        // `jsonCopyDownload{...}` — parse it like always-tool mode does, and
+        // rescue the text field if even that fails.
         if (config.allowPlainText) {
+            const parsed = parseToolCall(response);
+            if (parsed.isToolCall && parsed.toolName === SUBMIT_TOOL) {
+                const answer = cleanWebchatText(parsed.args?.text ?? parsed.args?.message ?? parsed.args?.content ?? '');
+                return answer || response;
+            }
+            const rescued = extractSubmitText(response);
+            if (rescued !== null) return rescued;
             return cleanWebchatText(response);
         }
 
