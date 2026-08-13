@@ -121,6 +121,16 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 - **One tab = one conversation.** Requests are serialized through a queue;
   concurrent conversations need separate instances (different `PORT` +
   `WEBCHAT_URL`, own directory).
+- **Context handoff** (2026-08-13): the gateway roughly accounts for the
+  context it feeds the webchat model in one request (chars/4 ≈ tokens, tool
+  sections counted on every round). When the running total crosses
+  `CONTEXT_HANDOFF_THRESHOLD` (default `100000`, ≈78% of DeepSeek's 128K
+  window), it stops the tool loop, prompts the model to write a complete
+  `handoff_to_new_chat.md` document, opens a **new chat** in the same tab,
+  and sends the document as its first message. The thread pins are swapped
+  automatically (`chat.js` + the supervisor's `WEBCHAT_URL`/`TAB_URL_SUBSTRING`
+  line, if present) so respawns follow the new thread; the running instance
+  re-targets itself immediately. Disable with `CONTEXT_HANDOFF_ENABLED=false`.
 
 ## Configuration
 
@@ -138,6 +148,9 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 | `EXEC_TIMEOUT_MS` | `10000` | per-command bash timeout |
 | `SKIP_BROWSER` | `false` | run server without a browser (testing) |
 | `SELECTOR_*` | see `config.js` | comma-separated CSS selector lists, first match wins |
+| `CONTEXT_HANDOFF_ENABLED` | `true` | auto-swap to a new chat at the context threshold |
+| `CONTEXT_HANDOFF_THRESHOLD` | `100000` | rough per-request context estimate that triggers the handoff (chars/4 ≈ tokens) |
+| `HANDOFF_FILE` | `/home/roni/Roni_workspace/handoff_to_new_chat.md` | where the handoff document is written |
 
 ## Troubleshooting
 

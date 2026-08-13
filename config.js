@@ -31,6 +31,16 @@ const cfg = {
     modelName: process.env.MODEL_NAME || 'anymodel',
     cdpWsUrl: chat.cdpWsUrl || process.env.CDP_WS_URL || null,
 
+    // Context handoff (08-13): when the estimated context fed to the webchat
+    // model in one request crosses the threshold, the gateway stops the tool
+    // loop, has the model write a handoff document, opens a NEW chat in the
+    // same tab, and seeds it with the document as the first message. Rough
+    // accounting: chars/4 ≈ tokens. Default 100000 ≈ 78% of DeepSeek's 128K
+    // window, leaving headroom for the handoff write + final summary.
+    contextHandoffEnabled: process.env.CONTEXT_HANDOFF_ENABLED !== 'false',
+    contextHandoffThreshold: parseInt(process.env.CONTEXT_HANDOFF_THRESHOLD) || 100000,
+    handoffFile: process.env.HANDOFF_FILE || '/home/roni/Roni_workspace/handoff_to_new_chat.md',
+
     // Behaviour
     timeout: parseInt(process.env.TIMEOUT) || 180000, // Gemini cogitates for minutes — 60s was too short
     toolContextWindow: parseInt(process.env.TOOL_CONTEXT_WINDOW) || 30000, // Claude Code's tool list + schemas is ~20K chars

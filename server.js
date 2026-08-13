@@ -1,8 +1,14 @@
+const fs = require('fs');
+const path = require('path');
+const { spawn, spawnSync } = require('child_process');
 const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
 const config = require('./config');
-const { initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage } = require('./browser');
+const {
+    initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
+    buildFullPrompt, openNewChatAndSeed,
+} = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 
 const app = express();
@@ -255,7 +261,19 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         return null;
     }
 
-    let response = await sendPrompt(prompt, toolDefs);
+    // Context-handoff accounting (08-13): every sendPrompt's FULL built prompt
+    // (tool section included) plus every model reply counts toward the rough
+    // per-request context estimate. When it crosses the threshold the loop
+    // stops and the handoff flow takes over (see runContextHandoff).
+    let cycleTokens = 0;
+    const countedSend = async (msg, defs) => {
+        cycleTokens += estimateTokens(msg) + TOOL_SECTION_TOKENS;
+        const r = await sendPrompt(msg, defs);
+        cycleTokens += estimateTokens(r);
+        return r;
+    };
+
+    let response = await countedSend(prompt, toolDefs);
 
     // Harness protocol (08-13): the model interleaves plain-text messages with
     // tool calls — "what I'm about to do" → tool call → result → next call →
@@ -265,12 +283,18 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     // attempt gets a correction — never a raw leak to the client.
     let proseRounds = 0;      // conversation mode: consecutive prose-only replies
     let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
+    let lastToolInfo = null;  // most recent executed call, for the handoff doc
 
     for (let round = 0; round < config.maxToolRounds; round++) {
         // Client disconnect (interrupt/close) — stop feeding the webchat tab.
         if (isAborted?.()) {
             console.log(`🔴 client disconnected — aborting webchat loop (round ${round + 1})`);
             return null;
+        }
+        // Context limit crossed (rough threshold) — hand off to a new chat.
+        if (config.contextHandoffEnabled && cycleTokens >= config.contextHandoffThreshold) {
+            console.log(`📈 context threshold crossed (est. ${cycleTokens} ≥ ${config.contextHandoffThreshold}) — handing off`);
+            return runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo });
         }
         const parsed = parseToolCalls(response);
 
@@ -290,6 +314,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 return answer || extractSubmitText(response) || '[webchat model submitted an empty answer]';
             }
             onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
+            lastToolInfo = { tool: call.toolName, args: call.args };
             const result = await executeTool(call.toolName, call.args);
             // NEVER tell the model it's done after a tool result (08-12:
             // "Now give your final answer" made DeepSeek finalize after the
@@ -320,7 +345,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                       'Large files: read_file accepts an optional maxLength to read just the head of a huge file ' +
                       '(re-read without maxLength for the complete file before rewriting it). ' +
                       'The next step: fenced {"tool":"<name>","params":{...}}.');
-            response = await sendPrompt(followUp, toolDefs);
+            response = await countedSend(followUp, toolDefs);
             continue;
         }
 
@@ -333,7 +358,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             malformedRounds++;
             console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent`);
             onProgress?.({ type: 'rejected', text: 'malformed tool JSON — correction sent' });
-            response = await sendPrompt(MALFORMED_MSG, toolDefs);
+            response = await countedSend(MALFORMED_MSG, toolDefs);
             continue;
         }
 
@@ -349,7 +374,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             if (proseRounds < 2) {
                 proseRounds++;
                 if (prose) onProgress?.({ type: 'text', text: prose });
-                response = await sendPrompt(PROSE_NUDGE, toolDefs);
+                response = await countedSend(PROSE_NUDGE, toolDefs);
                 continue;
             }
             return finalAnswerFor(prose);
@@ -365,7 +390,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             const yap = looksLikeYap(response);
             console.log(`⚠️ webchat replied without tool JSON (round ${round + 1})${yap ? ' [progress-report yap]' : ''} — sending FORMAT ERROR`);
             onProgress?.({ type: 'rejected', text: yap ? 'plain-text progress report — rejected, demanding the next tool call' : 'plain-text reply — format error sent, demanding fenced tool JSON' });
-            response = await sendPrompt(yap ? YAP_ERROR_MSG : FORMAT_ERROR_MSG, toolDefs);
+            response = await countedSend(yap ? YAP_ERROR_MSG : FORMAT_ERROR_MSG, toolDefs);
             continue;
         }
         // Corrections exhausted — surface a SHORT marker. The model's raw
@@ -469,6 +494,202 @@ const YAP_ERROR_MSG =
     'the entire task is complete and verified, submit_answer. Do not narrate. Do it.';
 
 // ──────────────────────────────────────────────────────
+// CONTEXT HANDOFF (08-13)
+//    Rough threshold: chars/4 ≈ tokens. Every sendPrompt's FULL built prompt
+//    (tool section included) plus every model reply is counted; when the
+//    running request's total crosses the threshold, the tool loop stops, the
+//    model writes a handoff document, the tab opens a NEW chat, and the
+//    document goes in as the first message. Pins (chat.js + supervisor) are
+//    swapped so every respawn path follows the new thread.
+// ──────────────────────────────────────────────────────
+function estimateTokens(s) {
+    return Math.ceil(String(s).length / 4);
+}
+
+// One-off measurement of the per-send tool section (schema text + reminder),
+// counted on every round because buildFullPrompt re-includes it each time.
+const TOOL_SECTION_TOKENS = (() => {
+    try { return estimateTokens(buildFullPrompt('', buildExecutableToolDefs())); } catch { return 1000; }
+})();
+
+function buildHandoffPrompt(lastToolInfo) {
+    return '### CONTEXT LIMIT — HANDOFF MODE\n' +
+        'The conversation has reached its context-window threshold and cannot continue. STOP the current task.\n' +
+        (lastToolInfo
+            ? 'Your most recent work was: ' + JSON.stringify(lastToolInfo).slice(0, 1500) + '\n'
+            : '') +
+        'Write a COMPLETE handoff document so a brand-new chat can continue seamlessly. Use the write_file tool ' +
+        `with EXACTLY this path: ${config.handoffFile}\n` +
+        'The document (markdown) must contain:\n' +
+        '1. The current task and exactly how far it has progressed\n' +
+        '2. Every file created or changed so far (path + one line on what it does)\n' +
+        '3. Key decisions and why\n' +
+        '4. Commands run and their important results\n' +
+        '5. The remaining steps, in order\n' +
+        '6. Anything you were mid-way through\n' +
+        'Then reply with a fenced submit_answer whose text is a one-line confirmation: "Handoff written".';
+}
+
+// Ask the model for the handoff document (≤6 rounds: write_file the doc, then
+// submit_answer). Returns the document CONTENT, or null if the client aborted.
+async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo }) {
+    let response = await sendPrompt(buildHandoffPrompt(lastToolInfo), toolDefs);
+    let handoffPath = null;
+    for (let round = 0; round < 6; round++) {
+        if (isAborted?.()) return null;
+        const parsed = parseToolCalls(response);
+        if (parsed.toolCalls.length) {
+            const call = parsed.toolCalls[0];
+            if (call.toolName === SUBMIT_TOOL) break;
+            onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
+            const result = await executeTool(call.toolName, call.args);
+            const p = String(call.args?.path || '');
+            if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
+            response = await sendPrompt(
+                `Tool call "${call.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
+                'The task is: write the handoff document via write_file (if you have not yet) at EXACTLY ' +
+                `${config.handoffFile}, then reply with a fenced submit_answer — one line confirming the path.`,
+                toolDefs
+            );
+            continue;
+        }
+        if (looksLikeBrokenToolJson(response) && round < 2) {
+            response = await sendPrompt(MALFORMED_MSG, toolDefs);
+            continue;
+        }
+        if (round < 2) {
+            response = await sendPrompt(PROSE_NUDGE, toolDefs);
+            continue;
+        }
+        break;
+    }
+
+    // Read the document back (the model's tracked path first, the configured
+    // path second; fall back to a gateway-built summary).
+    let content = '';
+    for (const p of [handoffPath, config.handoffFile]) {
+        if (!p) continue;
+        try {
+            content = fs.readFileSync(p, 'utf8');
+        } catch { /* try next */ }
+        if (content && content.trim().length > 20) break;
+        content = '';
+    }
+    if (!content.trim()) {
+        content = '# Context handoff (automatic)\n\n' +
+            'The webchat reached its context limit before the model produced a full document.\n\n' +
+            `- User's request: ${(userPrompt || '').slice(0, 400)}\n` +
+            `- Last tool work: ${lastToolInfo ? JSON.stringify(lastToolInfo).slice(0, 1500) : 'none recorded'}\n\n` +
+            '_(auto-generated by the gateway context-handoff)_\n';
+    }
+    return content;
+}
+
+// Full handoff sequence: doc → fresh chat → seed → re-pin this instance →
+// persist pins for respawns. Returns the client-facing summary (or null).
+async function runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo }) {
+    onProgress?.({ type: 'text', text: '⚠️ context threshold reached — generating handoff document' });
+    const content = await runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo });
+    if (content === null) return null;
+
+    // Old thread id BEFORE navigating away (the tab's URL is the only source).
+    const oldUrl = getPage()?.url() || config.webchatUrl;
+    const oldId = (oldUrl.match(/\/a\/chat\/s\/([0-9a-f-]+)/) || [])[1] || config.tabUrlSubstring;
+
+    onProgress?.({ type: 'text', text: '💬 handoff written — opening a new chat' });
+    const { url: newUrl } = await openNewChatAndSeed(content);
+    const newId = (newUrl.match(/\/a\/chat\/s\/([0-9a-f-]+)/) || [])[1];
+
+    // Re-target THIS instance: the next request lands on the new thread.
+    if (newId) config.tabUrlSubstring = newId;
+    config.webchatUrl = newUrl;
+    console.log(`🔁 Thread swap: ${oldId} → ${newUrl}`);
+
+    // Persist the swap for respawns (chat.js + the supervisor's pin line).
+    const changed = persistThreadSwap(oldId, newId, newUrl);
+    if (changed.length) onProgress?.({ type: 'text', text: `💬 swap persisted (${changed.join(', ')})` });
+
+    return 'Context limit reached — the conversation was handed off to a new chat automatically.\n\n' +
+        `- Handoff document: ${config.handoffFile}\n` +
+        `- New thread: ${newUrl}\n` +
+        `- New thread id: ${newId || 'unknown'}\n` +
+        `- Handoff sent as the new chat's first message: yes\n` +
+        (changed.length ? `- Respawn pins updated: ${changed.join(', ')}\n` : '') +
+        '\nContinue the conversation normally — the new chat received the full handoff.';
+}
+
+// ── Persist a thread swap so respawns follow the new chat ──
+// chat.js (bare-start default) and the supervisor's WEBCHART_URL / TAB_URL_SUBSTRING
+// pins (env-override instances). Only lines referencing the OLD thread id are
+// touched — a scratch/test instance can never move the live pins. The supervisor
+// parses its script once at start, so it is restarted (kill → verify → relaunch →
+// verify) for the new pin to take effect; ensure() is idempotent and the gap is ~2s.
+function persistThreadSwap(oldId, newId, newUrl) {
+    if (!oldId || !newId || !newUrl) return [];
+    const supervisor = '/home/roni/Roni_Workspace/oculus/scripts/stack_supervisor.sh';
+    const chatJs = path.join(__dirname, 'chat.js');
+    const changed = [];
+    try {
+        const sv = fs.readFileSync(supervisor, 'utf8');
+        if (sv.includes(oldId)) {
+            fs.writeFileSync(supervisor, sv
+                .split('WEBCHAT_URL=https://chat.deepseek.com/a/chat/s/' + oldId).join('WEBCHAT_URL=' + newUrl)
+                .split('TAB_URL_SUBSTRING=' + oldId).join('TAB_URL_SUBSTRING=' + newId));
+            changed.push('stack_supervisor.sh');
+            console.log(`📝 supervisor pin: ${oldId} → ${newId}`);
+        }
+    } catch (e) {
+        console.warn('⚠️ supervisor pin update failed:', e.message);
+    }
+    try {
+        const cj = fs.readFileSync(chatJs, 'utf8');
+        if (cj.includes(oldId)) {
+            fs.writeFileSync(chatJs, cj.split('https://chat.deepseek.com/a/chat/s/' + oldId).join(newUrl));
+            changed.push('chat.js');
+            console.log(`📝 chat.js pin: ${oldId} → ${newId}`);
+        }
+    } catch (e) {
+        console.warn('⚠️ chat.js pin update failed:', e.message);
+    }
+    if (changed.includes('stack_supervisor.sh')) restartSupervisor();
+    return changed;
+}
+
+function restartSupervisor() {
+    // Anchored pattern (self-match trap): node's own cmdline is "node
+    // server.js", and pkill excludes itself — nothing can match the pattern
+    // but the supervisor process(es).
+    try {
+        spawnSync('pkill', ['-f', 'stack_supervisor[.]sh']);
+        for (let w = 0; w < 10; w++) {
+            const alive = spawnSync('pgrep', ['-f', 'stack_supervisor[.]sh']);
+            if (alive.status !== 0) break; // no match → down
+            spawnSync('sleep', ['0.5']);
+        }
+    } catch (e) {
+        console.warn('⚠️ supervisor restart (kill) failed:', e.message);
+        return;
+    }
+    const launch = () => {
+        const child = spawn('bash', ['/home/roni/Roni_Workspace/oculus/scripts/stack_supervisor.sh'], {
+            detached: true,
+            stdio: 'ignore',
+        });
+        child.unref();
+        setTimeout(() => {
+            const up = spawnSync('pgrep', ['-f', 'stack_supervisor[.]sh']);
+            if (up.status !== 0) {
+                console.warn('⚠️ supervisor did not come up — relaunching once');
+                launch();
+            } else {
+                console.log('🔄 supervisor restarted — new thread pin live');
+            }
+        }, 2500);
+    };
+    launch();
+}
+
+// ──────────────────────────────────────────────────────
 // ENDPOINTS
 // ──────────────────────────────────────────────────────
 app.get('/status', async (req, res) => {
@@ -483,6 +704,11 @@ app.get('/status', async (req, res) => {
         connected,
         webchatUrl: config.webchatUrl,
         tools: getToolDefinitions().length,
+        contextHandoff: {
+            enabled: config.contextHandoffEnabled,
+            threshold: config.contextHandoffThreshold,
+            handoffFile: config.handoffFile,
+        },
         timestamp: new Date().toISOString(),
     });
 });
@@ -619,7 +845,9 @@ app.post('/v1/messages', async (req, res) => {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
-        const ev = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        // Never write after the client left (mid-handoff swaps run long) —
+        // res.write on an ended response fires an unhandled stream error.
+        const ev = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
 
         ev('message_start', {
             type: 'message_start',
