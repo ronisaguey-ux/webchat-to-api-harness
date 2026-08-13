@@ -28,7 +28,7 @@ const cfg = {
     // talks like a friend. Tool calls still work when the model makes them.
     allowPlainText: process.env.ALLOW_PLAIN_TEXT === 'true',
     headless: process.env.HEADLESS === 'true',
-    modelName: process.env.MODEL_NAME || 'anymodel',
+    modelName: process.env.MODEL_NAME || 'deepseek webchat',
     // 08-13 MULTI-SITE: env FIRST — chat.js carries a hardcoded 9224 URL, so
     // CDP_WS_URL was ignored and no instance could target the 9223 GUI
     // browser (qwen/kimi/gemini logged-in tabs).
