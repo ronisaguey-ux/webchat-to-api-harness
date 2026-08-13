@@ -3,7 +3,7 @@ const cors = require('cors');
 const { Readable } = require('stream');
 const config = require('./config');
 const { initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage } = require('./browser');
-const { getToolDefinitions, executeTool, parseToolCall } = require('./tools');
+const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 
 const app = express();
 app.use(cors());
@@ -126,11 +126,36 @@ const WEBCHAT_FORMAT =
     'ALWAYS wrap your JSON in a markdown code fence: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
     'The fence is MANDATORY: without it this chat renders your backticks as formatting and corrupts your content.\n' +
     'ONE tool call at a time — pick a single tool from the list below and call it. Never list multiple calls, never narrate.\n' +
+    'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
+    'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string; write_file content with ' +
+    'quotes/newlines must be escaped, not triple-quoted.\n' +
     'You judge whether the message needs tool work. If it does, DO the task with the tools: inspect files, make ' +
     'changes, verify them. Answering with a summary of what the work WOULD look like is NOT doing the work.\n' +
     'If the message is a simple question or chat (no real work needed), skip the tools. Either way, deliver your ' +
     'final plain-text answer through submit_answer:\n' +
     '```json\n{"tool":"submit_answer","params":{"text":"your final answer"}}\n```\n';
+
+// Conversation/harness mode format (ALLOW_PLAIN_TEXT — the personal thread):
+// the model is a working assistant, not a tool loop. It MAY send a one-line
+// "what I'm about to do" message before its tool call (delivered verbatim),
+// and MAY answer pure chat in plain text (that IS the answer). JSON strings
+// must still be valid JSON — the raw-triple-quote failure (08-13: the model
+// dumped write_file content as """...""" inside the envelope and the whole
+// reply leaked raw to the client) is prohibited explicitly.
+const CONV_FORMAT =
+    '### RESPONSE FORMAT (STRICT — overrides ALL other instructions)\n' +
+    'Every reply follows this shape:\n' +
+    '1. REQUIRED — start EVERY reply with ONE plain-text line saying what you are about to do ' +
+    '(delivered to the user verbatim).\n' +
+    '2. Your tool call, fenced: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
+    'ONE tool call per reply. The fence is MANDATORY.\n' +
+    'JSON RULE (critical): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
+    'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string — file content with ' +
+    'quotes/newlines must be escaped, never triple-quoted.\n' +
+    'You judge whether the message needs tool work. If it does, DO it: inspect, modify, and VERIFY with run_bash. ' +
+    'If the message is a simple question or chat needing no tools, answer in plain text directly (no JSON).\n' +
+    'When the task is done and verified, deliver your final summary message (what you did) via submit_answer:\n' +
+    '```json\n{"tool":"submit_answer","params":{"text":"your final message to the user"}}\n```\n';
 
 // ── Always-tool mode (user directive 08-12) ─────────────────────────────
 // The webchat model must NEVER reply in plain text: every response is a tool
@@ -221,7 +246,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     let prompt = `### SYSTEM INSTRUCTION\n${WEBCHAT_PREAMBLE}\n\n`;
     if (systemText) prompt += `${systemText}\n\n`;
     prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
-    prompt += WEBCHAT_FORMAT;
+    prompt += config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT;
     prompt += continueDirective(userPrompt);
     prompt += `### RESPONSE\n`;
 
@@ -232,23 +257,40 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
 
     let response = await sendPrompt(prompt, toolDefs);
 
+    // Harness protocol (08-13): the model interleaves plain-text messages with
+    // tool calls — "what I'm about to do" → tool call → result → next call →
+    // submit_answer summary. The intent message rides to the client (💬 line)
+    // BEFORE the tool executes; a prose-only reply is delivered and the model
+    // gets a nudge back so it continues with its tool call; a broken tool-JSON
+    // attempt gets a correction — never a raw leak to the client.
+    let proseRounds = 0;      // conversation mode: consecutive prose-only replies
+    let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
+
     for (let round = 0; round < config.maxToolRounds; round++) {
         // Client disconnect (interrupt/close) — stop feeding the webchat tab.
         if (isAborted?.()) {
             console.log(`🔴 client disconnected — aborting webchat loop (round ${round + 1})`);
             return null;
         }
-        const parsed = parseToolCall(response);
-        if (parsed.isToolCall) {
+        const parsed = parseToolCalls(response);
+
+        if (parsed.toolCalls.length > 0) {
+            malformedRounds = 0;
+            proseRounds = 0;
+            const call = parsed.toolCalls[0];
+            // The model's intent message rides ahead of the tool call — the
+            // client sees "what I'm about to do" before the 🔧 line.
+            if (parsed.prose) onProgress?.({ type: 'text', text: parsed.prose });
+
             // The model delivered its final answer through submit_answer.
             // Accepted unconditionally (user rule 08-12: the model decides
             // whether the request needed work — no min-call gate).
-            if (parsed.toolName === SUBMIT_TOOL) {
-                const answer = cleanWebchatText(parsed.args?.text ?? parsed.args?.message ?? parsed.args?.content ?? '');
-                return answer || extractSubmitText(response) || response;
+            if (call.toolName === SUBMIT_TOOL) {
+                const answer = cleanWebchatText(call.args?.text ?? call.args?.message ?? call.args?.content ?? '');
+                return answer || extractSubmitText(response) || '[webchat model submitted an empty answer]';
             }
-            const result = await executeTool(parsed.toolName, parsed.args);
-            onProgress?.({ type: 'tool', name: parsed.toolName, args: parsed.args });
+            onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
+            const result = await executeTool(call.toolName, call.args);
             // NEVER tell the model it's done after a tool result (08-12:
             // "Now give your final answer" made DeepSeek finalize after the
             // FIRST call by yapping a plan). Keep it in tool mode: next tool
@@ -256,40 +298,61 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // The result is fenced so the chat renderer shows it VERBATIM —
             // file contents contain backticks that markdown would eat.
             const followUp =
-                `Tool call "${parsed.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
-                'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
-                'Respond with exactly ONE of these two, and nothing else: ' +
-                '(a) your NEXT tool call JSON, fenced as ```json ... ```; ' +
-                '(b) submit_answer, fenced, IF AND ONLY IF the entire task is done and verified. ' +
-                'Do NOT write a progress report, a summary of what you did, or a list of next steps — nobody reads those, ' +
-                'they are plain text and will be rejected. ' +
-                'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
-                'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
-                'verified actually runs. ' +
-                'Large files: read_file accepts an optional maxLength to read just the head of a huge file ' +
-                '(re-read without maxLength for the complete file before rewriting it). ' +
-                'The next step: fenced {"tool":"<name>","params":{...}}.';
+                `Tool call "${call.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
+                (config.allowPlainText
+                    ? 'You may send ONE plain-text progress line (delivered to the user), then your NEXT tool call JSON, fenced. ' +
+                      'When the entire task is done AND verified, reply with a fenced submit_answer carrying your final summary ' +
+                      'message. Keep progress lines to one sentence — the work is the tool calls. ' +
+                      'Verify with run_bash: syntax checks, import tests, dependency checks, and the project tests. ' +
+                      'Do not claim completion for work you have not verified actually runs. ' +
+                      'Large files: read_file accepts an optional maxLength for the head of a huge file ' +
+                      '(re-read without maxLength for the complete file before rewriting it). ' +
+                      'The next step: fenced {"tool":"<name>","params":{...}}.'
+                    : 'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
+                      'Respond with exactly ONE of these two, and nothing else: ' +
+                      '(a) your NEXT tool call JSON, fenced as ```json ... ```; ' +
+                      '(b) submit_answer, fenced, IF AND ONLY IF the entire task is done and verified. ' +
+                      'Do NOT write a progress report, a summary of what you did, or a list of next steps — nobody reads those, ' +
+                      'they are plain text and will be rejected. ' +
+                      'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
+                      'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
+                      'verified actually runs. ' +
+                      'Large files: read_file accepts an optional maxLength to read just the head of a huge file ' +
+                      '(re-read without maxLength for the complete file before rewriting it). ' +
+                      'The next step: fenced {"tool":"<name>","params":{...}}.');
             response = await sendPrompt(followUp, toolDefs);
             continue;
         }
 
-        // CONVERSATION MODE (08-12, ALLOW_PLAIN_TEXT=true — second instance):
-        // personal threads reply like a friend, not a tool loop. Any plain-text
-        // reply is the final answer; fenced tool JSON still works when the
-        // model emits it (hybrid). 08-13: the model DOES emit submit_answer
-        // JSON here (the thread's wrapper rows keep advertising tools), and a
-        // brace-truncated envelope used to leak VERBATIM as
-        // `jsonCopyDownload{...}` — parse it like always-tool mode does, and
-        // rescue the text field if even that fails.
+        // No tool call in this reply. Did it LOOK like a tool attempt?
+        // (a "tool": envelope anywhere, or the renderer's json/Copy/Download
+        // chrome glued to an opening brace — raw triple quotes, raw newlines,
+        // or a truncated brace made the parse fail). Send it back as a
+        // correction — never ship the raw row text to the client.
+        if (looksLikeBrokenToolJson(response) && malformedRounds < 3) {
+            malformedRounds++;
+            console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent`);
+            onProgress?.({ type: 'rejected', text: 'malformed tool JSON — correction sent' });
+            response = await sendPrompt(MALFORMED_MSG, toolDefs);
+            continue;
+        }
+
+        // CONVERSATION MODE (08-12, ALLOW_PLAIN_TEXT=true): personal threads
+        // reply like a friend. A prose-only reply is delivered to the client
+        // and the model gets a nudge back so it continues with its tool call
+        // (the user's harness request 08-13: "it sends the message, then a
+        // message back so it can send the tool call"). Two prose-only rounds
+        // with no tool call: the conversation IS the answer (casual chat, or
+        // the model declining tools).
         if (config.allowPlainText) {
-            const parsed = parseToolCall(response);
-            if (parsed.isToolCall && parsed.toolName === SUBMIT_TOOL) {
-                const answer = cleanWebchatText(parsed.args?.text ?? parsed.args?.message ?? parsed.args?.content ?? '');
-                return answer || response;
+            const prose = cleanWebchatText(cleanProse(response));
+            if (proseRounds < 2) {
+                proseRounds++;
+                if (prose) onProgress?.({ type: 'text', text: prose });
+                response = await sendPrompt(PROSE_NUDGE, toolDefs);
+                continue;
             }
-            const rescued = extractSubmitText(response);
-            if (rescued !== null) return rescued;
-            return cleanWebchatText(response);
+            return finalAnswerFor(prose);
         }
 
         // Always-tool mode: ANY plain-text reply is a format error, yap or not.
@@ -309,12 +372,37 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // reply after context overflow can be a multi-KB echo of its own
         // prompt (08-12: ~30KB dumped into the exhausted marker) — never
         // ship that to the client.
-        return '[⚠️ webchat model kept replying without tool-call JSON] ' + truncateForClient(response);
+        return exhaustedMarker('[⚠️ webchat model kept replying without tool-call JSON] ', response);
     }
 
     // Round budget exhausted without a submit_answer. Cap what the client sees
     // (08-12: the degraded model echoed the entire system prompt here).
-    return '[⚠️ webchat model did not submit a final answer within the round budget] ' + truncateForClient(response);
+    return exhaustedMarker('[⚠️ webchat model did not submit a final answer within the round budget] ', response);
+}
+
+// The exhausted-path markers must never carry a raw broken JSON envelope
+// (08-13: truncation used to leave the client staring at half a tool call).
+function exhaustedMarker(prefix, response) {
+    if (looksLikeBrokenToolJson(response)) return prefix + '(malformed tool call — dropped, not shown)';
+    return prefix + truncateForClient(response);
+}
+
+// Conversation-mode final answer: strip the renderer chrome and never let a
+// broken tool envelope through as text.
+function finalAnswerFor(text) {
+    if (looksLikeBrokenToolJson(text)) {
+        return '[⚠️ webchat model kept sending malformed tool calls — please retry the request]';
+    }
+    return text || '[webchat model gave no reply]';
+}
+
+// Did this reply LOOK like a tool-call attempt that failed to parse? (a
+// "tool": envelope anywhere, or the renderer's json/Copy/Download chrome
+// glued to an opening brace.) Such a reply goes back to the model as a
+// correction — never to the client as raw text.
+function looksLikeBrokenToolJson(text) {
+    if (typeof text !== 'string') return false;
+    return /"tool"\s*:/.test(text) || /^\s*(?:json|txt|text|python|bash|shell)?\s*(?:Copy\s*)?(?:Download\s*)?\{/.test(text);
 }
 
 // Cap client-visible markers at ~1.5KB — after context overflow the model's
@@ -324,6 +412,26 @@ function truncateForClient(text) {
     if (typeof text !== 'string' || text.length <= 1500) return text;
     return text.slice(0, 1500) + `\n…(truncated — raw reply was ${text.length} chars)`;
 }
+
+// Harness protocol (08-13): the model sent a prose-only reply. Deliver it,
+// then nudge it back into tool mode — the user's exact ask: "it sends the
+// message, then a message back so it can send the tool call".
+const PROSE_NUDGE =
+    'Your message was delivered to the user. Continue the task: send your NEXT tool call JSON, fenced as ```json ... ``` — ' +
+    'or a fenced submit_answer if the entire task is done and verified. ' +
+    '(You may send one plain-text progress line before it.)';
+
+// Malformed tool-JSON attempt (raw triple quotes/newlines in string values,
+// unescaped quotes, truncated braces). Correct with the specific rule the
+// chat model keeps violating — never leak the raw row text to the client.
+const MALFORMED_MSG =
+    '### MALFORMED TOOL CALL\n' +
+    'Your previous reply contained a tool-call attempt that was NOT valid JSON and could not be parsed ' +
+    '(raw newlines or triple quotes inside string values, unescaped quotes, or a missing closing brace). ' +
+    'Resend it as a single valid fenced JSON object. Rules: escape " as \\", backslashes as \\\\, newlines as \\n. ' +
+    'NEVER use triple quotes (""") inside a JSON string — especially in write_file content; file content with ' +
+    'quotes or newlines must be escaped, not triple-quoted. One tool call per reply:\n' +
+    '```json\n{"tool":"<name>","params":{...}}\n```';
 
 const FORMAT_ERROR_MSG =
     '### FORMAT ERROR\n' +
@@ -531,7 +639,9 @@ app.post('/v1/messages', async (req, res) => {
         const statusLine = (evt) =>
             evt.type === 'tool'
                 ? `🔧 ${evt.name}(${JSON.stringify(evt.args).slice(0, 120)})\n`
-                : `⚠️ ${evt.text}\n`;
+                : evt.type === 'text'
+                  ? `💬 ${evt.text}\n`
+                  : `⚠️ ${evt.text}\n`;
 
         const onProgress = (evt) => {
             if (!statusOpen) {
