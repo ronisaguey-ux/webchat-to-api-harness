@@ -525,6 +525,7 @@ async function installStreamTee() {
                     if (!raw) continue;
                     let j;
                     try { j = JSON.parse(raw); } catch { continue; }
+                    // OLD format: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"..."}],"status":"WIP"}}}
                     const resp = j && j.v && j.v.response;
                     if (resp) {
                         const st = resp.status || '';
@@ -533,6 +534,28 @@ async function installStreamTee() {
                             for (const f of resp.fragments) {
                                 if (f && f.type === 'RESPONSE' && typeof f.content === 'string') out.text += f.content;
                             }
+                        }
+                    }
+                    // NEW 2.3.0 format (probed 08-13 — the old format is gone
+                    // from live streams): content arrives as APPEND patches on
+                    // response/fragments/-1/content, or as BARE {"v":"<string>"}
+                    // chunks, and completion is signalled by
+                    // {"p":"response/status","o":"SET","v":"FINISHED"} (or a
+                    // BATCH with quasi_status) plus `event: close`.
+                    if (j && typeof j.v === 'string' && j.p && j.o === 'APPEND' && /content/.test(j.p)) {
+                        out.text += j.v;
+                    } else if (j && typeof j.v === 'string' && !j.p) {
+                        out.text += j.v;
+                    }
+                    if (j && j.p === 'response/status' && typeof j.v === 'string') {
+                        if (j.v === 'FINISHED' || j.v === 'DONE' || j.v === 'ERROR' || j.v === 'STOPPED') out.done = true;
+                    }
+                    if (j && j.p === 'response/quasi_status' && typeof j.v === 'string') {
+                        if (j.v === 'FINISHED' || j.v === 'DONE') out.done = true;
+                    }
+                    if (j && j.p === 'response' && j.o === 'BATCH' && Array.isArray(j.v)) {
+                        for (const sub of j.v) {
+                            if (sub && sub.p === 'quasi_status' && (sub.v === 'FINISHED' || sub.v === 'DONE')) out.done = true;
                         }
                     }
                     if (j && typeof j.biz_code === 'number' && j.biz_code !== 0) out.done = true;
