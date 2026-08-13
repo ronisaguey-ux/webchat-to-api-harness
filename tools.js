@@ -226,7 +226,29 @@ function parseToolCall(response) {
                 if (depth === 0) { end = i; break; }
             }
         }
-        if (end === -1) break; // unbalanced — nothing more to try
+        if (end === -1) {
+            // 08-13: scan ran off the end of the reply with braces still open
+            // — DeepSeek's renderer truncates the LAST brace of a fenced JSON
+            // reply ("...work on it."} missing the final }). The old code
+            // gave up here, the reply fell through conversation mode as raw
+            // `json Copy Download {...}` text (user report 08-13). Repair:
+            // close the open string if the cut landed inside one, close the
+            // open braces, and attempt a parse. A repaired candidate that
+            // still isn't a tool call just fails the JSON.parse below — the
+            // only cost is the extra attempt, and we break after it.
+            let repaired = text.slice(start);
+            if (inString) repaired += '"';
+            repaired += '}'.repeat(Math.min(depth, 20));
+            try {
+                const obj = JSON.parse(repaired);
+                if (obj && typeof obj === 'object' && obj.tool && obj.params) {
+                    return { isToolCall: true, toolName: String(obj.tool), args: obj.params };
+                }
+            } catch {
+                /* not recoverable — nothing more to try */
+            }
+            break;
+        }
         const candidate = text.slice(start, end + 1);
         try {
             const obj = JSON.parse(candidate);
