@@ -465,12 +465,30 @@ async function snapshotChat() {
                 answer: clone ? clone.innerText || '' : '',
                 lastCls: last ? (last.className || '').toString() : '',
                 body: document.body ? document.body.innerText || '' : '',
+                count: items.length, // message-row count (08-13: growth check)
             };
         }
         let n = 0;
         for (const s of sels) n += document.querySelectorAll(s).length;
         return { mode: 'count', count: n, text: '', body: document.body ? document.body.innerText || '' : '' };
     }, config.selectors.message);
+}
+
+// STOP-glyph check (08-13, hoisted out of the wait loop): DeepSeek shows the
+// STOP icon on the send button while a generation runs and reverts to the
+// send glyph when done. Handle-free — queries the live element in-page.
+async function isGenerating() {
+    try {
+        return await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                return d.length > 0 && !d.startsWith('M8.3125');
+            }
+            return false;
+        }, config.selectors.send);
+    } catch { return false; }
 }
 
 // ── Wait until a NEW message appears and its text stops changing
@@ -520,8 +538,14 @@ async function waitForResponse(before, typedText) {
         // stable across builds). Never accept a user-class row.
         const USER_ROW_CLS = '_9663006';
         const userRow = (state.lastCls || '').split(/\s+/).includes(USER_ROW_CLS);
+        // Growth via ROW COUNT (08-13): the text-inequality check alone never
+        // trips when the new answer renders IDENTICAL to the previous one —
+        // every response on the personal thread (6187afed) then burned the
+        // full timeout and was only rescued at deadline. Count growth covers
+        // that; text comparison stays as a fallback for virtual-list
+        // recycling that fluctuates the count.
         const grew = state.mode === 'vl'
-            ? !userRow && state.text !== before.text && state.text !== typedText && !state.text.includes(typedText)
+            ? !userRow && (state.count !== before.count || (state.text !== before.text && state.text !== typedText && !state.text.includes(typedText)))
             : state.count > before.count;
         // Accept on the THINK-STRIPPED answer text going stable (08-12): the
         // raw text is reasoning-only during cogitation, and accepting raw-text
@@ -530,11 +554,19 @@ async function waitForResponse(before, typedText) {
         // `answer` is empty while the model cogitates, so this never accepts
         // a reasoning-only pause. Fallback (count mode / older builds): the
         // raw-text check.
+        const busy = state.mode === 'vl' ? await isGenerating() : false;
         if (state.mode === 'vl') {
             // Skip a "..."-only answer: it can be a streaming placeholder that
             // froze while the model cogitates — accepting it returns garbage.
             const answerText = (state.answer || '').trim();
-            if (grew && answerText.length > 0 && answerText !== '…' && !/^\.{2,4}$/.test(answerText) && answerText.length === lastAnswerLen) {
+            // Accept on generation END (08-13): the send button reverts from
+            // STOP to the send glyph when DeepSeek finishes (it flips to STOP
+            // before the first token, so idle ⇒ the row is complete). Text
+            // stability alone was unreliable here — the 21:21 PONG only
+            // arrived via the deadline rescue — so accept as soon as a
+            // non-empty answer exists AND the button is idle. Stability still
+            // shortcuts the accept while the button reads busy.
+            if (grew && answerText.length > 0 && answerText !== '…' && !/^\.{2,4}$/.test(answerText) && (answerText.length === lastAnswerLen || !busy)) {
                 return state.answer;
             }
         } else if (grew && state.text.length > 0 && state.text.length === lastLen) {
@@ -565,22 +597,10 @@ async function waitForResponse(before, typedText) {
         // cogitates SILENTLY — no text movement for minutes while the send
         // button shows STOP (a generation is running). The text-activity reset
         // above misses that, so long cogitations died on the 180s deadline
-        // with a complete answer arriving seconds later. Poll the button
-        // (handle-free): STOP state extends the deadline exactly like text
-        // activity does.
-        if (state.mode === 'vl') {
-            const busy = await page.evaluate((sels) => {
-                for (const sel of sels) {
-                    const el = document.querySelector(sel);
-                    if (!el) continue;
-                    const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
-                    return d.length > 0 && !d.startsWith('M8.3125');
-                }
-                return false;
-            }, config.selectors.send).catch(() => false);
-            if (busy) {
-                deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
-            }
+        // with a complete answer arriving seconds later. STOP state extends
+        // the deadline exactly like text activity does.
+        if (state.mode === 'vl' && busy) {
+            deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
         }
         lastText = state.text;
         lastLen = state.text.length;
