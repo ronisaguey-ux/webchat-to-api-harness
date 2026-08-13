@@ -35,6 +35,18 @@ function isWebchatModel(body) {
     return m === config.modelName || m === 'anymodel';
 }
 
+// 08-13 MULTI-MODEL ROUTER: Claude Code sends every /model pick to the SAME
+// base URL (no per-option base URL in the harness), so the front-door
+// instance dispatches by model name. WEBCHAT_ROUTES="qwen=http://127.0.0.1:8083,kimi=..."
+// maps each webchat model to its own gateway (each drives the logged-in tab
+// in the 9223 GUI browser); anymodel drives THIS instance's deepseek tab;
+// everything else (deepseek-v4-flash) proxies upstream to the paid API.
+const WEBCHAT_ROUTES = {};
+for (const pair of (process.env.WEBCHAT_ROUTES || '').split(',')) {
+    const [name, target] = pair.split('=');
+    if (name && target) WEBCHAT_ROUTES[name.trim()] = target.trim();
+}
+
 // Transparent proxy: status + headers + body (SSE passthrough when streaming).
 async function proxyTo(req, res, upstreamBase, path, body) {
     try {
@@ -632,9 +644,16 @@ function persistThreadSwap(oldId, newId, newUrl) {
     try {
         const sv = fs.readFileSync(supervisor, 'utf8');
         if (sv.includes(oldId)) {
+            // 08-13: the supervisor pins use the 8-char id PREFIX for
+            // TAB_URL_SUBSTRING (TAB_URL_SUBSTRING=51455c98) while oldId is
+            // the full UUID — the full-id split never matched, so the
+            // substring pin went stale after handoffs (8082's pin died this
+            // way 08-13). Replace both forms with the new 8-char prefix.
+            const old8 = oldId.slice(0, 8), new8 = newId.slice(0, 8);
             fs.writeFileSync(supervisor, sv
                 .split('WEBCHAT_URL=https://chat.deepseek.com/a/chat/s/' + oldId).join('WEBCHAT_URL=' + newUrl)
-                .split('TAB_URL_SUBSTRING=' + oldId).join('TAB_URL_SUBSTRING=' + newId));
+                .split('TAB_URL_SUBSTRING=' + oldId).join('TAB_URL_SUBSTRING=' + new8)
+                .split('TAB_URL_SUBSTRING=' + old8).join('TAB_URL_SUBSTRING=' + new8));
             changed.push('stack_supervisor.sh');
             console.log(`📝 supervisor pin: ${oldId} → ${newId}`);
         }
@@ -671,7 +690,9 @@ function restartSupervisor() {
         return;
     }
     const launch = () => {
-        const child = spawn('bash', ['/home/roni/Roni_Workspace/oculus/scripts/stack_supervisor.sh'], {
+        // 08-13: log to the supervisor's own file — stdio:'ignore' spawned a
+        // SILENT supervisor (pid 10652) whose loop failures were invisible.
+        const child = spawn('bash', ['-c', 'bash /home/roni/Roni_Workspace/oculus/scripts/stack_supervisor.sh >> /tmp/stack_supervisor.log 2>&1'], {
             detached: true,
             stdio: 'ignore',
         });
@@ -788,6 +809,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.post('/v1/messages', async (req, res) => {
     try {
         const { system, messages, tools, model, stream } = req.body || {};
+        if (WEBCHAT_ROUTES[model]) {
+            return proxyTo(req, res, WEBCHAT_ROUTES[model], '/v1/messages', req.body);
+        }
         if (!isWebchatModel(req.body)) {
             return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', req.body);
         }
