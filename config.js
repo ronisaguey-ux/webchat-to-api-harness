@@ -33,6 +33,14 @@ const cfg = {
     // CDP_WS_URL was ignored and no instance could target the 9223 GUI
     // browser (qwen/kimi/gemini logged-in tabs).
     cdpWsUrl: process.env.CDP_WS_URL || chat.cdpWsUrl || null,
+    // 08-13 VIEWPORT PIN: on WM-less X sessions Chrome renderers can freeze
+    // at the launch-time size (all 9223 GUI tabs were stuck 800x600 inside
+    // 1920x1034 windows — resize events never arrive, page rendered
+    // quarter-size with the window surface around it). When set, the gateway
+    // pins the layout viewport via Emulation.setDeviceMetricsOverride right
+    // after attaching to the tab. Headless instances leave it unset.
+    viewportW: parseInt(process.env.VIEWPORT_W) || 0,
+    viewportH: parseInt(process.env.VIEWPORT_H) || 0,
 
     // Context handoff (08-13): when the estimated context fed to the webchat
     // model in one request crosses the threshold, the gateway stops the tool

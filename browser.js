@@ -148,6 +148,28 @@ async function connectToWebchat(webchatUrl) {
             }
         }
         console.log(`🟢 Reusing tab: ${page.url()}`);
+        // 08-13 VIEWPORT PIN (GUI-browser fix): on WM-less X sessions Chrome
+        // renderers can freeze at the launch-time size — observed: every 9223
+        // tab stuck at Chrome's default 800x600 while the X window was
+        // 1920x1034 (page rendered quarter-size, window surface around it).
+        // Resize events never reach the renderer, so pin the layout viewport
+        // explicitly. VIEWPORT_W/H env — set ONLY for gateways driving a GUI
+        // browser (headless deepseek instances leave it unset).
+        if (config.viewportW && config.viewportH) {
+            try {
+                const s = await page.createCDPSession();
+                await s.send('Emulation.setDeviceMetricsOverride', {
+                    width: config.viewportW,
+                    height: config.viewportH,
+                    deviceScaleFactor: 1,
+                    mobile: false,
+                });
+                await s.detach();
+                console.log(`📐 Viewport pinned to ${config.viewportW}x${config.viewportH}`);
+            } catch (e) {
+                console.log('⚠️ viewport pin failed:', String(e.message).slice(0, 70));
+            }
+        }
         await waitForChatInput(page);
         return page;
     }
