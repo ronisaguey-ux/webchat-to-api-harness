@@ -204,6 +204,22 @@ async function sendPrompt(prompt, toolDefinitions) {
     await connectToWebchat(config.webchatUrl);
     console.log(`📤 Sending prompt (${prompt.length} chars)`);
 
+    // 08-13 FOREIGN-BUSY guard: a generation left running from a
+    // disconnected client keeps its STOP control on the tab. Typing into
+    // that composer strands the prompt (the send click targets the send
+    // button, which is replaced by the stop control), and the wait then
+    // rescues stale rows. Wait up to 60s for the tab to go idle, then fail
+    // fast like the deepseek STOP wait does.
+    if (!new URL(config.webchatUrl).host.includes('deepseek')) {
+        for (let w = 0; w < 60; w++) {
+            if (!(await isForeignBusy())) break;
+            await sleep(1000);
+        }
+        if (await isForeignBusy()) {
+            throw new Error('webchat tab still generating from a previous request — retry after it finishes');
+        }
+    }
+
     const fullPrompt = buildFullPrompt(prompt, toolDefinitions);
 
     let input;
@@ -243,6 +259,11 @@ async function typePrompt(text) {
             if (!el) continue;
             const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
             if (desc && desc.set) {
+                // 08-13 MULTI-SITE: focus BEFORE setting — the value-set path
+                // never focused the input, so the later Enter press went to
+                // whatever had focus last (qwen: a nav element → Enter
+                // ACTIVATED it and navigated the tab to qwen.ai/home).
+                el.focus();
                 desc.set.call(el, t);
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 return true;
@@ -358,7 +379,15 @@ async function sendMessage(input, text) {
                     // thing to touch the running generation. Only click once the
                     // button is back in SEND state (arrow glyph, d starts
                     // M8.3125; any other glyph = busy/stop, wait for it).
-                    let ready = btnInfo.glyph.startsWith('M8.3125');
+                    // 08-13 MULTI-SITE: the M8.3125 send-glyph check is
+                    // DeepSeek-UI-specific — on qwen/kimi/gemini the send
+                    // button's icon differs and would read as perpetual STOP
+                    // (observed: gemini's probe blocked by a false-STOP wait).
+                    // The server-level busy guard already serializes requests,
+                    // so no live generation can be running here: click
+                    // directly on foreign sites.
+                    const isDeepseek = new URL(config.webchatUrl).host.includes('deepseek');
+                    let ready = !isDeepseek || btnInfo.glyph.startsWith('M8.3125');
                     if (!ready) {
                         console.log('🛑 send button in STOP state — waiting for generation to finish');
                         for (let w = 0; w < 120; w++) {
@@ -473,9 +502,22 @@ async function snapshotChat() {
                 count: items.length, // message-row count (08-13: growth check)
             };
         }
+        // 08-13 MULTI-SITE: foreign webchats (qwen/kimi/gemini) render replies
+        // in normal DOM — count mode must also carry the NEWEST text-bearing
+        // matched row, or waitForResponse can never accept their answers
+        // (deepseek's virtual list uses 'vl' mode above). Selectors are
+        // iterated in order; matches are in document order, so the last
+        // text-bearing one is the newest message (sidebar rows come earlier).
         let n = 0;
-        for (const s of sels) n += document.querySelectorAll(s).length;
-        return { mode: 'count', count: n, text: '', body: document.body ? document.body.innerText || '' : '' };
+        let lastEl = null;
+        for (const s of sels) {
+            for (const el of document.querySelectorAll(s)) {
+                n++;
+                if (((el.innerText) || '').trim().length > 0) lastEl = el;
+            }
+        }
+        const txt = lastEl ? lastEl.innerText || '' : '';
+        return { mode: 'count', count: n, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
     }, config.selectors.message);
 }
 
@@ -493,6 +535,32 @@ async function isGenerating() {
             }
             return false;
         }, config.selectors.send);
+    } catch { return false; }
+}
+
+// Count-mode generation detector (08-13): foreign webchats (qwen/kimi/
+// gemini) don't share DeepSeek's M8.3125 STOP glyph, so isGenerating()
+// can't read them. While a generation runs they show a stop control
+// (element whose aria-label or button text is exactly stop-ish; Chinese
+// labels included — qwen/kimi are zh UIs). Its presence ⇒ the newest row
+// is still streaming — never accept or rescue it, never type into it.
+async function isForeignBusy() {
+    try {
+        return await page.evaluate(() => {
+            const stopish = (s) => {
+                s = (s || '').trim().toLowerCase();
+                return s === 'stop' || s === 'stop response' || s === 'stop generating'
+                    || s === 'stop generation' || s === 'stop stream'
+                    || s === '停止' || s === '停止生成' || s === '停止响应';
+            };
+            for (const el of document.querySelectorAll('[aria-label]')) {
+                if (stopish(el.getAttribute('aria-label'))) return true;
+            }
+            for (const b of document.querySelectorAll('button')) {
+                if (stopish(b.innerText)) return true;
+            }
+            return false;
+        });
     } catch { return false; }
 }
 
@@ -565,7 +633,10 @@ async function installStreamTee() {
         };
         const push = (body) => {
             window.__wsTee.push({ body: String(body || ''), at: Date.now() });
-            if (window.__wsTee.length > 8) window.__wsTee.shift();
+            // 08-13 WEDGE FIX: 8 entries was evicting long tool-loop streams
+            // (compaction/tool runs push many completion XHRs); 32 keeps the
+            // window safe for any serialized burst.
+            if (window.__wsTee.length > 32) window.__wsTee.shift();
         };
         const origOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function (m, u, ...rest) {
@@ -589,6 +660,31 @@ async function installStreamTee() {
             return p;
         };
     });
+}
+
+// 08-13 WEDGE FIX: a DOM answer that "stopped growing" mid-stream is NOT a
+// complete answer — the webchat can pause between chunks while `busy` reads
+// false, and accepting the fragment burned rounds until the client gave up
+// ("API error · Retrying"). Called on the DOM-accept path only; the stream
+// tee is always preferred and holds the complete body at loadend.
+function looksLikeTruncatedAnswer(text) {
+    if (!text) return true;
+    const fences = (text.match(/```/g) || []).length;
+    if (fences % 2 !== 0) return true;                 // unclosed fence
+    const open = text.lastIndexOf('```');
+    if (open !== -1) {
+        // Unclosed fence is already caught by parity above; here the fence is
+        // closed — parse its block as JSON. A tool-call answer that fails to
+        // parse is mid-stream (or broken) → keep polling. Note: a complete
+        // fenced answer legitimately ENDS right after the closing fence, so
+        // an empty tail here is normal, not a signal.
+        const m = text.match(/```(?:json)?\n([\s\S]*?)\n```/);
+        if (m) { try { JSON.parse(m[1]); } catch { return true; } }
+    }
+    // Dangling tool-JSON tails (fenceless replies / partial render):
+    if (/("tool"\s*:\s*"[^"]*"\s*,\s*"params"\s*:\s*\{)[^{}]*$/.test(text)) return true;
+    if (/"params"\s*:\s*\{\s*$/.test(text)) return true;
+    return false;
 }
 
 // Read the newest tee entry at or after `startIndex` (the tee length at
@@ -693,7 +789,7 @@ async function waitForResponse(before, typedText) {
         // `answer` is empty while the model cogitates, so this never accepts
         // a reasoning-only pause. Fallback (count mode / older builds): the
         // raw-text check.
-        const busy = state.mode === 'vl' ? await isGenerating() : false;
+        const busy = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
         if (state.mode === 'vl') {
             // Skip a "..."-only answer: it can be a streaming placeholder that
             // froze while the model cogitates — accepting it returns garbage.
@@ -703,12 +799,29 @@ async function waitForResponse(before, typedText) {
             // before the first token, so idle ⇒ the row is complete). Text
             // stability alone was unreliable here — the 21:21 PONG only
             // arrived via the deadline rescue — so accept as soon as a
-            // non-empty answer exists AND the button is idle. Stability still
-            // shortcuts the accept while the button reads busy.
-            if (grew && answerText.length > 0 && answerText !== '…' && !/^\.{2,4}$/.test(answerText) && (answerText.length === lastAnswerLen || !busy)) {
-                return state.answer;
+            // non-empty answer exists AND the button is idle.
+            // 08-13 WEDGE FIX: require (a) length stable across TWO polls
+            // (lastAnswerLen === this length), (b) button idle, (c) the text
+            // not visibly truncated. The old `|| !busy` accepted a mid-stream
+            // fragment the moment `busy` read false between chunks — that
+            // 36-char truncation is what wedged the session at 95% context.
+            // The stream tee (complete at loadend) is re-checked first and
+            // wins whenever it has the body.
+            if (grew && answerText.length > 0 && answerText !== '…' && !/^\.{2,4}$/.test(answerText) && answerText.length === lastAnswerLen && !busy) {
+                const teeNow = await readStreamedAnswer(teeStart);
+                if (teeNow.found && teeNow.text.trim().length > 0) return teeNow.text;
+                if (!looksLikeTruncatedAnswer(answerText)) return state.answer;
+                // else: mid-stream fragment — do NOT accept; keep polling
             }
-        } else if (grew && state.text.length > 0 && state.text.length === lastLen) {
+        } else if (grew && !busy && state.text.length > 0 && state.text.length === lastLen) {
+            // 08-13 MULTI-SITE: same '…'/dots placeholder guard as the vl path
+            // — gemini's composer renders a "…" row while cogitating and the
+            // count-mode accept returned it as the final answer. The !busy
+            // requirement (08-13) defers acceptance until the stop control
+            // clears — streaming rows grow in count AND text, and accepting
+            // them mid-stream returned fragments and stale rescues.
+            const ctext = state.text.trim();
+            if (ctext === '…' || /^\.{2,4}$/.test(ctext)) { await sleep(1500); continue; }
             return state.text;
         }
         if (grew && state.text.length === 0) {
@@ -737,8 +850,11 @@ async function waitForResponse(before, typedText) {
         // button shows STOP (a generation is running). The text-activity reset
         // above misses that, so long cogitations died on the 180s deadline
         // with a complete answer arriving seconds later. STOP state extends
-        // the deadline exactly like text activity does.
-        if (state.mode === 'vl' && busy) {
+        // the deadline exactly like text activity does. 08-13: extended to
+        // count-mode sites — a running generation there means the newest row
+        // is still streaming, so the deadline must not expire into a stale
+        // rescue (gemini's 20197-char request rescued a 22-char stale row).
+        if (busy) {
             deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
         }
         lastText = state.text;
@@ -757,10 +873,18 @@ async function waitForResponse(before, typedText) {
             return tee.text;
         }
         const last = await snapshotChat();
-        const ans = (last.answer || '').trim();
-        if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans)) {
-            console.log('⏱ timeout — rescuing the answer already on the tab');
-            return last.answer;
+        // 08-13: never rescue while a generation is still running — the
+        // newest row may be a stale previous answer or a stream fragment
+        // (observed: the 20197-char gemini request rescued a 22-char row).
+        const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+        if (busyNow) {
+            console.log('⏱ deadline hit while still generating — not rescuing stale rows');
+        } else {
+            const ans = (last.answer || '').trim();
+            if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans)) {
+                console.log('⏱ timeout — rescuing the answer already on the tab');
+                return last.answer;
+            }
         }
     } catch {}
     throw new Error(`Timed out after ${config.timeout}ms waiting for a response`);
@@ -792,7 +916,12 @@ async function openNewChat() {
     }
     if (!page) page = await browser.newPage();
     console.log('🆕 Opening a NEW chat');
-    await page.goto('https://chat.deepseek.com/a/chat', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // 08-13 MULTI-SITE: deepseek's "new chat" is the /a/chat root; other
+    // webchats (qwen/kimi/gemini) don't have that — their root IS a new chat.
+    const newChatUrl = new URL(config.webchatUrl).host.includes('deepseek')
+        ? 'https://chat.deepseek.com/a/chat'
+        : config.webchatUrl;
+    await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForChatInput();
     await sleep(2500); // let the SPA settle the composer
     return page;

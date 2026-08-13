@@ -29,7 +29,10 @@ const cfg = {
     allowPlainText: process.env.ALLOW_PLAIN_TEXT === 'true',
     headless: process.env.HEADLESS === 'true',
     modelName: process.env.MODEL_NAME || 'anymodel',
-    cdpWsUrl: chat.cdpWsUrl || process.env.CDP_WS_URL || null,
+    // 08-13 MULTI-SITE: env FIRST — chat.js carries a hardcoded 9224 URL, so
+    // CDP_WS_URL was ignored and no instance could target the 9223 GUI
+    // browser (qwen/kimi/gemini logged-in tabs).
+    cdpWsUrl: process.env.CDP_WS_URL || chat.cdpWsUrl || null,
 
     // Context handoff (08-13): when the estimated context fed to the webchat
     // model in one request crosses the threshold, the gateway stops the tool
