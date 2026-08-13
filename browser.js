@@ -623,6 +623,67 @@ async function waitForResponse(before, typedText) {
 }
 
 // ──────────────────────────────────────────────────────
+// 4b. CONTEXT HANDOFF (08-13): fresh chat + seed message
+// ──────────────────────────────────────────────────────
+// The thread's context window is exhausted → the gateway asks the webchat
+// model for a handoff document, then navigates THIS tab to a brand-new chat
+// (threads are server-side: the old conversation survives untouched) and
+// sends the document as the first message. Typing on the new-chat page is
+// what CREATES the thread; the tab's URL then carries the new /s/ id, which
+// server.js captures and pins for every respawn path.
+async function openNewChat() {
+    // Fresh CDP session like every send (stale-session refresh).
+    await initBrowser({ reconnect: true });
+    // Re-pick the pinned tab (the old thread's tab gets navigated away — the
+    // conversation stays safe server-side).
+    if (!page && config.cdpWsUrl) {
+        const pages = await browser.pages();
+        page = config.tabUrlSubstring
+            ? pages.find((p) => p.url().includes(config.tabUrlSubstring))
+            : pages.find((p) => p.url().startsWith(new URL(config.webchatUrl).origin));
+        if (!page) {
+            page = await browser.newPage();
+            await page.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        }
+    }
+    if (!page) page = await browser.newPage();
+    console.log('🆕 Opening a NEW chat');
+    await page.goto('https://chat.deepseek.com/a/chat', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitForChatInput();
+    await sleep(2500); // let the SPA settle the composer
+    return page;
+}
+
+// Send the handoff document as the FIRST message of the fresh chat — plain
+// text, NO tool-format preamble: the new thread must start with the document.
+async function sendFirstMessage(text) {
+    await typePrompt(text);
+    const before = await snapshotChat();
+    await sendMessage(null, text);
+    console.log('⏳ Waiting for the new chat to acknowledge the handoff...');
+    let reply = '';
+    try {
+        reply = await waitForResponse(before, text);
+    } catch (e) {
+        // The thread exists the moment the message lands; a timed-out first
+        // reply (long cogitation) must not abort the swap.
+        console.log('⚠️ new-chat first reply timed out:', String(e.message).slice(0, 80));
+    }
+    const url = page.url();
+    if (!/\/a\/chat\/s\//.test(url)) {
+        throw new Error(`New chat did not get a thread URL (still: ${url})`);
+    }
+    console.log(`🆕 New thread created: ${url}`);
+    await saveCookies();
+    return { url, reply };
+}
+
+async function openNewChatAndSeed(text) {
+    await openNewChat();
+    return sendFirstMessage(text);
+}
+
+// ──────────────────────────────────────────────────────
 // 5. BUILD PROMPT WITH TOOLS
 //    Tool definitions section is capped at TOOL_CONTEXT_WINDOW
 //    chars so huge tool schemas don't eat the chat's context.
@@ -710,4 +771,8 @@ module.exports = {
     closeBrowser,
     getPage: () => page,
     probePage,
+    buildFullPrompt,
+    openNewChat,
+    sendFirstMessage,
+    openNewChatAndSeed,
 };
