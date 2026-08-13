@@ -294,6 +294,11 @@ async function sendMessage(input, text) {
     // version uses page-level evaluates (querySelector inside, serializable
     // args only), CDP Input for the Enter press, and page.mouse.click by
     // fresh coordinates for the send button — no JSHandles, nothing to detach.
+    // 08-13: arm the in-page stream tee before any send — the answer is
+    // read from the completion XHR body, not the DOM (which stopped
+    // rendering responses in this environment). Idempotent; re-arms itself
+    // after navigations / context handoffs.
+    await installStreamTee().catch((e) => console.log('⚠ stream tee install failed:', String(e.message).slice(0, 60)));
     for (let attempt = 0; ; attempt++) {
         try {
             // Headless tabs restore a deep scroll position (thread URL reload)
@@ -491,6 +496,99 @@ async function isGenerating() {
     } catch { return false; }
 }
 
+// ── SSE STREAM TEE (08-13) ──────────────────────────────────
+// DeepSeek 2.3.0's frontend stopped committing streamed responses to the
+// DOM in this headless environment — the completion XHR streams real tokens
+// (probed 08-13: `data: {"v":{"response":{...,"fragments":[{"type":
+// "RESPONSE","content":"P"}],"status":"WIP"}}}` on a 200 text/event-stream),
+// but the virtual list never renders them, so DOM polling times out on
+// every request. Fix: tee the completion response in-page and read the
+// answer from the stream body directly. The app's http client uses
+// XMLHttpRequest (proven by the 08-13 tee capture); fetch is hooked too as
+// a transport fallback. Idempotent per page load — call from sendMessage
+// before every send so a navigation or context-handoff re-arms it on the
+// fresh document.
+async function installStreamTee() {
+    await page.evaluate(() => {
+        if (window.__wsTee) return;
+        window.__wsTee = [];
+        // SSE parser shared with readStreamedAnswer (parses in-page so the
+        // full stream body never crosses the CDP boundary).
+        window.__wsParseSse = function (body) {
+            const out = { text: '', done: false };
+            const blocks = String(body || '').split('\n\n');
+            for (const block of blocks) {
+                if (/^event:\s*(done|finished)/im.test(block)) out.done = true;
+                for (const line of block.split('\n')) {
+                    if (!line.startsWith('data:')) continue;
+                    const raw = line.slice(5).trim();
+                    if (!raw) continue;
+                    let j;
+                    try { j = JSON.parse(raw); } catch { continue; }
+                    const resp = j && j.v && j.v.response;
+                    if (resp) {
+                        const st = resp.status || '';
+                        if (st === 'DONE' || st === 'FINISHED' || st === 'ERROR' || st === 'STOPPED') out.done = true;
+                        if (Array.isArray(resp.fragments)) {
+                            for (const f of resp.fragments) {
+                                if (f && f.type === 'RESPONSE' && typeof f.content === 'string') out.text += f.content;
+                            }
+                        }
+                    }
+                    if (j && typeof j.biz_code === 'number' && j.biz_code !== 0) out.done = true;
+                }
+            }
+            return out;
+        };
+        const push = (body) => {
+            window.__wsTee.push({ body: String(body || ''), at: Date.now() });
+            if (window.__wsTee.length > 8) window.__wsTee.shift();
+        };
+        const origOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (m, u, ...rest) {
+            this.__wsUrl = String(u || '');
+            return origOpen.call(this, m, u, ...rest);
+        };
+        const origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function (...args) {
+            const x = this;
+            if (x.__wsUrl && x.__wsUrl.includes('/api/v0/chat/completion')) {
+                x.addEventListener('loadend', () => { if (x.status === 200) push(x.responseText); });
+            }
+            return origSend.apply(this, args);
+        };
+        const origFetch = window.fetch;
+        window.fetch = function (u, o) {
+            const p = origFetch.apply(this, arguments);
+            if (String(u || '').includes('/api/v0/chat/completion')) {
+                p.then((r) => r.clone().text()).then(push).catch(() => {});
+            }
+            return p;
+        };
+    });
+}
+
+// Read the newest tee entry at or after `startIndex` (the tee length at
+// waitForResponse entry — excludes entries belonging to earlier requests;
+// the send queue is serialized so anything newer is THIS request). Entries
+// are pushed at loadend, so the body is complete whenever found=true.
+async function readStreamedAnswer(startIndex) {
+    try {
+        return await page.evaluate((start) => {
+            const tee = window.__wsTee || [];
+            if (typeof window.__wsParseSse !== 'function') return { found: false, text: '', done: false };
+            let found = false, text = '', done = false;
+            for (let i = start; i < tee.length; i++) {
+                found = true;
+                const p = window.__wsParseSse(tee[i].body);
+                text = p.text;
+                done = p.done;
+            }
+            return { found, text, done };
+        }, startIndex);
+    } catch { return { found: false, text: '', done: false }; }
+}
+
 // ── Wait until a NEW message appears and its text stops changing
 //    across two polls (streaming models keep growing it) ──
 // `before` is the snapshotChat() taken just before sending; `typedText`
@@ -498,6 +596,11 @@ async function isGenerating() {
 // be accepted as the response (DeepSeek cogitates for seconds before its
 // answer replaces it as the last item).
 async function waitForResponse(before, typedText) {
+    // 08-13 SSE-TEE: the completion XHR's streamed body is now the primary
+    // answer source (the DOM stopped rendering responses in this env). Tee
+    // entries are pushed at loadend — anything at/after this index appeared
+    // while WE poll, so it belongs to this request (the queue is serialized).
+    const teeStart = await page.evaluate(() => (window.__wsTee || []).length).catch(() => 0);
     let deadline = Date.now() + config.timeout;
     // Absolute cap so a pathological never-ending stream can't hang the client
     // forever — activity may extend the deadline, but not past this.
@@ -507,6 +610,19 @@ async function waitForResponse(before, typedText) {
     let lastText = null; // previous poll's thread text, for activity detection
     let emptySince = 0; // how long the newest message element has been empty
     while (Date.now() < deadline) {
+        // 08-13: stream tee FIRST — the DOM may never render the answer in
+        // this environment. found=true means loadend fired, so the body is
+        // complete; return it without waiting on the UI.
+        try {
+            const tee = await readStreamedAnswer(teeStart);
+            if (tee.found) {
+                if (tee.text.trim().length > 0) return tee.text;
+                if (tee.done) throw new Error('Webchat stream ended without content (error status in stream)');
+            }
+        } catch (e) {
+            if (e.message && /stream ended without content/.test(e.message)) throw e;
+            // otherwise (page busy / evaluate race) fall through to the DOM poll
+        }
         let state;
         try {
             state = await snapshotChat();
@@ -612,6 +728,11 @@ async function waitForResponse(before, typedText) {
     // instead of failing the request — the answer is real model output and
     // the round logic (tool parse / format check) handles it normally.
     try {
+        const tee = await readStreamedAnswer(teeStart);
+        if (tee.found && tee.text.trim().length > 0) {
+            console.log('⏱ timeout — rescuing the answer from the stream tee');
+            return tee.text;
+        }
         const last = await snapshotChat();
         const ans = (last.answer || '').trim();
         if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans)) {
