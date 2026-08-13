@@ -3,6 +3,23 @@ const os = require('os');
 const { spawn } = require('child_process');
 const config = require('./config');
 
+// Small read-only command runner (git_status). Captures stdout/stderr with a
+// hard timeout — never used for interactive or long-running commands.
+function runCmd(argv, timeoutMs = 8000) {
+    return new Promise((resolve) => {
+        const child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '', stderr = '';
+        child.stdout.on('data', (d) => { stdout += d; if (stdout.length > 20000) child.kill(); });
+        child.stderr.on('data', (d) => { stderr += d; });
+        const t = setTimeout(() => {
+            child.kill('SIGKILL');
+            resolve({ success: false, stdout, stderr: stderr + '\n[timed out]' });
+        }, timeoutMs);
+        child.on('error', (e) => { clearTimeout(t); resolve({ success: false, stdout, stderr: e.message }); });
+        child.on('close', (code) => { clearTimeout(t); resolve({ success: code === 0, stdout, stderr }); });
+    });
+}
+
 // ──────────────────────────────────────────────────────
 // TOOL DEFINITIONS
 // ──────────────────────────────────────────────────────
@@ -139,9 +156,16 @@ const TOOL_DEFINITIONS = [
         },
     },
     {
+        // 2026-08-13: replaced the simulated placeholder with REAL search —
+        // DeepSeek's Anthropic-compatible endpoint (api.deepseek.com/v1/messages,
+        // x-api-key auth) with the native web_search_20250305 tool, which does
+        // server-side search + decryption and returns result entries + an AI
+        // answer with sources. Requires DEEPSEEK_API_KEY in the gateway .env
+        // (same key the websearch-deepseek MCP uses — v4 flash only, never
+        // deepseek-chat).
         name: 'search_web',
         category: 'web',
-        description: 'Search the web for information.',
+        description: 'Search the web; returns result entries plus an AI-written answer with source URLs.',
         parameters: {
             type: 'object',
             properties: {
@@ -150,11 +174,176 @@ const TOOL_DEFINITIONS = [
             required: ['query'],
         },
         handler: async (args) => {
-            // Placeholder — integrate a real search API if you want results
+            const key = process.env.DEEPSEEK_API_KEY;
+            if (!key) {
+                return { success: false, error: 'search disabled: DEEPSEEK_API_KEY not set in the gateway .env' };
+            }
+            const body = {
+                model: 'deepseek-v4-flash',
+                max_tokens: 1000,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'Search the web for the query, then give a final answer in the same language the user used, with source URLs. Use the web_search tool exactly once.',
+                    },
+                    { role: 'user', content: String(args.query || '') },
+                ],
+                tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+                tool_choice: { type: 'auto' },
+            };
+            try {
+                const resp = await fetch('https://api.deepseek.com/anthropic/v1/messages', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', 'x-api-key': key },
+                    body: JSON.stringify(body),
+                    signal: AbortSignal.timeout(45000),
+                });
+                if (!resp.ok) {
+                    const t = await resp.text().catch(() => '');
+                    return { success: false, error: `search API ${resp.status}: ${t.slice(0, 200)}` };
+                }
+                const data = await resp.json();
+                const results = [];
+                const textParts = [];
+                for (const block of (data.content || [])) {
+                    if (block.type === 'web_search_tool_result' && block.content) {
+                        for (const item of block.content) {
+                            results.push({
+                                title: item.title || '',
+                                url: item.url || '',
+                                text: (item.text || '').slice(0, 300),
+                            });
+                        }
+                    } else if (block.type === 'text' && block.text) {
+                        textParts.push(block.text);
+                    }
+                }
+                return {
+                    success: true,
+                    answer: textParts.join('\n').slice(0, 3000),
+                    results: results.slice(0, 8),
+                    resultCount: results.length,
+                };
+            } catch (e) {
+                return { success: false, error: String((e && e.message) || e) };
+            }
+        },
+    },
+    {
+        // 2026-08-13: a real clock — the webchat must never guess the date
+        // (the stale-date mistake class). Always use this for "what time is it".
+        name: 'get_time',
+        category: 'system',
+        description: 'Get the current date and time. NEVER guess the current date from memory — call this.',
+        parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+        },
+        handler: async () => {
+            const now = new Date();
             return {
                 success: true,
-                result: `[Simulated search for: "${args.query}"]`,
+                iso: now.toISOString(),
+                local: now.toString(),
+                epochMs: now.getTime(),
             };
+        },
+    },
+    {
+        // 2026-08-13: the webchat can answer "how's the pipeline / when does
+        // the audit finish" itself — same data the main session reads.
+        name: 'audit_status',
+        category: 'oculus',
+        description: 'Get the Oculus pipeline status: cycle, phase, running/paused, and audit pass/batch progress.',
+        parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+        },
+        handler: async () => {
+            const read = (p) => {
+                try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch { return null; }
+            };
+            const wf = read('/home/roni/Roni_Workspace/audits_plans/workflow_state.json');
+            const ad = read('/home/roni/Roni_Workspace/audits_plans/audit_state.json');
+            return {
+                success: true,
+                cycle: (wf && wf.cycle) ?? null,
+                phase: (wf && wf.phase) ?? null,
+                running: (wf && wf.running) ?? null,
+                paused: (wf && wf.paused) ?? null,
+                audit: ad ? {
+                    pass: ad.current_pass,
+                    numPasses: ad.num_passes ?? null,
+                    batchesDone: (ad.current_pass_completed_batches || []).length,
+                    totalBatches: ad.total_batches ?? null,
+                    completedPasses: ad.completed_passes || [],
+                } : null,
+            };
+        },
+    },
+    {
+        // 2026-08-13: read-only repo state for the workspace repos.
+        name: 'git_status',
+        category: 'git',
+        description: 'Read-only git status (branch, short status, last 3 commits) of a workspace repo.',
+        parameters: {
+            type: 'object',
+            properties: {
+                repo: {
+                    type: 'string',
+                    description: 'Repo: oculus (default), webchat-api, or helpotron',
+                },
+            },
+            required: [],
+        },
+        handler: async (args) => {
+            const repos = {
+                oculus: '/home/roni/Roni_Workspace/oculus',
+                'webchat-api': '/home/roni/Roni_Workspace/webchat-api',
+                helpotron: '/home/roni/Roni_Workspace/helpotron',
+            };
+            const dir = repos[String((args && args.repo) || 'oculus')];
+            if (!dir) {
+                return { success: false, error: `unknown repo; use one of: ${Object.keys(repos).join(', ')}` };
+            }
+            const st = await runCmd(['git', '-C', dir, 'status', '--short', '--branch']);
+            const lg = await runCmd(['git', '-C', dir, 'log', '--oneline', '-3']);
+            return {
+                success: st.success,
+                branchStatus: st.stdout,
+                recentCommits: lg.stdout,
+            };
+        },
+    },
+    {
+        // 2026-08-13: the webchat can message the owner directly — appends to
+        // the same outbox the orchestrator relay delivers. "webchat: " prefix
+        // enforced per the user's 08-13 contract.
+        name: 'telegram_send',
+        category: 'telegram',
+        description: 'Send a Telegram message to the owner (delivered via the outbox relay; "webchat: " prefix auto-added).',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'Message text' },
+            },
+            required: ['text'],
+        },
+        handler: async (args) => {
+            const OUTBOX = '/home/roni/Roni_Workspace/audits_plans/claude_outbox.json';
+            let text = String((args && args.text) || '').trim();
+            if (!text) return { success: false, error: 'empty text' };
+            if (!/^webchat: /i.test(text)) text = 'webchat: ' + text;
+            let out = [];
+            try { out = JSON.parse(fs.readFileSync(OUTBOX, 'utf-8')); } catch { out = []; }
+            if (!Array.isArray(out)) out = [];
+            out.push({ ts: new Date().toISOString(), from: 'claude', text });
+            const tmp = OUTBOX + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf-8');
+            fs.renameSync(tmp, OUTBOX);
+            return { success: true, message: 'queued for Telegram delivery' };
         },
     },
 ];
