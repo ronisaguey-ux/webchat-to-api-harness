@@ -41,6 +41,17 @@ const cfg = {
     // after attaching to the tab. Headless instances leave it unset.
     viewportW: parseInt(process.env.VIEWPORT_W) || 0,
     viewportH: parseInt(process.env.VIEWPORT_H) || 0,
+    // 08-14 OPTIMIZATION (owner's performance guide): network-level asset
+    // blocking — images/fonts/media are aborted at the CDP layer (RAM +
+    // bandwidth win on heavy sites like gemini; document/script/xhr/fetch/
+    // websocket always pass). Stylesheets blocked only when BLOCKED_CSS=1
+    // (deepseek SPAs are stable; gemini's layout is fragile — leave off).
+    // BLOCKED_URLS_EXTRA = comma-separated extra glob patterns.
+    blockedUrls: (process.env.BLOCKED_URLS_EXTRA ? process.env.BLOCKED_URLS_EXTRA.split(',') : [])
+        .concat(process.env.BLOCKED_CSS === 'true' ? ['*.css*'] : [])
+        .concat(['*.png*', '*.jpg*', '*.jpeg*', '*.gif*', '*.webp*', '*.avif*',
+                 '*.svg*', '*.ico*', '*.woff*', '*.woff2*', '*.ttf*', '*.otf*',
+                 '*.mp4*', '*.mp3*', '*.webm*']),
 
     // Context handoff (08-13, threshold corrected 08-14): when the completion
     // REQUEST body (history + system + tools + message) crosses the threshold,

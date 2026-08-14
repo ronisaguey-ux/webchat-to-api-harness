@@ -137,7 +137,11 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 | Env var | Default | Meaning |
 |---|---|---|
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | bind address |
-| `WEBCHAT_URL` | `https://chat.deepseek.com` | target chat |
+| `WEBCHAT_URL` | `https://chat.deepseek.com` | target chat (needs `WEBCHAT_URL_OVERRIDE=true` to take effect when a `chat.js` exists) |
+| `WEBCHAT_URL_OVERRIDE` | `false` | `true` makes `WEBCHAT_URL` beat the `chat.js` URL |
+| `TAB_URL_SUBSTRING` | *(none)* | attach to the open tab whose URL contains this substring (multi-site instances) |
+| `CDP_WS_URL` | *(from `chat.js`)* | attach to an already-running browser via its DevTools ws URL; wins over `chat.js` `cdpWsUrl` |
+| `MODEL_NAME` | `deepseek webchat` | model id advertised by `/v1/models`; gateway routes accept `deepseek-v4-pro` / `deepseek-v4-flash` |
 | `HEADLESS` | `false` | visible browser for login |
 | `TIMEOUT` | `60000` | max wait for a response (ms) |
 | `TOOL_CONTEXT_WINDOW` | `8000` | cap on the tools section of the prompt (chars) |
@@ -148,9 +152,54 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 | `EXEC_TIMEOUT_MS` | `10000` | per-command bash timeout |
 | `SKIP_BROWSER` | `false` | run server without a browser (testing) |
 | `SELECTOR_*` | see `config.js` | comma-separated CSS selector lists, first match wins |
+| `VIEWPORT_W` / `VIEWPORT_H` | `0` / `0` | pin the chat viewport (used by multi-site drivers) |
+| `BLOCKED_URLS_EXTRA` | *(none)* | extra URL globs to block at the network layer (comma-separated) |
+| `BLOCKED_CSS` | `false` | `true` also blocks all `*.css*` (DeepSeek-only — other layouts break without stylesheets) |
 | `CONTEXT_HANDOFF_ENABLED` | `true` | auto-swap to a new chat at the context threshold |
 | `CONTEXT_HANDOFF_THRESHOLD` | `100000` | rough per-request context estimate that triggers the handoff (chars/4 ≈ tokens) |
 | `HANDOFF_FILE` | `/home/roni/Roni_workspace/handoff_to_new_chat.md` | where the handoff document is written |
+
+## Performance & resource tuning (2026-08-14)
+
+The webchat tab is the stack's dominant memory/CPU consumer. The harness
+ships two knobs to strip it down, plus a lean launch profile for the Chrome
+it drives.
+
+**Network-level asset blocking.** On attach the driver installs
+`Network.setBlockedURLs` and drops media/font blobs before they ever render.
+Chrome never downloads or decodes them — a chat tab that idled at hundreds of
+MB of decoded images stays at a few tens.
+
+- Always on: `*.png *.jpg *.jpeg *.gif *.webp *.avif *.svg *.ico *.woff
+  *.woff2 *.ttf *.otf *.mp4 *.mp3 *.webm`
+- `BLOCKED_CSS=true` additionally blocks all `*.css*` (DeepSeek-only; the
+  Gemini/ChatGPT layouts break without stylesheets)
+- `BLOCKED_URLS_EXTRA='*.js*,*.json*'` strips scripts too for a pure-text
+  head — nothing else on the page works, diagnostics only
+- Verify at attach time: the gateway logs `🚫 Asset blocking ON (N patterns)`
+
+**Lean Chrome launch profile** (persistent-CDP mode):
+
+```bash
+--disable-gpu --disable-dev-shm-usage --disable-background-networking \
+--disable-sync --disable-translate --metrics-recording-only --mute-audio \
+--js-flags=--max-old-space-size=512
+```
+
+The first three are the memory/CPU wins; the rest stop telemetry, sync and
+audio churn. Headless instances add `--headless=new --no-sandbox` with a
+spoofed UA. Verify a live instance with `tr '\0' ' ' < /proc/<pid>/cmdline`.
+
+**Multiple sites = multiple drivers.** This box runs two persistent Chrome
+instances: a GUI one (port 9223, watch window) and a `--headless=new` one
+(port 9224). Gemini attaches to the **headless** instance — the GUI instance
+cannot generate responses (a client-side, pre-network failure reproduced on
+fresh tabs; see the ops guide). Each gateway targets its own tab via
+`TAB_URL_SUBSTRING`, so one driver serves several chats.
+
+See **`docs/OPERATIONS_AND_PERFORMANCE.md`** — the full instruction guide:
+architecture (gateways / tabs / drivers), env reference, send-flow internals,
+context handoff, and troubleshooting recipes.
 
 ## Troubleshooting
 
