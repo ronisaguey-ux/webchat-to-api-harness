@@ -770,16 +770,30 @@ async function installStreamTee() {
             }
             return out;
         };
-        if (window.__wsTee && window.__wsTeeSeq) return;
-        window.__wsTee = [];
-        window.__wsTeeSeq = 0;
+        // 08-13 VERSIONED RE-ARM: the guard below must NOT skip an upgrade —
+        // a long-lived page keeps the interceptor closure it got at install,
+        // so code fixes (the 08-13 request-body capture) never reached pages
+        // armed by an older build and the handoff pre-check read 0 forever.
+        // New installs wrap the old wrapper (chain: new → old → real send);
+        // push dedupes consecutive identical bodies so an upgrade never
+        // doubles entries. The buffer/seq survive the upgrade — the reader
+        // takes a seq snapshot at entry and skips everything older.
+        if (window.__wsTeeV === 2) return;
+        if (!window.__wsTee || typeof window.__wsTeeSeq !== 'number') {
+            window.__wsTee = [];
+            window.__wsTeeSeq = 0;
+        }
+        window.__wsTeeV = 2;
         // XHR/fetch interceptors (buffer pushes — the parser above is the
-        // only per-install part; these must not double-install).
+        // only per-install part; re-wrapping is safe thanks to the dedupe).
         const push = (body) => {
+            const s = String(body || '');
+            const prev = window.__wsTee[window.__wsTee.length - 1];
+            if (prev && prev.body === s) return; // upgrade double-wrap dedupe
             // seq is monotonic and survives the 32-entry eviction — the
             // reader matches on seq, not array position (see the CAP BUG
             // comment in readStreamedAnswer).
-            window.__wsTee.push({ body: String(body || ''), at: Date.now(), seq: ++window.__wsTeeSeq });
+            window.__wsTee.push({ body: s, at: Date.now(), seq: ++window.__wsTeeSeq });
             // 08-13 WEDGE FIX: 8 entries was evicting long tool-loop streams
             // (compaction/tool runs push many completion XHRs); 32 keeps the
             // window safe for any serialized burst.
@@ -794,6 +808,13 @@ async function installStreamTee() {
         XMLHttpRequest.prototype.send = function (...args) {
             const x = this;
             if (x.__wsUrl && x.__wsUrl.includes('/api/v0/chat/completion')) {
+                // 08-13 CONTEXT-HANDOFF: capture the REQUEST body size at send
+                // time — DeepSeek's cap is per-request (history + system +
+                // tools + message, observed failing at ~135k chars / ~32k
+                // tokens), so this length is the true context measure. Set on
+                // send (not loadend) so a request that FAILS with
+                // context_length_exceeded still records how big it was.
+                window.__wsTeeReqBodyChars = String(args[0] || '').length;
                 x.addEventListener('loadend', () => { if (x.status === 200) push(x.responseText); });
             }
             return origSend.apply(this, args);
@@ -802,11 +823,35 @@ async function installStreamTee() {
         window.fetch = function (u, o) {
             const p = origFetch.apply(this, arguments);
             if (String(u || '').includes('/api/v0/chat/completion')) {
+                const body = (o && o.body) ? String(o.body) : '';
+                if (body.length) window.__wsTeeReqBodyChars = body.length;
                 p.then((r) => r.clone().text()).then(push).catch(() => {});
             }
             return p;
         };
     });
+}
+
+// Read the last completion REQUEST body size (chars) recorded by the tee.
+// 0 = nothing captured yet (fresh thread / tee just reset) — callers treat
+// that as "no history, never hand off".
+async function getReqBodyChars() {
+    try { return await page.evaluate(() => window.__wsTeeReqBodyChars || 0); } catch { return 0; }
+}
+
+// After a context-handoff thread swap the page's counters describe the OLD
+// thread — a stale ~threshold-sized body would immediately re-trigger a
+// handoff on the fresh chat. Clear the request-size record and the stream
+// buffer (its entries belong to the old thread's requests; the reader takes
+// a seq snapshot at entry, so zeroing the seq is safe between requests).
+async function resetTeeForHandoff() {
+    try {
+        await page.evaluate(() => {
+            window.__wsTeeReqBodyChars = 0;
+            window.__wsTee = [];
+            window.__wsTeeSeq = 0;
+        });
+    } catch { /* page busy — the next send re-arms/overwrites anyway */ }
 }
 
 // 08-13 WEDGE FIX: a DOM answer that "stopped growing" mid-stream is NOT a
@@ -1228,4 +1273,6 @@ module.exports = {
     openNewChat,
     sendFirstMessage,
     openNewChatAndSeed,
+    getReqBodyChars,
+    resetTeeForHandoff,
 };
