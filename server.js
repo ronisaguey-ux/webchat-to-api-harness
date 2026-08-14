@@ -376,6 +376,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     // attempt gets a correction — never a raw leak to the client.
     let proseRounds = 0;      // conversation mode: consecutive prose-only replies
     let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
+    let narrationNudged = false; // strict mode: send_message narration taught once per request
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
 
     for (let round = 0; round < config.maxToolRounds; round++) {
@@ -407,6 +408,24 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // The model's intent message rides ahead of the tool call — the
             // client sees "what I'm about to do" before the 🔧 line.
             if (parsed.prose) onProgress?.({ type: 'text', text: parsed.prose });
+
+            // 08-13 EVENING (user rule "force it"): a work tool call with NO
+            // prose and NO send_message means the model skipped narration —
+            // nudge it ONCE per request to send send_message first. (Bounded:
+            // one extra round max; the call itself is not lost, the model
+            // re-sends it after the send_message.)
+            if (
+                !config.allowPlainText &&
+                !parsed.prose &&
+                call.toolName !== SUBMIT_TOOL &&
+                call.toolName !== 'send_message' &&
+                !narrationNudged
+            ) {
+                narrationNudged = true;
+                console.log(`💬 narration nudge (round ${round + 1}) — work call without send_message`);
+                response = await countedSend(NARRATION_MSG, toolDefs);
+                continue;
+            }
 
             // The model delivered its final answer through submit_answer.
             // Accepted unconditionally (user rule 08-12: the model decides
@@ -442,7 +461,9 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             const followUp =
                 `Tool call "${call.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
                 (config.allowPlainText
-                    ? 'You may send ONE plain-text progress line (delivered to the user), then your NEXT tool call JSON, fenced. ' +
+                    ? 'You MUST send ONE plain-text 💬 line before your next tool call (your thinking + what the ' +
+                      'tool is about to do and why — delivered to the user verbatim; user rule 08-13), then your ' +
+                      'NEXT tool call JSON, fenced. ' +
                       'When the entire task is done AND verified, reply with a fenced submit_answer carrying your final summary ' +
                       'message. Keep progress lines to one sentence — the work is the tool calls. ' +
                       'Verify with run_bash: syntax checks, import tests, dependency checks, and the project tests. ' +
@@ -559,6 +580,13 @@ function truncateForClient(text) {
 // Harness protocol (08-13): the model sent a prose-only reply. Deliver it,
 // then nudge it back into tool mode — the user's exact ask: "it sends the
 // message, then a message back so it can send the tool call".
+const NARRATION_MSG =
+    '### NARRATION REQUIRED (user rule 08-13 EVENING)\n' +
+    'Your last tool call was NOT preceded by a send_message. Before ANY work tool call you MUST send ' +
+    'send_message first: one short 💬 line with what you are thinking and what the tool call you are about ' +
+    'to make does and why (delivered to the user verbatim). Reply NOW with that send_message call. ' +
+    'Then continue with your work tool call as usual.';
+
 const PROSE_NUDGE =
     'Your message was delivered to the user. Continue the task: send your NEXT tool call JSON, fenced as ```json ... ``` — ' +
     'or a fenced submit_answer if the entire task is done and verified. ' +
