@@ -938,7 +938,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Error:', error);
-        if (!res.writableEnded && !res.destroyed) {
+        // 08-13 EVENING: headersSent guard — a crashed-stream attempt here
+        // threw ERR_HTTP_HEADERS_SENT and killed the process the same way.
+        if (!res.headersSent && !res.writableEnded && !res.destroyed) {
             res.status(500).json({ error: { message: error.message, type: 'api_error' } });
         }
     }
@@ -1088,13 +1090,19 @@ app.post('/v1/messages', async (req, res) => {
         res.end();
     } catch (error) {
         console.error('❌ Error:', error);
-        // 08-12: the client can disconnect while handleRequest is still working
-        // (their 180s timeout) — writing a 500 to an already-ended response
-        // threw ERR_HTTP_HEADERS_SENT and CRASHED the whole server (the 2nd
-        // session's "connection refused · retrying" loop). Only respond if the
-        // response is still writable.
-        if (!res.writableEnded && !res.destroyed) {
+        // 08-13 EVENING: the 08-12 writableEnded guard missed the SSE path —
+        // ev() writes had ALREADY sent headers when handleRequest threw (180s
+        // waitForResponse timeout mid run-until-done task) → res.json() threw
+        // ERR_HTTP_HEADERS_SENT → whole process crashed → "connection refused"
+        // for every client. Guard headersSent too; on the stream, end with an
+        // SSE error event instead of a 500.
+        if (!res.headersSent && !res.writableEnded && !res.destroyed) {
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: error.message } });
+        } else if (!res.writableEnded && !res.destroyed) {
+            try {
+                res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: error.message } })}\n\n`);
+                res.end();
+            } catch (e) { /* client already gone */ }
         }
     }
 });
