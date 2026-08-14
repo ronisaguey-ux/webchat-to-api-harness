@@ -7,7 +7,7 @@ const { Readable } = require('stream');
 const config = require('./config');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
-    buildFullPrompt, openNewChatAndSeed,
+    buildFullPrompt, openNewChatAndSeed, getReqBodyChars, resetTeeForHandoff,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 
@@ -18,6 +18,70 @@ const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanPro
 // ms (queued, not rejected) so the account never sees a burst from us.
 const MIN_SEND_INTERVAL_MS = parseInt(process.env.MIN_SEND_INTERVAL_MS || '6000', 10);
 let lastSendAt = 0;
+
+// 08-13 CONTEXT-HANDOFF (real measure): the completion XHR's REQUEST body
+// size (history + system + tools + message, chars) — exactly what DeepSeek
+// counts against its per-request cap (observed failing at ~135k chars ≈ 32k
+// tokens while smaller bodies passed; the manual message that "answered"
+// after failures succeeded because it carried no system/tools overhead).
+// Refreshed from the page after every send; 0 = nothing captured yet (fresh
+// thread / post-swap reset) → never hand off.
+let lastReqBodyChars = 0;
+
+// Shared send path: rate-limit spacing + body refresh + one timeout retry.
+// Module scope so the handoff doc flow (runHandoff) uses the same gate.
+let sendRetriesLeft = 1;
+// Post-swap grace: the first request after a handoff always reaches the
+// fresh thread (its seeded body can be ≥ threshold by itself — overhead +
+// doc — and must not re-trigger the pre-send handoff immediately).
+let lastHandoffAt = 0;
+// Per-request handoff context (module-level so countedSend can trigger the
+// handoff from the ERROR path — see the CONTEXT_FULL catch below). Refreshed
+// at every handleRequest start and whenever a tool executes.
+let activeHandoffCtx = null;
+async function countedSend(msg, defs) {
+    // 08-13 RATE-LIMIT GATE: queue-spaced sends (see MIN_SEND_INTERVAL_MS
+    // above). DeepSeek rejected burst traffic with a hint-error that this
+    // harness previously could not see — requests hung until timeout, the
+    // client retried, and the retry storm deepened the limit.
+    const waitMs = lastSendAt + MIN_SEND_INTERVAL_MS - Date.now();
+    if (waitMs > 0) {
+        console.log(`⏱ send gate: waiting ${waitMs}ms (account rate limit spacing)`);
+        await sleep(waitMs);
+    }
+    lastSendAt = Date.now();
+    try {
+        const r = await sendPrompt(msg, defs);
+        lastReqBodyChars = await getReqBodyChars();
+        return r;
+    } catch (e) {
+        // 08-13 HARD-CAP SAFETY NET: the pre-send measurement can be blind
+        // (page tee armed by an old build, race, fresh-thread overflow) —
+        // then the send FAILS with context_length_exceeded and the client
+        // got a hard error. Convert that failure into the handoff instead.
+        // Grace-guarded: while a handoff is in progress (≤2 min), rethrow so
+        // runHandoff's own try/catch falls back to the summary — never a
+        // nested handoff recursion on the same full thread.
+        if (/Length limit reached|context_length_exceeded/.test(String(e.message))) {
+            if (Date.now() - lastHandoffAt > 120000 && activeHandoffCtx) {
+                console.log(`📈 hard context limit hit (${String(e.message).slice(0, 90)}) — handing off`);
+                return await runContextHandoff(activeHandoffCtx);
+            }
+            throw e;
+        }
+        if (sendRetriesLeft > 0 && /Timed out/.test(String(e.message))) {
+            sendRetriesLeft--;
+            console.log('⏱ send timed out — resending with a RETRY banner');
+            const r = await sendPrompt(
+                '### RETRY (the previous message may not have reached you — here it is again)\n' + msg,
+                defs
+            );
+            lastReqBodyChars = await getReqBodyChars();
+            return r;
+        }
+        throw e;
+    }
+}
 
 const app = express();
 app.use(cors());
@@ -327,46 +391,37 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         return null;
     }
 
-    // Context-handoff accounting (08-13): every sendPrompt's FULL built prompt
-    // (tool section included) plus every model reply counts toward the rough
-    // per-request context estimate. When it crosses the threshold the loop
-    // stops and the handoff flow takes over (see runContextHandoff).
-    let cycleTokens = 0;
-    let sendRetriesLeft = 1; // 08-13: one resend when a send times out — the
-    // tab can drop a followUp while busy and the loop would otherwise hang to
-    // the 180s deadline (the "stops mid task" wedge on helpotron).
-    const countedSend = async (msg, defs) => {
-        // 08-13 RATE-LIMIT GATE: queue-spaced sends (see MIN_SEND_INTERVAL_MS
-        // above). DeepSeek rejected burst traffic with a hint-error that this
-        // harness previously could not see — requests hung until timeout, the
-        // client retried, and the retry storm deepened the limit.
-        const waitMs = lastSendAt + MIN_SEND_INTERVAL_MS - Date.now();
-        if (waitMs > 0) {
-            console.log(`⏱ send gate: waiting ${waitMs}ms (account rate limit spacing)`);
-            await sleep(waitMs);
-        }
-        lastSendAt = Date.now();
-        cycleTokens += estimateTokens(msg) + TOOL_SECTION_TOKENS;
-        try {
-            const r = await sendPrompt(msg, defs);
-            cycleTokens += estimateTokens(r);
-            return r;
-        } catch (e) {
-            if (sendRetriesLeft > 0 && /Timed out/.test(String(e.message))) {
-                sendRetriesLeft--;
-                console.log('⏱ send timed out — resending with a RETRY banner');
-                const r = await sendPrompt(
-                    '### RETRY (the previous message may not have reached you — here it is again)\n' + msg,
-                    defs
-                );
-                cycleTokens += estimateTokens(r);
-                return r;
-            }
-            throw e;
-        }
-    };
+    // Context-handoff accounting (08-13): the tee records the completion
+    // REQUEST body size after every send — the true per-request context
+    // (DeepSeek's cap is on history + system + tools + message together).
+    // lastReqBodyChars is refreshed by the module-level countedSend; the
+    // pre-send check fires when the thread is ALREADY near the cap, the
+    // round-top check fires when the body GROWS past it mid-tool-loop.
+    sendRetriesLeft = 1; // per-request timeout-retry budget for countedSend
+
+    // Pre-send context check: if the LAST recorded request body (the previous
+    // request's full history + overhead) is already at/over the threshold,
+    // the thread is near DeepSeek's cap — hand off BEFORE sending anything.
+    // Fresh threads read 0 here (nothing captured) and never trip this path;
+    // the lastHandoffAt grace lets a just-seeded thread (whose body is
+    // overhead + doc, possibly ≥ threshold) run its first request. Growth
+    // during the request is handled by the round-top check.
+    lastReqBodyChars = await getReqBodyChars();
+    if (
+        config.contextHandoffEnabled &&
+        lastReqBodyChars >= config.contextHandoffThreshold &&
+        Date.now() - lastHandoffAt > 120000
+    ) {
+        console.log(`📈 request body already at handoff threshold (${lastReqBodyChars} chars ≥ ${config.contextHandoffThreshold}) — handing off`);
+        return runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo: null });
+    }
+
+    activeHandoffCtx = { toolDefs, onProgress, isAborted, userPrompt, lastToolInfo: null };
 
     let response = await countedSend(prompt, toolDefs);
+    // Growth baseline: captured AFTER the first send so a request whose body
+    // starts large (fresh seed, big overhead) isn't seen as "grown" by it.
+    let requestStartBody = lastReqBodyChars;
 
     // Harness protocol (08-13): the model interleaves plain-text messages with
     // tool calls — "what I'm about to do" → tool call → result → next call →
@@ -385,9 +440,17 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             console.log(`🔴 client disconnected — aborting webchat loop (round ${round + 1})`);
             return null;
         }
-        // Context limit crossed (rough threshold) — hand off to a new chat.
-        if (config.contextHandoffEnabled && cycleTokens >= config.contextHandoffThreshold) {
-            console.log(`📈 context threshold crossed (est. ${cycleTokens} ≥ ${config.contextHandoffThreshold}) — handing off`);
+        // Context limit crossed (real request-body size) — hand off to a new
+        // chat. Growth guard: the body must have grown >8k chars during THIS
+        // request — a big-overhead first message on a fresh thread can already
+        // sit at/over the threshold and must not hand off without accumulated
+        // work (that's the perpetual-handoff trap).
+        if (
+            config.contextHandoffEnabled &&
+            lastReqBodyChars >= config.contextHandoffThreshold &&
+            lastReqBodyChars - requestStartBody > 8000
+        ) {
+            console.log(`📈 context threshold crossed (request body ${lastReqBodyChars} chars ≥ ${config.contextHandoffThreshold}, grew ${lastReqBodyChars - requestStartBody} this request) — handing off`);
             return runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo });
         }
         // 08-13 user rule: tool-call size cap — oversized replies (the chat
@@ -436,6 +499,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             }
             onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
             lastToolInfo = { tool: call.toolName, args: call.args };
+            if (activeHandoffCtx) activeHandoffCtx.lastToolInfo = lastToolInfo;
             // 08-13 EVENING (user rule): send_message is the JSON-only way to
             // talk to the user — deliver its text to the client as a 'text'
             // progress event (rendered "💬 <text>") instead of running a tool.
@@ -678,61 +742,89 @@ function buildHandoffPrompt(lastToolInfo) {
 
 // Ask the model for the handoff document (≤6 rounds: write_file the doc, then
 // submit_answer). Returns the document CONTENT, or null if the client aborted.
+// 08-13 HARDENING: sends go through countedSend (rate-limit spacing + body
+// refresh), and the whole flow is wrapped — if the thread hits the hard cap
+// MID-document (context_length_exceeded on a doc write), the caller's
+// fallback summary takes over instead of a 500.
 async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo }) {
-    let response = await sendPrompt(buildHandoffPrompt(lastToolInfo), toolDefs);
+    // handoffPath is read AFTER the try/catch (fallback path) — it must live
+    // at function scope, not inside the try (08-13: ReferenceError when the
+    // doc flow failed and the fallback read loop ran).
     let handoffPath = null;
-    for (let round = 0; round < 6; round++) {
-        if (isAborted?.()) return null;
-        // 08-13 size cap (see MAX_TOOL_CALL_CHARS): the handoff doc is the
-        // classic oversized-write target — chunk it instead of mangling it.
-        if (response.length > MAX_TOOL_CALL_CHARS) {
-            console.log(`⚠️ handoff tool call too big (${response.length} chars) — chunking instruction sent`);
-            response = await sendPrompt(TOO_BIG_MSG, toolDefs);
-            continue;
+    try {
+        let response = await countedSend(buildHandoffPrompt(lastToolInfo), toolDefs);
+        for (let round = 0; round < 6; round++) {
+            if (isAborted?.()) return null;
+            // 08-13 size cap (see MAX_TOOL_CALL_CHARS): the handoff doc is the
+            // classic oversized-write target — chunk it instead of mangling it.
+            if (response.length > MAX_TOOL_CALL_CHARS) {
+                console.log(`⚠️ handoff tool call too big (${response.length} chars) — chunking instruction sent`);
+                response = await countedSend(TOO_BIG_MSG, toolDefs);
+                continue;
+            }
+            const parsed = parseToolCalls(response);
+            if (parsed.toolCalls.length) {
+                const call = parsed.toolCalls[0];
+                if (call.toolName === SUBMIT_TOOL) break;
+                onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
+                const result = await executeTool(call.toolName, call.args);
+                const p = String(call.args?.path || '');
+                if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
+                response = await countedSend(
+                    `Tool call "${call.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
+                    'The task is: write the handoff document via write_file (if you have not yet) at EXACTLY ' +
+                    `${config.handoffFile}, then reply with a fenced submit_answer — one line confirming the path.`,
+                    toolDefs
+                );
+                continue;
+            }
+            if (looksLikeBrokenToolJson(response) && round < 2) {
+                response = await countedSend(MALFORMED_MSG, toolDefs);
+                continue;
+            }
+            if (round < 2) {
+                response = await countedSend(PROSE_NUDGE, toolDefs);
+                continue;
+            }
+            break;
         }
-        const parsed = parseToolCalls(response);
-        if (parsed.toolCalls.length) {
-            const call = parsed.toolCalls[0];
-            if (call.toolName === SUBMIT_TOOL) break;
-            onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
-            const result = await executeTool(call.toolName, call.args);
-            const p = String(call.args?.path || '');
-            if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
-            response = await sendPrompt(
-                `Tool call "${call.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
-                'The task is: write the handoff document via write_file (if you have not yet) at EXACTLY ' +
-                `${config.handoffFile}, then reply with a fenced submit_answer — one line confirming the path.`,
-                toolDefs
-            );
-            continue;
-        }
-        if (looksLikeBrokenToolJson(response) && round < 2) {
-            response = await sendPrompt(MALFORMED_MSG, toolDefs);
-            continue;
-        }
-        if (round < 2) {
-            response = await sendPrompt(PROSE_NUDGE, toolDefs);
-            continue;
-        }
-        break;
+    } catch (e) {
+        // Thread hit the hard cap mid-document (or the page died) — the model
+        // couldn't finish the doc; the fallback summary below still carries
+        // the request + last tool work into the new chat.
+        console.log(`⚠️ handoff doc flow failed (${String(e.message).slice(0, 200)}) — using fallback summary`);
     }
 
     // Read the document back (the model's tracked path first, the configured
-    // path second; fall back to a gateway-built summary).
+    // path second; fall back to a gateway-built summary). Freshness gate:
+    // the configured file may hold an OLD handoff from a previous swap —
+    // only accept it if written within the last 5 minutes by THIS flow.
     let content = '';
     for (const p of [handoffPath, config.handoffFile]) {
         if (!p) continue;
         try {
+            const st = fs.statSync(p);
+            if (Date.now() - st.mtimeMs > 300000) continue; // stale doc — skip
             content = fs.readFileSync(p, 'utf8');
         } catch { /* try next */ }
         if (content && content.trim().length > 20) break;
         content = '';
     }
     if (!content.trim()) {
+        // Gateway-built summary (08-13): scrapes the rendered thread (the
+        // "look at chat history" requirement) so the fresh chat still carries
+        // what was being discussed even when the model couldn't write a doc.
+        let recent = '';
+        try {
+            recent = String(
+                (await getPage().evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '')) || ''
+            ).slice(-3000);
+        } catch { /* page busy — summary without the scrape */ }
         content = '# Context handoff (automatic)\n\n' +
             'The webchat reached its context limit before the model produced a full document.\n\n' +
             `- User's request: ${(userPrompt || '').slice(0, 400)}\n` +
             `- Last tool work: ${lastToolInfo ? JSON.stringify(lastToolInfo).slice(0, 1500) : 'none recorded'}\n\n` +
+            (recent ? `- Recent thread content (scraped from the old chat):\n\n${recent}\n\n` : '') +
             '_(auto-generated by the gateway context-handoff)_\n';
     }
     return content;
@@ -741,6 +833,11 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
 // Full handoff sequence: doc → fresh chat → seed → re-pin this instance →
 // persist pins for respawns. Returns the client-facing summary (or null).
 async function runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo }) {
+    // Grace stamped FIRST: from here until 2 min after the swap, any
+    // context-length error inside the doc flow rethrows into runHandoff's
+    // fallback instead of recursing into another handoff on the same full
+    // thread (the error path in countedSend checks this timestamp).
+    lastHandoffAt = Date.now();
     onProgress?.({ type: 'text', text: '⚠️ context threshold reached — generating handoff document' });
     const content = await runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo });
     if (content === null) return null;
@@ -752,6 +849,16 @@ async function runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, 
     onProgress?.({ type: 'text', text: '💬 handoff written — opening a new chat' });
     const { url: newUrl } = await openNewChatAndSeed(content);
     const newId = (newUrl.match(/\/a\/chat\/s\/([0-9a-f-]+)/) || [])[1];
+
+    // 08-13 STALE-BODY FIX: the tee's stream buffer and page-side counter
+    // now describe the OLD thread (its last body was at/over threshold). Read
+    // the SEED request's body first (that IS the fresh thread's true size),
+    // then wipe the page-side state so stale entries/counters can't re-trigger
+    // this handoff — and stamp the grace so the fresh thread's first request
+    // is never refused for a body it legitimately has.
+    lastReqBodyChars = await getReqBodyChars();
+    await resetTeeForHandoff();
+    lastHandoffAt = Date.now();
 
     // Re-target THIS instance: the next request lands on the new thread.
     if (newId) config.tabUrlSubstring = newId;
