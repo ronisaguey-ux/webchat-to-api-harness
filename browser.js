@@ -183,6 +183,22 @@ async function connectToWebchat(webchatUrl) {
                 console.log('⚠️ viewport pin failed:', String(e.message).slice(0, 70));
             }
         }
+        // 08-14 OPTIMIZATION (owner's guide): strip browser bloat at the
+        // network layer — images/fonts/media (and stylesheets if BLOCKED_CSS=1)
+        // are aborted; the chat app itself (document/script/xhr/fetch/
+        // websocket) is untouched. Chrome's setBlockedURLs globs match
+        // anywhere in the URL, so query-string'd assets are caught too.
+        if (config.blockedUrls && config.blockedUrls.length) {
+            try {
+                const n = await page.createCDPSession();
+                await n.send('Network.enable');
+                await n.send('Network.setBlockedURLs', { urls: config.blockedUrls });
+                await n.detach();
+                console.log(`🚫 Asset blocking ON (${config.blockedUrls.length} patterns)`);
+            } catch (e) {
+                console.log('⚠️ asset blocking failed:', String(e.message).slice(0, 70));
+            }
+        }
         await waitForChatInput(page);
         return page;
     }
@@ -464,6 +480,27 @@ async function sendMessage(input, text) {
                 return false;
             }, config.selectors.input);
             await sleep(400);
+            // 08-14 GEMINI FIX: programmatic el.focus() does not activate
+            // gemini's editor — Enter is then ignored and the send-button
+            // fallback can misfire (it once opened the model picker instead
+            // of sending). A trusted mouse click on the composer activates
+            // it; Enter then sends (verified 08-14 on the 9224 driver).
+            // DeepSeek's composer handles focus() fine — keep its proven path.
+            if (!new URL(config.webchatUrl).host.includes('deepseek')) {
+                const cRect = await page.evaluate((sels) => {
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                    }
+                    return null;
+                }, config.selectors.input);
+                if (cRect) {
+                    await page.mouse.click(cRect.x, cRect.y);
+                    await sleep(300);
+                }
+            }
             // 08-13 NEVER-SEND-EMPTY guard: if typing silently failed (composer
             // remounted mid-request, stale element), Enter would fire with an
             // empty box — DeepSeek shows "Message is empty" and the wait hangs
