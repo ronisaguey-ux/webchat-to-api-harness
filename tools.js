@@ -313,6 +313,10 @@ const TOOL_DEFINITIONS = [
                     batchesDone: (ad.current_pass_completed_batches || []).length,
                     totalBatches: ad.total_batches ?? null,
                     completedPasses: ad.completed_passes || [],
+                    // 08-14: the runner's final state write bumps current_pass to
+                    // num_passes+1 (by design) — flag completion so readouts stop
+                    // showing a scary "pass 6/5, 0 batches".
+                    allPassesComplete: (ad.completed_passes || []).length >= (ad.num_passes || 0),
                 } : null,
             };
         },
@@ -380,6 +384,41 @@ const TOOL_DEFINITIONS = [
             return { success: true, message: 'queued for Telegram delivery' };
         },
     },
+    {
+        // 2026-08-14 (user): the webchat's tool channel to the MAIN session.
+        // Appends to the same inbox the responder's FORWARD_TO_MAIN writes;
+        // a monitor wakes the main session. MAIN replies into
+        // claude_webchat_outbox.json with "to": <thread URL> and the gateway
+        // injects them into the thread's next message.
+        name: 'send_message_to_main',
+        category: 'oculus',
+        description:
+            'Send a message to the MAIN Claude session (backup operator/fixer). Use when you need ' +
+            'something beyond your tools: real file access, system decisions, or escalation. ' +
+            'The main session wakes immediately and its reply is shown to you in your next message.',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'The message to main (what you need, what you found)' },
+            },
+            required: ['text'],
+        },
+        handler: async (args, ctx) => {
+            const INBOX = '/home/roni/Roni_Workspace/audits_plans/claude_webchat_inbox.json';
+            const text = String((args && args.text) || '').trim();
+            if (!text) return { success: false, error: 'empty text' };
+            let out = [];
+            try { out = JSON.parse(fs.readFileSync(INBOX, 'utf-8')); } catch { out = []; }
+            if (!Array.isArray(out)) out = [];
+            const item = { ts: new Date().toISOString(), from: 'webchat', text };
+            if (ctx && ctx.threadId) item.thread = ctx.threadId;
+            out.push(item);
+            const tmp = INBOX + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf-8');
+            fs.renameSync(tmp, INBOX);
+            return { success: true, message: 'Message sent to main; its reply will appear in your next message.' };
+        },
+    },
 ];
 
 // ──────────────────────────────────────────────────────
@@ -390,7 +429,7 @@ function getToolDefinitions() {
     return TOOL_DEFINITIONS.map(({ handler, ...rest }) => rest);
 }
 
-async function executeTool(toolName, args) {
+async function executeTool(toolName, args, ctx) {
     const tool = TOOL_DEFINITIONS.find((t) => t.name === toolName);
     if (!tool) {
         return {
@@ -400,7 +439,7 @@ async function executeTool(toolName, args) {
     }
     console.log(`🔧 Executing: ${toolName}(${JSON.stringify(args)})`);
     try {
-        const result = await tool.handler(args || {});
+        const result = await tool.handler(args || {}, ctx || {});
         console.log(`✅ Tool ${toolName} executed.`);
         return result;
     } catch (e) {

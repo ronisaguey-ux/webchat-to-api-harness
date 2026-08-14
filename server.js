@@ -11,6 +11,40 @@ const {
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 
+// ── Main-reply injection (08-14, user) ───────────────────────────────────
+// The webchat can message MAIN via the send_message_to_main tool. MAIN
+// replies into claude_webchat_outbox.json with "to": <this gateway's thread
+// URL>; on the NEXT request to this thread the pending replies are appended
+// to the prompt so the webchat sees them in context. Seen-markers persist
+// per-port so replies are not re-injected after a gateway restart. The
+// telegram responder skips "to"-tagged items (they are gateway-routed).
+const MAIN_REPLY_FILE = '/home/roni/Roni_Workspace/audits_plans/claude_webchat_outbox.json';
+const MAIN_REPLY_SEEN_FILE =
+    '/home/roni/Roni_Workspace/audits_plans/.main_reply_seen_' + (process.env.PORT || 8080) + '.json';
+let mainReplyLastSeen = '';
+try { mainReplyLastSeen = JSON.parse(fs.readFileSync(MAIN_REPLY_SEEN_FILE, 'utf-8')).ts || ''; } catch (e) { /* first run */ }
+
+function injectMainReplies(msg) {
+    try {
+        if (!config.webchatUrl || typeof msg !== 'string') return msg;
+        let out = [];
+        try { out = JSON.parse(fs.readFileSync(MAIN_REPLY_FILE, 'utf-8')); } catch (e) { return msg; }
+        if (!Array.isArray(out)) return msg;
+        const mine = out.filter((m) => m && m.to === config.webchatUrl && (m.ts || '') > mainReplyLastSeen);
+        if (!mine.length) return msg;
+        const latest = mine.map((m) => m.ts || '').sort().pop();
+        const block = '\n\n### MAIN REPLY (from the MAIN Claude session — a reply to your send_message_to_main call)\n' +
+            mine.map((m) => String(m.text || '')).join('\n\n') +
+            '\n### END MAIN REPLY\n';
+        mainReplyLastSeen = latest;
+        try { fs.writeFileSync(MAIN_REPLY_SEEN_FILE, JSON.stringify({ ts: latest }), 'utf-8'); } catch (e) { /* best-effort */ }
+        console.log(`💬 injected ${mine.length} main reply(ies) into the next message (${String(config.webchatUrl).slice(0, 60)})`);
+        return msg + block;
+    } catch (e) {
+        return msg; // never break the send path
+    }
+}
+
 // 08-13 RATE-LIMIT GATE (user-visible hang fix): DeepSeek's account limiter
 // rejects bursts with "Messages too frequent. Try again later." — parallel
 // consumers (user client + orchestrator) hammering the same account made
@@ -433,7 +467,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
 
     activeHandoffCtx = { toolDefs, onProgress, isAborted, userPrompt, lastToolInfo: null };
 
-    let response = await countedSend(prompt, toolDefs);
+    let response = await countedSend(injectMainReplies(prompt), toolDefs);
     // Growth baseline: captured AFTER the first send so a request whose body
     // starts large (fresh seed, big overhead) isn't seen as "grown" by it.
     let requestStartBody = lastReqBodyChars;
@@ -524,7 +558,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 if (text) onProgress?.({ type: 'text', text });
                 result = { success: true, delivered: true, text };
             } else {
-                result = await executeTool(call.toolName, call.args);
+                result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
             }
             // 08-13 EVENING (user rule): NEVER end the tool loop after a tool
             // call — the model used "next":"done" mid-task and the harness
@@ -782,7 +816,7 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
                 const call = parsed.toolCalls[0];
                 if (call.toolName === SUBMIT_TOOL) break;
                 onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
-                const result = await executeTool(call.toolName, call.args);
+                const result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
                 const p = String(call.args?.path || '');
                 if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
                 response = await countedSend(
