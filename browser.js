@@ -7,6 +7,19 @@ let page = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 08-14 EXPERT SWAP (user rule: deepseek webchat runs in EXPERT mode — mode
+// is locked at thread creation, so an instant thread must be swapped to a
+// fresh expert chat). sendPrompt records the fresh thread here when the swap
+// fired; server.js consumes it via takeThreadSwap() and pins respawns, the
+// same way a context-handoff pins its new thread.
+let swappingToExpert = false;
+let threadSwapSeen = null;
+function takeThreadSwap() {
+    const t = threadSwapSeen;
+    threadSwapSeen = null;
+    return t;
+}
+
 // A stale CDP connection (Chrome died, object still says "connected") passes
 // every isConnected()-style check yet fails on real work. Probe the page for
 // real: a fast evaluate. Bounded to 3s so a half-open socket can't stall.
@@ -224,9 +237,23 @@ async function sendPrompt(prompt, toolDefinitions) {
     // hang on evaluate while fresh ones always work (observed on Gemini).
     await initBrowser({ reconnect: true });
     await connectToWebchat(config.webchatUrl);
-    // 08-13 user rule: DeepThink + Search must stay ON for the deepseek tab.
-    // The composer chips carry aria-pressed; click whatever is off. No-op for
-    // foreign webchats (no such chips) and never throws.
+    // 08-14 (user rule): the deepseek webchat runs in EXPERT mode. An instant
+    // thread (Search chip present) cannot be switched in place — swap to a
+    // fresh EXPERT chat; the in-flight prompt becomes its first message.
+    // EXPERT_SWAP_INSTANT=1 gates this to the instances that want it (8080 —
+    // the telegram responder's thread must never be silently swapped).
+    if (
+        process.env.EXPERT_SWAP_INSTANT === '1' &&
+        new URL(config.webchatUrl).host.includes('deepseek') &&
+        (await isInstantThread())
+    ) {
+        console.log('🧪 pinned thread is INSTANT — swapping to a fresh EXPERT chat');
+        swappingToExpert = true;
+        await openNewChat();
+    }
+    // 08-14: keep DeepThink ON for the deepseek tab (expert mode has only the
+    // DeepThink chip — Search is never touched). No-op for foreign webchats
+    // (no such chips) and never throws.
     await ensureToggles();
     console.log(`📤 Sending prompt (${prompt.length} chars)`);
 
@@ -266,32 +293,84 @@ async function sendPrompt(prompt, toolDefinitions) {
     const text = await waitForResponse(before, fullPrompt);
     console.log(`📥 Response received (${text.length} chars)`);
 
+    // 08-14 EXPERT-SWAP PIN: the first send on a fresh thread is what creates
+    // it — capture the new /s/ id so server.js can pin respawns (mirrors the
+    // handoff flow). Only when this send performed an expert swap.
+    if (swappingToExpert) {
+        swappingToExpert = false;
+        const u = page.url();
+        const m = u.match(/\/a\/chat\/s\/([0-9a-f-]+)/);
+        if (m && m[1]) threadSwapSeen = { url: u, id: m[1] };
+    }
+
     await saveCookies(); // keep the session fresh
     return text;
 }
 
-// 08-13 (user rule): keep DeepThink + Search enabled on the deepseek tab.
-// The composer toggles are .ds-toggle-button chips with aria-pressed state;
-// click whichever is OFF, idempotently, every request (a reload or tab flip
-// can reset them). Foreign webchats have no such chips — harmless no-op.
-// el.click() dispatches a real click event, which React's root listener
-// handles; verified against the live tab (deepseek 2.3.0, 08-13).
+// 08-14 (user rule): the deepseek tab runs in EXPERT mode, which has ONLY the
+// DeepThink chip (instant mode is the one with DeepThink + Search — the chip
+// set IS the mode). So keep DeepThink on and NEVER touch Search: force-on it
+// on an instant thread would lock that thread into instant. Idempotent, every
+// request (a reload or tab flip can reset the chips). Foreign webchats have
+// no such chips — harmless no-op.
 async function ensureToggles() {
     try {
         const clicked = await page.evaluate(() => {
             const flipped = [];
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
-                if (!/^(DeepThink|Search)$/i.test(label)) continue;
+                if (label !== 'DeepThink') continue;
                 if (el.getAttribute('aria-pressed') === 'true') continue;
                 el.click();
                 flipped.push(label);
             }
             return flipped;
         });
-        if (clicked && clicked.length) console.log('🧠 toggles enabled: ' + clicked.join(', '));
+        if (clicked && clicked.length) console.log('🧠 DeepThink enabled');
     } catch (e) {
         console.log('⚠ toggle ensure failed:', String(e.message).slice(0, 60));
+    }
+}
+
+// 08-14 (user rule): instant mode = Search chip present, expert = DeepThink
+// only. The chip set is the reliable mode detector — the mode itself is
+// locked at thread creation and cannot be read from the URL.
+async function isInstantThread() {
+    try {
+        return await page.evaluate(() =>
+            [...document.querySelectorAll('.ds-toggle-button')].some(
+                (el) => (el.textContent || '').trim() === 'Search'));
+    } catch {
+        return false; // fail-open: a DOM hiccup must never block a send
+    }
+}
+
+// 08-14 (user rule): select EXPERT mode on a fresh new-chat page. Mode is
+// locked at thread creation, so this works ONLY on the new-chat composer,
+// where the mode tabs (Instant / Expert / Vision, class dfb78875) live.
+// Click the Expert tab, then DeepThink ON. Never throws — a UI change just
+// logs and continues with the default (instant) mode rather than stalling.
+async function selectExpertMode() {
+    try {
+        const clicked = await page.evaluate(() => {
+            const tab = [...document.querySelectorAll('div')].find(
+                (el) =>
+                    (el.textContent || '').trim() === 'Expert' &&
+                    /dfb78875/.test(el.className || '') &&
+                    el.getBoundingClientRect().width > 0);
+            if (!tab) return false;
+            tab.click();
+            return true;
+        });
+        if (!clicked) {
+            console.log('⚠ expert mode tab not found on new-chat page — default mode will be used');
+            return;
+        }
+        await sleep(800); // composer re-renders for expert mode
+        await ensureToggles(); // DeepThink ON
+        console.log('🧠 new chat set to EXPERT mode (DeepThink on)');
+    } catch (e) {
+        console.log('⚠ selectExpertMode failed:', String(e.message).slice(0, 60));
     }
 }
 
@@ -1149,6 +1228,13 @@ async function openNewChat() {
     await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForChatInput();
     await sleep(2500); // let the SPA settle the composer
+    // 08-14 (user rule): mode is locked at thread creation — select EXPERT
+    // on the fresh new-chat composer BEFORE the first message creates the
+    // thread (instant threads can never become expert afterwards).
+    if (new URL(config.webchatUrl).host.includes('deepseek')) {
+        await selectExpertMode();
+        await sleep(500);
+    }
     return page;
 }
 
@@ -1275,4 +1361,5 @@ module.exports = {
     openNewChatAndSeed,
     getReqBodyChars,
     resetTeeForHandoff,
+    takeThreadSwap,
 };

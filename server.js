@@ -7,7 +7,7 @@ const { Readable } = require('stream');
 const config = require('./config');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
-    buildFullPrompt, openNewChatAndSeed, getReqBodyChars, resetTeeForHandoff,
+    buildFullPrompt, openNewChatAndSeed, getReqBodyChars, resetTeeForHandoff, takeThreadSwap,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 
@@ -53,6 +53,21 @@ async function countedSend(msg, defs) {
     try {
         const r = await sendPrompt(msg, defs);
         lastReqBodyChars = await getReqBodyChars();
+        // 08-14 EXPERT-SWAP PIN: the send swapped an instant thread for a
+        // fresh EXPERT one — pin the new thread for every respawn path (same
+        // as the context-handoff swap, including the supervisor restart).
+        const swap = takeThreadSwap();
+        if (swap && swap.id && swap.id !== config.tabUrlSubstring) {
+            const oldPin = config.tabUrlSubstring;
+            config.tabUrlSubstring = swap.id;
+            config.webchatUrl = swap.url;
+            try {
+                persistThreadSwap(oldPin, swap.id, swap.url);
+                console.log(`🔁 Expert swap pinned: ${oldPin} → ${swap.url}`);
+            } catch (e) {
+                console.warn('⚠️ expert-swap pin persist failed:', e.message);
+            }
+        }
         return r;
     } catch (e) {
         // 08-13 HARD-CAP SAFETY NET: the pre-send measurement can be blind
