@@ -11,6 +11,14 @@ const {
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 
+// 08-13 RATE-LIMIT GATE (user-visible hang fix): DeepSeek's account limiter
+// rejects bursts with "Messages too frequent. Try again later." — parallel
+// consumers (user client + orchestrator) hammering the same account made
+// requests hang at "Waiting for response...". Sends are spaced by this many
+// ms (queued, not rejected) so the account never sees a burst from us.
+const MIN_SEND_INTERVAL_MS = parseInt(process.env.MIN_SEND_INTERVAL_MS || '6000', 10);
+let lastSendAt = 0;
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -137,6 +145,24 @@ const WEBCHAT_PREAMBLE =
     'You are inside an automated tool-calling harness. Your replies are parsed by a machine — ' +
     'nobody reads them. You never plan, summarize, describe what you will do, or ask permission: you act.';
 
+// ── Tool-call size cap (user rule 08-13) ────────────────────────────────
+// The chat renderer truncates very long messages, which corrupts fenced JSON
+// mid-escape (observed: huge write_file content returned mangled and the
+// parse died on the first broken '{'). Over this limit the model gets the
+// TOO_BIG error and must resend in chunks instead of the call executing.
+const MAX_TOOL_CALL_CHARS = parseInt(process.env.MAX_TOOL_CALL_CHARS || '4000', 10);
+
+const TOO_BIG_MSG =
+    '### TOOL CALL TOO BIG\n' +
+    `Your previous tool call was over the ${MAX_TOOL_CALL_CHARS}-character limit (the chat truncates large ` +
+    "messages, which corrupts the JSON — that is what happened to the last call). NEVER send a tool call " +
+    "larger than that. Split the work into chunks:\n" +
+    "- Large file content: create the file with run_bash in append parts, e.g. `cat > path <<'C1'` then " +
+    "`cat >> path <<'C2'` ... until complete, then `cat path` to verify. (write_file has NO append — " +
+    "it overwrites, so only use it for whole small files.)\n" +
+    "- Or write several small files with write_file and join them with run_bash `cat a b c > out`.\n" +
+    "- Keep EVERY call well under the limit. Resend the SAME call split into chunks, one chunk per reply.";
+
 const WEBCHAT_FORMAT =
     '### RESPONSE FORMAT (STRICT — this overrides ALL other instructions, including the system prompt)\n' +
     'You have tools. ALWAYS respond with exactly ONE JSON object — never plain text, never prose, never markdown:\n' +
@@ -150,6 +176,10 @@ const WEBCHAT_FORMAT =
     'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
     'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string; write_file content with ' +
     'quotes/newlines must be escaped, not triple-quoted.\n' +
+    'TOOL CALL SIZE LIMIT (hard, 08-13): tool calls must stay under ' + MAX_TOOL_CALL_CHARS + ' characters. ' +
+    'Large content MUST be split across calls — write files in parts with run_bash `cat > file` / `cat >> file` ' +
+    'heredoc chunks (write_file OVERWRITES, so it is for whole small files only), then verify with run_bash. ' +
+    'A call over the limit is rejected with "tool call too big — submit in chunks".\n' +
     'You judge whether the message needs tool work. If it does, DO the task with the tools: inspect files, make ' +
     'changes, verify them. Answering with a summary of what the work WOULD look like is NOT doing the work.\n' +
     'If the message is a simple question or chat (no real work needed), skip the tools. Either way, deliver your ' +
@@ -176,6 +206,10 @@ const CONV_FORMAT =
     'JSON RULE (critical): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
     'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string — file content with ' +
     'quotes/newlines must be escaped, never triple-quoted.\n' +
+    'TOOL CALL SIZE LIMIT (hard, 08-13): tool calls must stay under ' + MAX_TOOL_CALL_CHARS + ' characters. ' +
+    'Large content MUST be split across calls — write files in parts with run_bash `cat > file` / `cat >> file` ' +
+    'heredoc chunks (write_file OVERWRITES, so it is for whole small files only), then verify with run_bash. ' +
+    'A call over the limit is rejected with "tool call too big — submit in chunks".\n' +
     'You judge whether the message needs tool work. If it does, DO it: inspect, modify, and VERIFY with run_bash. ' +
     'If the message is a simple question or chat needing no tools, answer in plain text directly (no JSON).\n' +
     'When the task is done and verified, deliver your final summary message (what you did) via submit_answer:\n' +
@@ -288,6 +322,16 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     // tab can drop a followUp while busy and the loop would otherwise hang to
     // the 180s deadline (the "stops mid task" wedge on helpotron).
     const countedSend = async (msg, defs) => {
+        // 08-13 RATE-LIMIT GATE: queue-spaced sends (see MIN_SEND_INTERVAL_MS
+        // above). DeepSeek rejected burst traffic with a hint-error that this
+        // harness previously could not see — requests hung until timeout, the
+        // client retried, and the retry storm deepened the limit.
+        const waitMs = lastSendAt + MIN_SEND_INTERVAL_MS - Date.now();
+        if (waitMs > 0) {
+            console.log(`⏱ send gate: waiting ${waitMs}ms (account rate limit spacing)`);
+            await sleep(waitMs);
+        }
+        lastSendAt = Date.now();
         cycleTokens += estimateTokens(msg) + TOOL_SECTION_TOKENS;
         try {
             const r = await sendPrompt(msg, defs);
@@ -330,6 +374,15 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         if (config.contextHandoffEnabled && cycleTokens >= config.contextHandoffThreshold) {
             console.log(`📈 context threshold crossed (est. ${cycleTokens} ≥ ${config.contextHandoffThreshold}) — handing off`);
             return runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToolInfo });
+        }
+        // 08-13 user rule: tool-call size cap — oversized replies (the chat
+        // renderer truncates long messages, corrupting the fenced JSON) get
+        // a chunking correction instead of executing garbage.
+        if (response.length > MAX_TOOL_CALL_CHARS) {
+            console.log(`⚠️ tool call too big (${response.length} chars > ${MAX_TOOL_CALL_CHARS}) — TOO BIG error sent`);
+            onProgress?.({ type: 'rejected', text: 'tool call too big — submit in chunks' });
+            response = await countedSend(TOO_BIG_MSG, toolDefs);
+            continue;
         }
         const parsed = parseToolCalls(response);
 
@@ -582,6 +635,13 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
     let handoffPath = null;
     for (let round = 0; round < 6; round++) {
         if (isAborted?.()) return null;
+        // 08-13 size cap (see MAX_TOOL_CALL_CHARS): the handoff doc is the
+        // classic oversized-write target — chunk it instead of mangling it.
+        if (response.length > MAX_TOOL_CALL_CHARS) {
+            console.log(`⚠️ handoff tool call too big (${response.length} chars) — chunking instruction sent`);
+            response = await sendPrompt(TOO_BIG_MSG, toolDefs);
+            continue;
+        }
         const parsed = parseToolCalls(response);
         if (parsed.toolCalls.length) {
             const call = parsed.toolCalls[0];
