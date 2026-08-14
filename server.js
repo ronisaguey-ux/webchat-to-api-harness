@@ -1156,10 +1156,16 @@ app.post('/v1/messages', async (req, res) => {
             // only the auto/best-* combo family actually routes. Rewrite the
             // picker alias to auto/best-coding — OmniRoute's own free
             // upstreams only. Never the paid key on this route.
+            // 08-14: the gemini gateway's OWN model name is
+            // 'gemini 3.7 flash webchat' (not the 'gemini webchat' route
+            // key) — a verbatim passthrough makes it fall through to ITS
+            // paid proxy and 400. Rewrite the alias like omniroute.
             const targetBody =
                 routedModel === 'omniroute'
                     ? { ...routedBody, model: 'auto/best-coding' }
-                    : routedBody;
+                    : routedModel.startsWith('gemini')
+                        ? { ...routedBody, model: 'gemini 3.7 flash webchat' }
+                        : routedBody;
             return proxyTo(req, res, WEBCHAT_ROUTES[routedModel], '/v1/messages', targetBody);
         }
         if (!isWebchatModel(routedBody)) {
