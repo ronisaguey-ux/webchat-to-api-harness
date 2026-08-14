@@ -986,10 +986,44 @@ app.get('/tools', (req, res) => {
     res.json(getToolDefinitions());
 });
 
+// 08-14 OMNIROUTE SLOT (lazy-start feel): the omniroute_watchdog keeps
+// OmniRoute (20128) alive but its dev compile takes minutes after a death.
+// If the target is down when a request arrives, wait for the watchdog to
+// bring it back before proxying. Race-free: we never spawn it ourselves
+// (the watchdog owns that — a second spawner caused the 08-06 restart loop).
+async function ensureRouteUp(target) {
+    if (!target.includes(':20128')) return;
+    for (let i = 0; i < 18; i++) { // up to ~90s
+        try {
+            const r = await fetch(`${target.replace(/\/+$/, '')}/models`, {
+                method: 'GET',
+                signal: AbortSignal.timeout(3000),
+            });
+            if (r.ok) return;
+        } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+}
+
 app.get('/v1/models', (req, res) => {
+    // 08-14 GATEWAY PICKER: Claude Code's model discovery
+    // (CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) only keeps ids
+    // containing 'claude'/'anthropic' (v2.1.223+), so advertise
+    // claude/-prefixed aliases; the /v1/messages dispatch strips the
+    // prefix and routes on the rest (keys must match WEBCHAT_ROUTES /
+    // isWebchatModel exactly — 'deepseek webchat' keeps its space).
+    const gatewayRows = [
+        { id: 'claude/deepseek-v4-flash', display_name: 'V4 Flash (paid API)' },
+        { id: 'claude/deepseek webchat', display_name: 'DeepSeek Webchat' },
+        { id: 'claude/gemini webchat', display_name: 'Gemini Webchat' },
+        { id: 'claude/qwen webchat', display_name: 'Qwen Webchat' },
+        { id: 'claude/kimi webchat', display_name: 'Kimi Webchat' },
+        { id: 'claude/omniroute', display_name: 'OmniRoute' },
+    ];
     res.json({
         object: 'list',
         data: [
+            ...gatewayRows.map((r) => ({ ...r, object: 'model', owned_by: 'webchat-api' })),
             { id: config.modelName, object: 'model', owned_by: 'webchat-api' },
             { id: 'deepseek-v4-flash', object: 'model', owned_by: 'upstream-proxy' },
         ],
@@ -1059,11 +1093,16 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.post('/v1/messages', async (req, res) => {
     try {
         const { system, messages, tools, model, stream } = req.body || {};
-        if (WEBCHAT_ROUTES[model]) {
-            return proxyTo(req, res, WEBCHAT_ROUTES[model], '/v1/messages', req.body);
+        // 08-14 GATEWAY PICKER: strip the claude/ prefix from discovery-row
+        // ids ('claude/qwen webchat' → 'qwen webchat' → route target).
+        const routedModel = String(model || '').replace(/^claude\//, '');
+        const routedBody = routedModel !== model ? { ...req.body, model: routedModel } : req.body;
+        if (WEBCHAT_ROUTES[routedModel]) {
+            await ensureRouteUp(WEBCHAT_ROUTES[routedModel]);
+            return proxyTo(req, res, WEBCHAT_ROUTES[routedModel], '/v1/messages', routedBody);
         }
-        if (!isWebchatModel(req.body)) {
-            return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', req.body);
+        if (!isWebchatModel(routedBody)) {
+            return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
         }
 
         if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
