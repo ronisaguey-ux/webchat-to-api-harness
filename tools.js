@@ -3,6 +3,11 @@ const os = require('os');
 const { spawn } = require('child_process');
 const config = require('./config');
 
+// 08-14 WEDGE ROOT-CAUSE ceiling: tool RESULTS must never round-trip a huge
+// file through the chat tab (read_file on a 5.86MB state file → 6.2M-char
+// prompt → tab choked, gateway wedged). See read_file handler.
+const MAX_READ_FILE_CHARS = parseInt(process.env.MAX_READ_FILE_CHARS || '200000', 10);
+
 // Small read-only command runner (git_status). Captures stdout/stderr with a
 // hard timeout — never used for interactive or long-running commands.
 function runCmd(argv, timeoutMs = 8000) {
@@ -27,7 +32,7 @@ const TOOL_DEFINITIONS = [
     {
         name: 'read_file',
         category: 'file',
-        description: 'Read contents of a file.',
+        description: 'Read contents of a file. Hard ceiling: results are ALWAYS capped at 200K chars (truncated:true + totalLength), so a huge file can never balloon the chat — pass maxLength to control the window read.',
         parameters: {
             type: 'object',
             properties: {
@@ -42,12 +47,19 @@ const TOOL_DEFINITIONS = [
         },
         handler: async (args) => {
             const content = fs.readFileSync(args.path, 'utf-8');
-            if (args.maxLength && content.length > args.maxLength) {
+            // 08-14 WEDGE ROOT-CAUSE: read_file without maxLength returned the
+            // FULL file (5.86MB cross_eval_state.json) into the tool-result
+            // message → next prompt = 6,197,724 chars → the webchat tab choked
+            // and the gateway wedged on "Waiting for response..." for hours.
+            // Hard ceiling regardless of args: a file this big must NEVER
+            // round-trip through the tab, and explicit maxLength is clamped too.
+            const limit = Math.min(args.maxLength || MAX_READ_FILE_CHARS, MAX_READ_FILE_CHARS);
+            if (content.length > limit) {
                 return {
                     success: true,
                     truncated: true,
                     totalLength: content.length,
-                    content: content.slice(0, args.maxLength),
+                    content: content.slice(0, limit),
                 };
             }
             return { success: true, content };
