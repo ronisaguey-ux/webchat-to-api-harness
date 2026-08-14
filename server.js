@@ -150,7 +150,11 @@ const WEBCHAT_PREAMBLE =
 // mid-escape (observed: huge write_file content returned mangled and the
 // parse died on the first broken '{'). Over this limit the model gets the
 // TOO_BIG error and must resend in chunks instead of the call executing.
-const MAX_TOOL_CALL_CHARS = parseInt(process.env.MAX_TOOL_CALL_CHARS || '4000', 10);
+// 08-13: raised 4000 → 60000 after the 4000 cap rejected real tool calls
+// (helpotron read_file). Ceiling evidence: the always-tool thread contains
+// 61699-char user messages DeepSeek accepted, so 60k is safe; past that the
+// 128k-token context budget becomes the binding constraint.
+const MAX_TOOL_CALL_CHARS = parseInt(process.env.MAX_TOOL_CALL_CHARS || '60000', 10);
 
 const TOO_BIG_MSG =
     '### TOOL CALL TOO BIG\n' +
