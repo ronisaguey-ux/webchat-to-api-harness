@@ -1123,6 +1123,19 @@ app.post('/v1/messages', async (req, res) => {
         // res.write on an ended response fires an unhandled stream error.
         const ev = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
 
+        // 08-14 KEEPALIVE: the webchat cogitates SILENTLY for minutes before
+        // its first chunk (the tab streams no thinking tokens), and the
+        // gateway forwards nothing during that wait — Claude Code's
+        // stream-idle watchdog then kills the turn ("Stream idle timeout -
+        // no chunks received"; observed 08-13 22:5x, 11-min churn on the
+        // 'add EVERYTHING' helpotron run while TWO clients starved on one
+        // tab). SSE comment lines are ignored by every SSE parser — they
+        // feed the watchdog without polluting the event stream. Started
+        // BEFORE enqueue() so queued clients (single-lane tab) are fed too.
+        const heartbeat = setInterval(() => {
+            if (!res.writableEnded && !res.destroyed) res.write(': keepalive\n\n');
+        }, 15000);
+
         ev('message_start', {
             type: 'message_start',
             message: {
@@ -1167,7 +1180,7 @@ app.post('/v1/messages', async (req, res) => {
         res.on('close', () => { aborted = true; });
 
         const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted));
-        if (text === null) return; // aborted — nothing more to write
+        if (text === null) { clearInterval(heartbeat); return; } // aborted — nothing more to write
 
         if (statusOpen) ev('content_block_stop', { type: 'content_block_stop', index: blockIndex++ });
 
@@ -1194,8 +1207,10 @@ app.post('/v1/messages', async (req, res) => {
             usage: { output_tokens: text.length },
         });
         ev('message_stop', { type: 'message_stop' });
+        clearInterval(heartbeat);
         res.end();
     } catch (error) {
+        clearInterval(heartbeat);
         console.error('❌ Error:', error);
         // 08-13 EVENING: the 08-12 writableEnded guard missed the SSE path —
         // ev() writes had ALREADY sent headers when handleRequest threw (180s
