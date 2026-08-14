@@ -224,6 +224,10 @@ async function sendPrompt(prompt, toolDefinitions) {
     // hang on evaluate while fresh ones always work (observed on Gemini).
     await initBrowser({ reconnect: true });
     await connectToWebchat(config.webchatUrl);
+    // 08-13 user rule: DeepThink + Search must stay ON for the deepseek tab.
+    // The composer chips carry aria-pressed; click whatever is off. No-op for
+    // foreign webchats (no such chips) and never throws.
+    await ensureToggles();
     console.log(`📤 Sending prompt (${prompt.length} chars)`);
 
     // 08-13 FOREIGN-BUSY guard: a generation left running from a
@@ -264,6 +268,31 @@ async function sendPrompt(prompt, toolDefinitions) {
 
     await saveCookies(); // keep the session fresh
     return text;
+}
+
+// 08-13 (user rule): keep DeepThink + Search enabled on the deepseek tab.
+// The composer toggles are .ds-toggle-button chips with aria-pressed state;
+// click whichever is OFF, idempotently, every request (a reload or tab flip
+// can reset them). Foreign webchats have no such chips — harmless no-op.
+// el.click() dispatches a real click event, which React's root listener
+// handles; verified against the live tab (deepseek 2.3.0, 08-13).
+async function ensureToggles() {
+    try {
+        const clicked = await page.evaluate(() => {
+            const flipped = [];
+            for (const el of document.querySelectorAll('.ds-toggle-button')) {
+                const label = (el.textContent || '').trim();
+                if (!/^(DeepThink|Search)$/i.test(label)) continue;
+                if (el.getAttribute('aria-pressed') === 'true') continue;
+                el.click();
+                flipped.push(label);
+            }
+            return flipped;
+        });
+        if (clicked && clicked.length) console.log('🧠 toggles enabled: ' + clicked.join(', '));
+    } catch (e) {
+        console.log('⚠ toggle ensure failed:', String(e.message).slice(0, 60));
+    }
 }
 
 // ── Type into the chat input ──
@@ -356,6 +385,34 @@ async function sendMessage(input, text) {
                 return false;
             }, config.selectors.input);
             await sleep(400);
+            // 08-13 NEVER-SEND-EMPTY guard: if typing silently failed (composer
+            // remounted mid-request, stale element), Enter would fire with an
+            // empty box — DeepSeek shows "Message is empty" and the wait hangs
+            // (observed on the 08-13 f05a02e4 tab). Verify the text landed;
+            // retype once; only then send.
+            let landed = await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (!el) continue;
+                    const v = el.value !== undefined ? el.value : el.innerText || '';
+                    if (v.trim().length > 0) return true;
+                }
+                return false;
+            }, config.selectors.input);
+            if (!landed) {
+                console.log('⚠️ composer empty after typing — retyping once');
+                await typePrompt(text);
+                landed = await page.evaluate((sels) => {
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const v = el.value !== undefined ? el.value : el.innerText || '';
+                        if (v.trim().length > 0) return true;
+                    }
+                    return false;
+                }, config.selectors.input);
+                if (!landed) throw new Error('composer stayed empty after typing — send aborted (no empty sends)');
+            }
             await page.keyboard.press('Enter');
             await sleep(1500);
             // If the text is still in the box, Enter didn't send — click the button.
@@ -603,28 +660,67 @@ async function installStreamTee() {
         // 08-13 CAP BUG FIX: seq-tagged entries (see push()/readStreamedAnswer).
         // If an older build armed a seq-less tee on this long-lived page,
         // RE-ARM it — stale entries belong to dead requests anyway.
-        if (window.__wsTee && window.__wsTeeSeq) return;
-        window.__wsTee = [];
-        window.__wsTeeSeq = 0;
-        // SSE parser shared with readStreamedAnswer (parses in-page so the
-        // full stream body never crosses the CDP boundary).
+        // 08-13 PARSER-REFRESH: __wsParseSse is assigned BEFORE the guard —
+        // gateway restarts must reach already-armed pages, or code fixes to
+        // the parser never apply (the page keeps the old function forever and
+        // the "restart to fix it" cycle silently does nothing). The buffer and
+        // XHR/fetch interceptors below stay guarded — they are stateful and
+        // must not double-install.
         window.__wsParseSse = function (body) {
-            const out = { text: '', done: false };
+            const out = { text: '', done: false, error: '' };
+            // 08-13 DeepThink gate: with thinking_enabled the think block
+            // streams FIRST as bare {"v":...} chunks + -1/content APPENDs,
+            // while the v-response frame declares fragments[last].type as
+            // THINK. Only after a RESPONSE fragment is declared do those
+            // chunks belong to the answer (probed live 08-13: fragment id 2
+            // THINK → id 3 RESPONSE). Without the gate the extracted text is
+            // reasoning + JSON — the 08-12 DOM-path poison, now on the tee.
+            let streamingResponse = false;
             const blocks = String(body || '').split('\n\n');
             for (const block of blocks) {
                 if (/^event:\s*(done|finished)/im.test(block)) out.done = true;
+                // 08-13 RATE-LIMIT FIX: burst traffic gets
+                //   event: hint
+                //   data: {"type":"error","content":"Messages too frequent. Try
+                //     again later.","finish_reason":"rate_limit_reached"}
+                // then `event: close` and NOTHING else — status never SETs
+                // FINISHED, so without this the wait loop polls to the full
+                // timeout, the client retries, and each retry re-hammers the
+                // same limit (the 08-13 "stops mid task" doom loop). Treat it
+                // as terminal and surface the error text.
+                if (/^event:\s*hint/im.test(block)) {
+                    for (const line of block.split('\n')) {
+                        if (!line.startsWith('data:')) continue;
+                        try {
+                            const j = JSON.parse(line.slice(5).trim());
+                            if (j && j.type === 'error') {
+                                out.done = true;
+                                out.error = String(j.content || 'deepseek stream error');
+                                if (j.finish_reason) out.error += ' (finish_reason: ' + j.finish_reason + ')';
+                            }
+                        } catch { /* not JSON */ }
+                    }
+                }
                 for (const line of block.split('\n')) {
                     if (!line.startsWith('data:')) continue;
                     const raw = line.slice(5).trim();
                     if (!raw) continue;
                     let j;
                     try { j = JSON.parse(raw); } catch { continue; }
+                    if (j && typeof j.finish_reason === 'string' &&
+                        /rate_limit_reached|error|content_filter/i.test(j.finish_reason)) {
+                        out.done = true;
+                        out.error = out.error || ('stream finished with finish_reason: ' + j.finish_reason);
+                    }
                     // OLD format: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"..."}],"status":"WIP"}}}
                     const resp = j && j.v && j.v.response;
                     if (resp) {
                         const st = resp.status || '';
                         if (st === 'DONE' || st === 'FINISHED' || st === 'ERROR' || st === 'STOPPED') out.done = true;
                         if (Array.isArray(resp.fragments)) {
+                            const lastFrag = resp.fragments[resp.fragments.length - 1];
+                            if (lastFrag && lastFrag.type === 'RESPONSE') streamingResponse = true;
+                            else if (lastFrag && lastFrag.type === 'THINK') streamingResponse = false;
                             for (const f of resp.fragments) {
                                 if (f && f.type === 'RESPONSE' && typeof f.content === 'string') out.text += f.content;
                             }
@@ -635,11 +731,28 @@ async function installStreamTee() {
                     // response/fragments/-1/content, or as BARE {"v":"<string>"}
                     // chunks, and completion is signalled by
                     // {"p":"response/status","o":"SET","v":"FINISHED"} (or a
-                    // BATCH with quasi_status) plus `event: close`.
-                    if (j && typeof j.v === 'string' && j.p && j.o === 'APPEND' && /content/.test(j.p)) {
-                        out.text += j.v;
+                    // BATCH with quasi_status) plus `event: close`. Gated on
+                    // streamingResponse so DeepThink reasoning never mixes in.
+                    //
+                    // The RESPONSE fragment is declared mid-stream as a PATCH:
+                    // {"p":"response/fragments","o":"APPEND","v":[{"id":3,
+                    // "type":"RESPONSE","content":"```",...}]} — the answer
+                    // chunk after it also arrives WITHOUT "o" on -1/content
+                    // (frame "json" above) — accept any -1/content patch, and
+                    // treat the fragments APPEND patch as the gate switch.
+                    if (j && j.p === 'response/fragments' && j.o === 'APPEND' && Array.isArray(j.v) && j.v.length) {
+                        const lastFrag = j.v[j.v.length - 1];
+                        if (lastFrag && lastFrag.type === 'RESPONSE') {
+                            streamingResponse = true;
+                            if (typeof lastFrag.content === 'string') out.text += lastFrag.content;
+                        } else if (lastFrag && lastFrag.type === 'THINK') {
+                            streamingResponse = false;
+                        }
+                    }
+                    if (j && typeof j.v === 'string' && j.p && /content/.test(j.p)) {
+                        if (streamingResponse) out.text += j.v;
                     } else if (j && typeof j.v === 'string' && !j.p) {
-                        out.text += j.v;
+                        if (streamingResponse) out.text += j.v;
                     }
                     if (j && j.p === 'response/status' && typeof j.v === 'string') {
                         if (j.v === 'FINISHED' || j.v === 'DONE' || j.v === 'ERROR' || j.v === 'STOPPED') out.done = true;
@@ -657,6 +770,11 @@ async function installStreamTee() {
             }
             return out;
         };
+        if (window.__wsTee && window.__wsTeeSeq) return;
+        window.__wsTee = [];
+        window.__wsTeeSeq = 0;
+        // XHR/fetch interceptors (buffer pushes — the parser above is the
+        // only per-install part; these must not double-install).
         const push = (body) => {
             // seq is monotonic and survives the 32-entry eviction — the
             // reader matches on seq, not array position (see the CAP BUG
@@ -724,8 +842,8 @@ async function readStreamedAnswer(startIndex) {
     try {
         return await page.evaluate((start) => {
             const tee = window.__wsTee || [];
-            if (typeof window.__wsParseSse !== 'function') return { found: false, text: '', done: false };
-            let found = false, text = '', done = false;
+            if (typeof window.__wsParseSse !== 'function') return { found: false, text: '', done: false, error: '' };
+            let found = false, text = '', done = false, error = '';
             // 08-13 CAP BUG: past 32 entries the tee evicts its oldest, so a
             // new push leaves length EXACTLY at 32 — an index-based read from
             // `start` (= length at waitForResponse entry) never ran again and
@@ -740,10 +858,11 @@ async function readStreamedAnswer(startIndex) {
                 const p = window.__wsParseSse(e.body);
                 text = p.text;
                 done = p.done;
+                error = p.error || error; // last error wins; empty stays empty
             }
-            return { found, text, done };
+            return { found, text, done, error };
         }, startIndex);
-    } catch { return { found: false, text: '', done: false }; }
+    } catch { return { found: false, text: '', done: false, error: '' }; }
 }
 
 // ── Wait until a NEW message appears and its text stops changing
@@ -775,11 +894,16 @@ async function waitForResponse(before, typedText) {
         try {
             const tee = await readStreamedAnswer(teeStart);
             if (tee.found) {
+                // 08-13 RATE-LIMIT FIX: the stream can end with a hint-error
+                // (e.g. "Messages too frequent") — nothing else ever arrives.
+                // Fail fast with the error text; a hung client retries, and
+                // each retry re-hammers the same account limit.
+                if (tee.error) throw new Error('DeepSeek stream error: ' + tee.error + ' — wait ~30s and retry');
                 if (tee.text.trim().length > 0) return tee.text;
                 if (tee.done) throw new Error('Webchat stream ended without content (error status in stream)');
             }
         } catch (e) {
-            if (e.message && /stream ended without content/.test(e.message)) throw e;
+            if (e.message && /stream ended without content|stream error/.test(e.message)) throw e;
             // otherwise (page busy / evaluate race) fall through to the DOM poll
         }
         let state;
