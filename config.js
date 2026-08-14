@@ -42,16 +42,19 @@ const cfg = {
     viewportW: parseInt(process.env.VIEWPORT_W) || 0,
     viewportH: parseInt(process.env.VIEWPORT_H) || 0,
 
-    // Context handoff (08-13): when the completion REQUEST body (history +
-    // system + tools + message — the exact thing DeepSeek caps) crosses the
-    // threshold, the gateway stops the tool loop, has the model write a
-    // handoff document, opens a NEW chat in the same tab, and seeds it with
-    // the document as the first message. Measured in REQUEST-BODY CHARS from
-    // the in-page tee (observed failure boundary ~135k chars ≈ 32k tokens).
-    // Default 90000 leaves ~40k chars of headroom for the doc-write rounds;
-    // the fallback summary covers the case where the thread dies mid-doc.
+    // Context handoff (08-13, threshold corrected 08-14): when the completion
+    // REQUEST body (history + system + tools + message) crosses the threshold,
+    // the gateway stops the tool loop, has the model write a handoff document,
+    // opens a NEW chat in the same tab, and seeds it with the document as the
+    // first message. Measured in REQUEST-BODY CHARS from the in-page tee;
+    // rough mapping chars/4 ≈ tokens (English-heavy; CJK is denser — env
+    // override CONTEXT_HANDOFF_THRESHOLD for exactness). The webchat model's
+    // window is ~1M tokens (user 08-14), so the default hands off at 500k
+    // tokens ≈ 2,000,000 chars — half the window, ample room for the doc-write
+    // rounds + final summary before the real cap. The hard-cancel safety net
+    // (context_length_exceeded → handoff) still catches any early cap.
     contextHandoffEnabled: process.env.CONTEXT_HANDOFF_ENABLED !== 'false',
-    contextHandoffThreshold: parseInt(process.env.CONTEXT_HANDOFF_THRESHOLD) || 90000,
+    contextHandoffThreshold: parseInt(process.env.CONTEXT_HANDOFF_THRESHOLD) || 2000000,
     handoffFile: process.env.HANDOFF_FILE || '/home/roni/Roni_workspace/handoff_to_new_chat.md',
 
     // Behaviour
