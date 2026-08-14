@@ -2,6 +2,11 @@ const fs = require('fs');
 const puppeteer = require('puppeteer');
 const config = require('./config');
 
+// 08-14 WEDGE ROOT-CAUSE guard: nothing legitimate is ever near this; it
+// exists to turn a runaway tool result into a loud client-visible error
+// instead of a silent gateway wedge (see sendPrompt).
+const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS || '900000', 10);
+
 let browser = null;
 let page = null;
 
@@ -247,6 +252,14 @@ async function sendPrompt(prompt, toolDefinitions) {
     if (process.env.TEST_FAKE_RESPONSE) {
         console.log(`🧪 TEST_FAKE_RESPONSE set — skipping browser (prompt: ${prompt.length} chars)`);
         return process.env.TEST_FAKE_RESPONSE;
+    }
+
+    // 08-14 WEDGE ROOT-CAUSE hard guard: an uncapped tool result once made the
+    // prompt 6,197,724 chars — the tab choked and the gateway wedged on
+    // "Waiting for response..." for hours. Never send anything this absurd:
+    // fail loudly to the client instead of silently wedging.
+    if (prompt.length > MAX_PROMPT_CHARS) {
+        throw new Error(`prompt too large (${prompt.length} chars > ${MAX_PROMPT_CHARS}) — refusing to send; a tool result or context build ran away. Check the caller.`);
     }
 
     // Refresh the CDP session per request — long-lived sessions intermittently

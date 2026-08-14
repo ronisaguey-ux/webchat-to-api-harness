@@ -560,6 +560,14 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             } else {
                 result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
             }
+            // 08-14 WEDGE ROOT-CAUSE belt: whatever a tool returns, the result
+            // message must stay small — a huge read_file output previously
+            // ballooned the next prompt to 6.2M chars and wedged the tab.
+            // (read_file itself now caps at 200K; this catches every other tool.)
+            const resultJson = JSON.stringify(result);
+            const cappedResult = resultJson.length > 150000
+                ? resultJson.slice(0, 150000) + '… [tool result truncated — pass maxLength for head reads]'
+                : resultJson;
             // 08-13 EVENING (user rule): NEVER end the tool loop after a tool
             // call — the model used "next":"done" mid-task and the harness
             // went idle with the task unfinished. The turn ends ONLY when the
@@ -581,8 +589,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                       'message. Keep progress lines to one sentence — the work is the tool calls. ' +
                       'Verify with run_bash: syntax checks, import tests, dependency checks, and the project tests. ' +
                       'Do not claim completion for work you have not verified actually runs. ' +
-                      'Large files: read_file accepts an optional maxLength for the head of a huge file ' +
-                      '(re-read without maxLength for the complete file before rewriting it). ' +
+                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — pass maxLength for a specific head window. ' +
                       'The next step: fenced {"tool":"<name>","params":{...}}.'
                     : 'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
                       'Reply with exactly ONE tool call per message, fenced as ```json ... ```. To speak to the user, ' +
@@ -594,8 +601,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                       'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
                       'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
                       'verified actually runs. ' +
-                      'Large files: read_file accepts an optional maxLength to read just the head of a huge file ' +
-                      '(re-read without maxLength for the complete file before rewriting it). ' +
+                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — pass maxLength for a specific head window. ' +
                       'The next step: fenced {"tool":"<name>","params":{...}}.');
             response = await countedSend(followUp, toolDefs);
             continue;
