@@ -173,10 +173,15 @@ const WEBCHAT_FORMAT =
     '{"tool":"<name>","params":{...}}\n' +
     'ALWAYS wrap your JSON in a markdown code fence: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
     'The fence is MANDATORY: without it this chat renders your backticks as formatting and corrupts your content.\n' +
-    'ONE tool call at a time — pick a single tool from the list below and call it. Never list multiple calls, never narrate.\n' +
-    'PAUSE CONTROL (tool call+done, user rule 08-13): add "next":"done" to ANY tool call — ' +
-    '{"tool":"<name>","params":{...},"next":"done"} — the tool runs, its output is sent to the user, and you are NOT ' +
-    'prompted again until the user sends a new message. Omit it (or set "next":"1") to keep working round after round.\n' +
+    'ONE tool call at a time — pick a single tool from the list below and call it. Never list multiple calls.\n' +
+    'MESSAGE PROTOCOL (hard, user rule 08-13 EVENING) — you speak to the user ONLY via the send_message tool:\n' +
+    '  1) FIRST reply to any user message: a send_message call with your 💬 acknowledgement — what you will do.\n' +
+    '  2) BEFORE EVERY OTHER TOOL CALL: a send_message call with one 💬 line — your thinking, the tool call ' +
+    'you are about to make, and why.\n' +
+    '  3) NEVER end with a tool call: after every tool result, keep working — next send_message + next tool call — ' +
+    'until the task is fully done.\n' +
+    '  4) Finish with submit_answer carrying your final 💬 summary message — that ends the turn.\n' +
+    'Every send_message text is delivered to the user verbatim; it is REQUIRED between every tool call.\n' +
     'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
     'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string; write_file content with ' +
     'quotes/newlines must be escaped, not triple-quoted.\n' +
@@ -204,9 +209,14 @@ const CONV_FORMAT =
     '(delivered to the user verbatim).\n' +
     '2. Your tool call, fenced: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
     'ONE tool call per reply. The fence is MANDATORY.\n' +
-    'PAUSE CONTROL (tool call+done, user rule 08-13): add "next":"done" to ANY tool call — ' +
-    '{"tool":"<name>","params":{...},"next":"done"} — the tool runs, its output is sent to the user, and you are NOT ' +
-    'prompted again until the user sends a new message. Omit it (or set "next":"1") to keep working round after round.\n' +
+    'MESSAGE PROTOCOL (hard, user rule 08-13 EVENING):\n' +
+    '  1) FIRST reply to any user message: one plain-text 💬 acknowledgement line — what you will do.\n' +
+    '  2) BEFORE EVERY tool call: one plain-text 💬 line — your thinking, the tool call you are about to ' +
+    'make, and why.\n' +
+    '  3) NEVER end with a tool call: after every tool result, keep working — next 💬 line + next tool call — ' +
+    'until the task is fully done.\n' +
+    '  4) Finish with your final plain-text 💬 summary message (no tool call) — that ends the turn.\n' +
+    'Every 💬 line is delivered to the user verbatim; it is REQUIRED between every tool call.\n' +
     'JSON RULE (critical): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
     'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string — file content with ' +
     'quotes/newlines must be escaped, never triple-quoted.\n' +
@@ -407,17 +417,22 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             }
             onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
             lastToolInfo = { tool: call.toolName, args: call.args };
-            const result = await executeTool(call.toolName, call.args);
-            // TOOL CALL+DONE (user rule 08-13): the model added "next":"done"
-            // to the call — run the tool, send its output to the client, and
-            // go IDLE: no followUp message to the tab until the next client
-            // request wakes the gateway. (+1 / omitted = keep looping below.)
-            if (/["']next["']\s*:\s*["'](done|0|false|stop)["']/i.test(response)) {
-                console.log(`⏸ tool call+done — ${call.toolName} ran once, pausing (no further prompts until woken)`);
-                return `[⏸ paused — tool call+done: ${call.toolName} ran and its output was delivered. ` +
-                    `Result: ${JSON.stringify(result)}\n\nThe harness will not prompt the model again until you ` +
-                    `send a new message.]`;
+            // 08-13 EVENING (user rule): send_message is the JSON-only way to
+            // talk to the user — deliver its text to the client as a 'text'
+            // progress event (rendered "💬 <text>") instead of running a tool.
+            let result;
+            if (call.toolName === 'send_message') {
+                const text = String(call.args?.text ?? '');
+                if (text) onProgress?.({ type: 'text', text });
+                result = { success: true, delivered: true, text };
+            } else {
+                result = await executeTool(call.toolName, call.args);
             }
+            // 08-13 EVENING (user rule): NEVER end the tool loop after a tool
+            // call — the model used "next":"done" mid-task and the harness
+            // went idle with the task unfinished. The turn ends ONLY when the
+            // model sends its final summary (a reply with no tool call). The
+            // pause wedge is gone; every tool result continues the loop.
             // NEVER tell the model it's done after a tool result (08-12:
             // "Now give your final answer" made DeepSeek finalize after the
             // FIRST call by yapping a plan). Keep it in tool mode: next tool
@@ -436,11 +451,12 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                       '(re-read without maxLength for the complete file before rewriting it). ' +
                       'The next step: fenced {"tool":"<name>","params":{...}}.'
                     : 'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
+                      'Reply with exactly ONE tool call per message, fenced as ```json ... ```. To speak to the user, ' +
+                      'call send_message with your one-line 💬 (what you are thinking and about to do) — that is how ' +
+                      'your progress reaches the user; never write plain text outside the JSON fence. ' +
                       'Respond with exactly ONE of these two, and nothing else: ' +
-                      '(a) your NEXT tool call JSON, fenced as ```json ... ```; ' +
+                      '(a) your NEXT tool call JSON (send_message or a work tool), fenced as ```json ... ```; ' +
                       '(b) submit_answer, fenced, IF AND ONLY IF the entire task is done and verified. ' +
-                      'Do NOT write a progress report, a summary of what you did, or a list of next steps — nobody reads those, ' +
-                      'they are plain text and will be rejected. ' +
                       'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
                       'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
                       'verified actually runs. ' +

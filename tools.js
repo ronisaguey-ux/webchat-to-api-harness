@@ -107,10 +107,18 @@ const TOOL_DEFINITIONS = [
                 const errFile = outFile.replace(/\.out$/, '.err');
                 const outFd = fs.openSync(outFile, 'w');
                 const errFd = fs.openSync(errFile, 'w');
-                const child = spawn('/bin/bash', ['-c', cmd], {
+                // 08-13 EVENING: stdin instead of `-c` — `bash -c "<cmd>"` puts
+                // the command text in the wrapper's own cmdline, so a pkill -f
+                // inside the command (e.g. "pkill -f uvicorn") matched the
+                // wrapper itself and SIGTERM'd it → "exit code null" tool
+                // failures. With `bash -s` the wrapper cmdline is just "bash",
+                // so pkill only matches the real target processes.
+                const child = spawn('/bin/bash', ['-s'], {
                     detached: true,
-                    stdio: ['ignore', outFd, errFd],
+                    stdio: ['pipe', outFd, errFd],
                 });
+                child.stdin.write(cmd);
+                child.stdin.end();
                 let settled = false;
                 const finish = (extra) => {
                     if (settled) return;
@@ -248,6 +256,32 @@ const TOOL_DEFINITIONS = [
                 local: now.toString(),
                 epochMs: now.getTime(),
             };
+        },
+    },
+    {
+        // 08-13 EVENING (user rule): the ONLY way to talk to the user in
+        // JSON-only mode. server.js special-cases this name before executeTool
+        // and delivers the text to the client as a 'text' progress event
+        // (rendered "💬 <text>"). This handler is the fallback shape for
+        // paths that don't special-case it (runHandoff).
+        name: 'send_message',
+        category: 'chat',
+        description:
+            'Send a plain-text message to the user (delivered verbatim, rendered as "💬 <text>"). ' +
+            'Use this to acknowledge the user\'s message, narrate what you are about to do before ' +
+            'every other tool call, and to send your final summary. This is the ONLY way to ' +
+            'communicate in plain text.',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'The message text (one short line — what you are thinking and about to do)' },
+            },
+            required: ['text'],
+        },
+        handler: async (args) => {
+            const text = String(args?.text ?? '');
+            if (!text) return { success: false, error: 'empty message' };
+            return { success: true, delivered: true, text };
         },
     },
     {
