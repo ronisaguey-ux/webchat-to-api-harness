@@ -993,9 +993,12 @@ app.get('/tools', (req, res) => {
 // (the watchdog owns that — a second spawner caused the 08-06 restart loop).
 async function ensureRouteUp(target) {
     if (!target.includes(':20128')) return;
-    for (let i = 0; i < 18; i++) { // up to ~90s
+    // probe the OpenAI models listing, whether the route target is a bare
+    // host (http://127.0.0.1:20128) or already carries /api/v1
+    const probe = `${target.replace(/\/+$/, '').replace(/\/api\/v1$/, '')}/api/v1/models`;
+    for (let i = 0; i < 18; i++) { // up to ~90s — the watchdog owns respawns
         try {
-            const r = await fetch(`${target.replace(/\/+$/, '')}/models`, {
+            const r = await fetch(probe, {
                 method: 'GET',
                 signal: AbortSignal.timeout(3000),
             });
@@ -1099,7 +1102,16 @@ app.post('/v1/messages', async (req, res) => {
         const routedBody = routedModel !== model ? { ...req.body, model: routedModel } : req.body;
         if (WEBCHAT_ROUTES[routedModel]) {
             await ensureRouteUp(WEBCHAT_ROUTES[routedModel]);
-            return proxyTo(req, res, WEBCHAT_ROUTES[routedModel], '/v1/messages', routedBody);
+            // OmniRoute validates model names on /api/v1/messages: the
+            // deepseek-v4-* names it advertises have no active credentials,
+            // only the auto/best-* combo family actually routes. Rewrite the
+            // picker alias to auto/best-coding — OmniRoute's own free
+            // upstreams only. Never the paid key on this route.
+            const targetBody =
+                routedModel === 'omniroute'
+                    ? { ...routedBody, model: 'auto/best-coding' }
+                    : routedBody;
+            return proxyTo(req, res, WEBCHAT_ROUTES[routedModel], '/v1/messages', targetBody);
         }
         if (!isWebchatModel(routedBody)) {
             return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
