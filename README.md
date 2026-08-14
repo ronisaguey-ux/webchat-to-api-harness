@@ -1,5 +1,7 @@
 # Webchat-to-API Converter
 
+**Note:** This harness is best used with DeepSeek webchat (chat.deepseek.com). It is the primary target and most thoroughly tested.
+
 An OpenAI- **and** Anthropic-compatible API backed by a real webchat tab
 (DeepSeek, ChatGPT, Claude.ai, …) driven with Puppeteer. Lets any agentic
 wrapper (Aider, LiteLLM clients, Claude Code via `ANTHROPIC_BASE_URL`) talk to
