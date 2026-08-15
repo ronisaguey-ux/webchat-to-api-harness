@@ -600,8 +600,12 @@ async function isForeignBusy() {
 // fresh document.
 async function installStreamTee() {
     await page.evaluate(() => {
-        if (window.__wsTee) return;
+        // 08-13 CAP BUG FIX: seq-tagged entries (see push()/readStreamedAnswer).
+        // If an older build armed a seq-less tee on this long-lived page,
+        // RE-ARM it — stale entries belong to dead requests anyway.
+        if (window.__wsTee && window.__wsTeeSeq) return;
         window.__wsTee = [];
+        window.__wsTeeSeq = 0;
         // SSE parser shared with readStreamedAnswer (parses in-page so the
         // full stream body never crosses the CDP boundary).
         window.__wsParseSse = function (body) {
@@ -654,7 +658,10 @@ async function installStreamTee() {
             return out;
         };
         const push = (body) => {
-            window.__wsTee.push({ body: String(body || ''), at: Date.now() });
+            // seq is monotonic and survives the 32-entry eviction — the
+            // reader matches on seq, not array position (see the CAP BUG
+            // comment in readStreamedAnswer).
+            window.__wsTee.push({ body: String(body || ''), at: Date.now(), seq: ++window.__wsTeeSeq });
             // 08-13 WEDGE FIX: 8 entries was evicting long tool-loop streams
             // (compaction/tool runs push many completion XHRs); 32 keeps the
             // window safe for any serialized burst.
@@ -719,9 +726,18 @@ async function readStreamedAnswer(startIndex) {
             const tee = window.__wsTee || [];
             if (typeof window.__wsParseSse !== 'function') return { found: false, text: '', done: false };
             let found = false, text = '', done = false;
-            for (let i = start; i < tee.length; i++) {
+            // 08-13 CAP BUG: past 32 entries the tee evicts its oldest, so a
+            // new push leaves length EXACTLY at 32 — an index-based read from
+            // `start` (= length at waitForResponse entry) never ran again and
+            // every answer after the tee saturated timed out. Entries carry a
+            // monotonic seq; match on it (legacy seq-less entries fall back
+            // to position).
+            for (let i = 0; i < tee.length; i++) {
+                const e = tee[i];
+                const isNew = (e.seq !== undefined) ? e.seq > start : i >= start;
+                if (!isNew) continue;
                 found = true;
-                const p = window.__wsParseSse(tee[i].body);
+                const p = window.__wsParseSse(e.body);
                 text = p.text;
                 done = p.done;
             }
@@ -741,7 +757,9 @@ async function waitForResponse(before, typedText) {
     // answer source (the DOM stopped rendering responses in this env). Tee
     // entries are pushed at loadend — anything at/after this index appeared
     // while WE poll, so it belongs to this request (the queue is serialized).
-    const teeStart = await page.evaluate(() => (window.__wsTee || []).length).catch(() => 0);
+    // 08-13 CAP BUG FIX: track the tee by seq — length-based starts break once
+    // eviction keeps length pinned at 32 (new entries were invisible forever).
+    const teeStart = await page.evaluate(() => (window.__wsTeeSeq || 0)).catch(() => 0);
     let deadline = Date.now() + config.timeout;
     // Absolute cap so a pathological never-ending stream can't hang the client
     // forever — activity may extend the deadline, but not past this.
@@ -794,7 +812,13 @@ async function waitForResponse(before, typedText) {
         // user rows = class _9663006, assistant rows = _4f9bf79 (probed 08-12,
         // stable across builds). Never accept a user-class row.
         const USER_ROW_CLS = '_9663006';
-        const userRow = (state.lastCls || '').split(/\s+/).includes(USER_ROW_CLS);
+        // 08-13: newer rows hash to _81e7b5e (probed live) — the hash-only
+        // check missed them, and the last row after a send is often the
+        // gateway's own tool-preamble USER row, which the DOM path could
+        // accept as the answer. Guard on hash OR the preamble prefix.
+        const userRow = (state.lastCls || '').split(/\s+/).includes(USER_ROW_CLS)
+            || (state.lastCls || '').split(/\s+/).includes('_81e7b5e')
+            || /^You have access to the tools below/.test(state.answer || '');
         // Growth via ROW COUNT (08-13): the text-inequality check alone never
         // trips when the new answer renders IDENTICAL to the previous one —
         // every response on the personal thread (6187afed) then burned the
@@ -903,7 +927,7 @@ async function waitForResponse(before, typedText) {
             console.log('⏱ deadline hit while still generating — not rescuing stale rows');
         } else {
             const ans = (last.answer || '').trim();
-            if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans)) {
+            if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans) && !/^You have access to the tools below/.test(ans)) {
                 console.log('⏱ timeout — rescuing the answer already on the tab');
                 return last.answer;
             }
