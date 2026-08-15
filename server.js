@@ -7,9 +7,12 @@ const { Readable } = require('stream');
 const config = require('./config');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
-    buildFullPrompt, openNewChatAndSeed, getReqBodyChars, resetTeeForHandoff, takeThreadSwap,
+    buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
+    resetTeeForHandoff, takeThreadSwap,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
+const { checkDrift } = require('./drift');
+const { judgeDrift } = require('./drift_judge');
 
 // ── Main-reply injection (08-14, user) ───────────────────────────────────
 // The webchat can message MAIN via the send_message_to_main tool. MAIN
@@ -398,6 +401,10 @@ const CONV_FORMAT =
     'make, and why.\n' +
     '  3) NEVER end with a tool call: after every tool result, keep working — next 💬 line + next tool call — ' +
     'until the task is fully done.\n' +
+    '  IMPORTANT (user rule 08-15): BEFORE EVERY WORK TOOL CALL (run_bash, read_file, write_file, ' +
+    'list_dir, search_web, etc.) you MUST first send a send_message tool call with one short 💬 line ' +
+    'saying what you are about to do and why. Reply with the send_message JSON FIRST, then continue ' +
+    'with the work tool call.\n' +
     '  4) Finish with your final plain-text 💬 summary message (no tool call) — that ends the turn.\n' +
     'Every 💬 line is delivered to the user verbatim; it is REQUIRED between every tool call.\n' +
     'JSON RULE (critical): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
@@ -513,6 +520,70 @@ function continueDirective(userPrompt) {
         'submit_answer instead.';
 }
 
+// ── DRIFT DETECTOR (owner 08-15: "its paradigm for optimality") ──
+// Env-gated: the supervisor sets DRIFT_DETECT=1 on the personal gateway only.
+// Before the final answer is committed, the model's PRIVATE THINKING
+// (captured from the completion-stream THINK fragments by browser.js) is
+// scored for direct refusal / fake compliance / off-task drift. A gate trip
+// goes to the omniroute judge (free upstreams — never the paid key); a
+// confirmed drift PAUSES the exchange, writes drift_report.json, and reports
+// to main (claude_inbox.json, the MAIN-DIRECT channel), who adjudicates:
+// valid → reseed + re-fire (drift_reseed.js); invalid → the exchange resumes.
+const DRIFT_DETECT = process.env.DRIFT_DETECT === '1';
+const DRIFT_REPORT_DIR = process.env.DRIFT_REPORT_DIR || '/home/roni/Roni_Workspace/audits_plans/drift_reports';
+const MAIN_INBOX_FILE = process.env.MAIN_INBOX_FILE || '/home/roni/Roni_Workspace/audits_plans/claude_inbox.json';
+const DRIFT_PAUSE_TEXT =
+    '⚠️ [DRIFT-PAUSED] The drift detector flagged this exchange (thinking scored as ' +
+    'refusal / fake-compliance / off-task) and the answer is HELD for main to adjudicate. ' +
+    'A report was written to drift_reports/ and main was notified — the task will be ' +
+    'reseeded and re-fired if the verdict holds.';
+
+async function reportDrift(r) {
+    try {
+        fs.mkdirSync(DRIFT_REPORT_DIR, { recursive: true });
+        const fname = 'drift_' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+        const fpath = path.join(DRIFT_REPORT_DIR, fname);
+        fs.writeFileSync(fpath, JSON.stringify({
+            ts: new Date().toISOString(),
+            score: r.score,
+            matches: r.matches,
+            threshold: r.threshold,
+            verdict: r.verdict,
+            taskHint: String(r.userPrompt || '').slice(0, 1500),
+            thinkExcerpt: String(r.thinkText || '').slice(-4000),
+        }, null, 2));
+        fs.writeFileSync(path.join(DRIFT_REPORT_DIR, 'drift_report.json'), fs.readFileSync(fpath));
+        const inbox = JSON.parse(fs.readFileSync(MAIN_INBOX_FILE, 'utf-8'));
+        inbox.push({
+            ts: new Date().toISOString(),
+            from: 'drift-detector',
+            text: 'DRIFT DETECTED on webchat 8080 (score ' + r.score + ', judge: ' +
+                (r.verdict ? (r.verdict.drifted ? 'VALID' : 'overruled') : 'no-verdict') +
+                (r.verdict && r.verdict.reason ? ' — ' + r.verdict.reason : '') +
+                ') — report: ' + fpath + ' — adjudicate: VALID → reseed + re-fire, INVALID → resume',
+        });
+        fs.writeFileSync(MAIN_INBOX_FILE, JSON.stringify(inbox, null, 2));
+        console.log(`🛡 DRIFT DETECTED (score ${r.score}) — exchange paused, reported to main`);
+    } catch (e) {
+        console.warn('⚠️ drift report write failed:', e.message);
+    }
+}
+
+// Gate the final answer: returns the answer text (delivered) or the pause text.
+async function maybePauseForDrift(text, userPrompt) {
+    if (!DRIFT_DETECT) return text;
+    let thinkText;
+    try { thinkText = await getAndClearThinkBuf(); } catch { return text; }
+    if (!thinkText || !thinkText.trim()) return text;
+    const gate = checkDrift(thinkText);
+    if (!gate.drifted) return text;
+    let verdict = null;
+    try { verdict = await judgeDrift(thinkText, userPrompt); } catch { verdict = null; }
+    if (verdict && verdict.drifted === false) return text; // judge overruled — deliver
+    await reportDrift({ ...gate, verdict, thinkText, userPrompt });
+    return DRIFT_PAUSE_TEXT + (verdict && verdict.reason ? '\n\nJudge: ' + verdict.reason : '');
+}
+
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
     let prompt = `### SYSTEM INSTRUCTION\n${WEBCHAT_PREAMBLE}\n\n`;
     if (systemText) prompt += `${systemText}\n\n`;
@@ -613,7 +684,6 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // one extra round max; the call itself is not lost, the model
             // re-sends it after the send_message.)
             if (
-                !config.allowPlainText &&
                 !parsed.prose &&
                 call.toolName !== SUBMIT_TOOL &&
                 call.toolName !== 'send_message' &&
@@ -630,7 +700,10 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // whether the request needed work — no min-call gate).
             if (call.toolName === SUBMIT_TOOL) {
                 const answer = cleanWebchatText(call.args?.text ?? call.args?.message ?? call.args?.content ?? '');
-                return answer || extractSubmitText(response) || '[webchat model submitted an empty answer]';
+                return await maybePauseForDrift(
+                    answer || extractSubmitText(response) || '[webchat model submitted an empty answer]',
+                    userPrompt
+                );
             }
             onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
             lastToolInfo = { tool: call.toolName, args: call.args };
@@ -721,7 +794,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 response = await countedSend(PROSE_NUDGE, toolDefs);
                 continue;
             }
-            return finalAnswerFor(prose);
+            return await maybePauseForDrift(finalAnswerFor(prose), userPrompt);
         }
 
         // Always-tool mode: ANY plain-text reply is a format error, yap or not.
@@ -1258,7 +1331,14 @@ app.post('/v1/messages', async (req, res) => {
                     : routedModel.startsWith('gemini')
                         ? { ...routedBody, model: 'gemini 3.7 flash webchat' }
                         : routedBody;
-            return proxyTo(req, res, WEBCHAT_ROUTES[routedModel], '/v1/messages', targetBody);
+            // 08-15 DRIFT-JUDGE FIX: OmniRoute 3.8.x serves its API under
+            // /api/v1/* — the old '/v1/messages' path returned the Next.js
+            // app shell (HTML) and the drift judge call hung on it.
+            return proxyTo(
+                req, res, WEBCHAT_ROUTES[routedModel],
+                routedModel === 'omniroute' ? '/api/v1/messages' : '/v1/messages',
+                targetBody
+            );
         }
         if (!isWebchatModel(routedBody)) {
             return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
@@ -1348,28 +1428,35 @@ app.post('/v1/messages', async (req, res) => {
         });
 
         let blockIndex = 0;
-        let statusOpen = false;
-        const statusLine = (evt) =>
-            evt.type === 'tool'
-                ? `🔧 ${evt.name}(${JSON.stringify(evt.args).slice(0, 120)})\n`
-                : evt.type === 'text'
-                  ? `💬 ${evt.text}\n`
-                  : `⚠️ ${evt.text}\n`;
-
+        // 08-15 NARRATION FIX (owner-urgent): emit REAL Anthropic content
+        // blocks instead of one flat '💬 JSON' text blob. A narration text
+        // event becomes a text block; a work tool becomes a tool_use block.
+        // The client then renders a normal text message BEFORE the tool call.
         const onProgress = (evt) => {
-            if (!statusOpen) {
-                statusOpen = true;
-                ev('content_block_start', {
-                    type: 'content_block_start',
-                    index: blockIndex,
-                    content_block: { type: 'text', text: '' },
-                });
+            if (evt.type === 'text') {
+                const t = String(evt.text ?? '');
+                if (!t) return;
+                ev('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+                ev('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: t } });
+                ev('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+                blockIndex++;
+                return;
             }
-            ev('content_block_delta', {
-                type: 'content_block_delta',
-                index: blockIndex,
-                delta: { type: 'text_delta', text: statusLine(evt) },
-            });
+            if (evt.type === 'tool') {
+                const id = 'toolu_' + Math.random().toString(36).slice(2, 10);
+                ev('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'tool_use', id, name: evt.name, input: {} } });
+                ev('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: JSON.stringify(evt.args ?? {}) } });
+                ev('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+                blockIndex++;
+                return;
+            }
+            // rejected / status events: surface as a short text block, never a bare tool JSON row
+            const t = String(evt.text ?? (evt.type === 'rejected' ? 'rejected' : ''));
+            if (!t) return;
+            ev('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+            ev('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: t } });
+            ev('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+            blockIndex++;
         };
 
         // Client gone (interrupt, timeout) → abort the webchat loop so it stops
@@ -1380,7 +1467,6 @@ app.post('/v1/messages', async (req, res) => {
         const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted));
         if (text === null) { clearInterval(heartbeat); return; } // aborted — nothing more to write
 
-        if (statusOpen) ev('content_block_stop', { type: 'content_block_stop', index: blockIndex++ });
 
         ev('content_block_start', {
             type: 'content_block_start',

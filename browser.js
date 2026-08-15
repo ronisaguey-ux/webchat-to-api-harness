@@ -718,13 +718,31 @@ async function snapshotChat() {
         // text-bearing one is the newest message (sidebar rows come earlier).
         let n = 0;
         let lastEl = null;
+        const seen = new Set();
+        const recent = [];
         for (const s of sels) {
             for (const el of document.querySelectorAll(s)) {
                 n++;
-                if (((el.innerText) || '').trim().length > 0) lastEl = el;
+                const t = (el.innerText || '').trim();
+                if (t.length === 0) continue;
+                if (seen.has(el)) continue;
+                seen.add(el);
+                // 08-15 NARRATION FIX: skip gateway-prompt echoes (user rows)
+                // so they never leak into the narration join below.
+                if (/You have access to the tools below|### SYSTEM INSTRUCTION|### USER MESSAGE/.test(t)) continue;
+                lastEl = el;
+                recent.push(el);
+                if (recent.length > 3) recent.shift();
             }
         }
-        const txt = lastEl ? lastEl.innerText || '' : '';
+        // 08-15 NARRATION FIX: gemini renders narration and fenced tool JSON
+        // in separate rows. Join trailing rows when the newest row is a tool
+        // call, so parseToolCalls sees [text, tool_use] instead of just JSON.
+        let txt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
+        if (recent.length > 1 && txt.includes('{') && /tool/.test(txt)) {
+            const joined = recent.map((e) => e.innerText || '').join('\n');
+            txt = joined.slice(0, 100000);
+        }
         return { mode: 'count', count: n, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
     }, config.selectors.message);
 }
@@ -796,7 +814,11 @@ async function installStreamTee() {
         // XHR/fetch interceptors below stay guarded — they are stateful and
         // must not double-install.
         window.__wsParseSse = function (body) {
-            const out = { text: '', done: false, error: '' };
+            // 08-15 DRIFT: `think` carries the model's PRIVATE THINKING (the
+            // DeepThink reasoning streamed BEFORE the RESPONSE fragment is
+            // declared, plus THINK fragment content) — readStreamedAnswer
+            // accumulates it into window.__wsThinkBuf for the drift detector.
+            const out = { text: '', think: '', done: false, error: '' };
             // 08-13 DeepThink gate: with thinking_enabled the think block
             // streams FIRST as bare {"v":...} chunks + -1/content APPENDs,
             // while the v-response frame declares fragments[last].type as
@@ -851,7 +873,10 @@ async function installStreamTee() {
                             if (lastFrag && lastFrag.type === 'RESPONSE') streamingResponse = true;
                             else if (lastFrag && lastFrag.type === 'THINK') streamingResponse = false;
                             for (const f of resp.fragments) {
-                                if (f && f.type === 'RESPONSE' && typeof f.content === 'string') out.text += f.content;
+                                if (f && typeof f.content === 'string') {
+                                    if (f.type === 'RESPONSE') out.text += f.content;
+                                    else if (f.type === 'THINK') out.think += f.content;
+                                }
                             }
                         }
                     }
@@ -876,12 +901,15 @@ async function installStreamTee() {
                             if (typeof lastFrag.content === 'string') out.text += lastFrag.content;
                         } else if (lastFrag && lastFrag.type === 'THINK') {
                             streamingResponse = false;
+                            if (typeof lastFrag.content === 'string') out.think += lastFrag.content;
                         }
                     }
                     if (j && typeof j.v === 'string' && j.p && /content/.test(j.p)) {
                         if (streamingResponse) out.text += j.v;
+                        else out.think += j.v; // pre-RESPONSE bare chunks = reasoning
                     } else if (j && typeof j.v === 'string' && !j.p) {
                         if (streamingResponse) out.text += j.v;
+                        else out.think += j.v; // pre-RESPONSE bare chunks = reasoning
                     }
                     if (j && j.p === 'response/status' && typeof j.v === 'string') {
                         if (j.v === 'FINISHED' || j.v === 'DONE' || j.v === 'ERROR' || j.v === 'STOPPED') out.done = true;
@@ -968,6 +996,18 @@ async function getReqBodyChars() {
     try { return await page.evaluate(() => window.__wsTeeReqBodyChars || 0); } catch { return 0; }
 }
 
+// 08-15 DRIFT: read + reset the page's accumulated THINK (reasoning) text —
+// the drift detector's input for the exchange that just finished.
+async function getAndClearThinkBuf() {
+    try {
+        return await page.evaluate(() => {
+            const t = window.__wsThinkBuf || '';
+            window.__wsThinkBuf = '';
+            return t;
+        });
+    } catch { return ''; }
+}
+
 // After a context-handoff thread swap the page's counters describe the OLD
 // thread — a stale ~threshold-sized body would immediately re-trigger a
 // handoff on the fresh chat. Clear the request-size record and the stream
@@ -1033,6 +1073,13 @@ async function readStreamedAnswer(startIndex) {
                 text = p.text;
                 done = p.done;
                 error = p.error || error; // last error wins; empty stays empty
+                if (p.think) {
+                    // 08-15 DRIFT: the model's PRIVATE THINKING accumulates
+                    // here (capped — scoring needs a window, not the whole
+                    // session); the gateway reads + clears it via
+                    // getAndClearThinkBuf at the end of each exchange.
+                    window.__wsThinkBuf = ((window.__wsThinkBuf || '') + p.think).slice(-40000);
+                }
             }
             return { found, text, done, error };
         }, startIndex);
@@ -1410,6 +1457,7 @@ module.exports = {
     sendFirstMessage,
     openNewChatAndSeed,
     getReqBodyChars,
+    getAndClearThinkBuf,
     resetTeeForHandoff,
     takeThreadSwap,
 };
