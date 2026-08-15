@@ -12,6 +12,7 @@
 //   4. Prints the new thread URL for the re-fire.
 const fs = require('fs');
 const browserMod = require('/home/roni/Roni_Workspace/webchat-api/browser.js');
+const configMod = require('/home/roni/Roni_Workspace/webchat-api/config.js');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const DEFAULT_URL = process.env.WEBCHAT_URL || 'https://chat.deepseek.com/a/chat/s/e480da5e-5904-4d25-8040-41ac1dd1c8d6';
@@ -26,11 +27,12 @@ const DEFAULT_BRIEF = process.env.DRIFT_BRIEF_FILE || '/home/roni/Roni_Workspace
   // deepseek's /a/chat root (new-chat composer) instead of the thread itself
   const m = threadUrl.match(/\/a\/chat\/s\/([0-9a-f-]+)/);
   if (m) {
-    browserMod.config.webchatUrl = threadUrl;
-    browserMod.config.tabUrlSubstring = m[1];
+    configMod.webchatUrl = threadUrl;
+    configMod.tabUrlSubstring = m[1];
   }
 
   await browserMod.initBrowser({ reconnect: true }); // shared connect path
+  await browserMod.connectToWebchat(threadUrl); // bind page by tabUrlSubstring
   const page = browserMod.getPage();
 
   // 1) STOP an in-flight generation, if visible (we WANT this stop — the
