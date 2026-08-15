@@ -106,8 +106,51 @@ const TOOL_DEFINITIONS = [
                             '(it executes webchat-model-controlled strings — read the README warning).',
                     });
                 }
-                const cmd = String(args.command || '');
-                // spawn + stdio→temp files instead of execFile + pipes: execFile
+                const cmd = String(args.command || "");
+                // 08-14 DENY-BY-DEFAULT guard (owner directive): hard-block
+                // dangerous patterns even when BASH_ALLOWED=true. git push is
+                // allowed ONLY to feature branches (explicit branch check).
+                const DANGER = [
+                    "pkill -f",
+                    "node -e",
+                    "node -p",
+                    "rm -rf",
+                    "settings_backup.json",
+                    "ghp_",
+                    "TELEGRAM_TOKEN",
+                    "BOT_TOKEN",
+                ];
+                let denied = null;
+                for (const s of DANGER) {
+                    if (cmd.includes(s)) { denied = s; break; }
+                }
+                if (denied) {
+                    return resolve({
+                        success: false,
+                        error: "run_bash DENIED: command matches dangerous pattern: " + denied,
+                    });
+                }
+                const toks = cmd.split(" ").filter(Boolean);
+                const gi = toks.indexOf("git");
+                const pi = toks.indexOf("push");
+                if (gi !== -1 && pi !== -1 && pi > gi) {
+                    const rest = toks.slice(pi + 1);
+                    const branch = rest.filter((t) => t[0] !== "-" && t !== "origin" && t !== "upstream").pop();
+                    if (!branch || branch === "master" || branch === "main") {
+                        return resolve({
+                            success: false,
+                            error: "run_bash DENIED: git push requires an explicit feature branch (master/main forbidden)",
+                        });
+                    }
+                }
+                // Log EVERY executed command (denied ones are NOT executed).
+                try {
+                    fs.appendFileSync(
+                        "/home/roni/Roni_Workspace/webchat-api/bash_tool_log.jsonl",
+                        JSON.stringify({ ts: new Date().toISOString(), cmd }) + os.EOL
+                    );
+                } catch (e) { /* logging must never block execution */ }
+// spawn + stdio→temp files instead of execFile + pipes: execFile
                 // waits for the pipes to CLOSE, so `cmd &` (backgrounded servers)
                 // blocked until the timeout — the model's "uvicorn ... &" hung
                 // every request a full 60s (2nd session 08-12). bash -c exits
