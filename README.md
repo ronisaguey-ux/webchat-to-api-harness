@@ -258,3 +258,14 @@ or `stream idle timeout`.
 **Prevention.** Keep the send mutex and wedge-guard (restarts silent
 listeners) — they are correct. The missing piece is tab-level self-healing:
 when a stream dies mid-turn, the tab must be reloaded, not just the gateway.
+
+---
+
+## 🔗 Companion Repositories & Toolchain Dependencies
+
+1. **[`drift-clean`](https://github.com/ronisaguey-ux/drift-clean.git)**:
+   - Provides background session hygiene, stream drift monitoring, and multi-AI transcript cleanup.
+2. **[`Insane-Custum-Claude-Settings`](https://github.com/ronisaguey-ux/Insane-Custum-Claude-Settings.git)**:
+   - Universal Claude Code settings, PreToolUse banned action hooks, and slash commands.
+3. **[`helpotron`](https://github.com/ronisaguey-ux/helpotron.git)**:
+   - Full-stack agentic workspace and reactive testing framework.
