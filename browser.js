@@ -375,29 +375,45 @@ async function isInstantThread() {
 }
 
 // 08-14 (user rule): select EXPERT mode on a fresh new-chat page. Mode is
-// locked at thread creation, so this works ONLY on the new-chat composer,
-// where the mode tabs (Instant / Expert / Vision, class dfb78875) live.
-// Click the Expert tab, then DeepThink ON. Never throws — a UI change just
-// logs and continues with the default (instant) mode rather than stalling.
+// locked at thread creation, so this works ONLY on the new-chat composer.
+// 08-15 (USER CORRECTION): the Instant/Expert/Vision tabs were NEVER removed —
+// they are a radiogroup (div.b0db7355, role="radio" options; dfb78875 = the
+// unselected option's inner div, aa40b5de + _31a22b0 on the selected radio).
+// My earlier probe missed them because they are NOT <button>s. The REAL expert
+// check per owner rule: an expert composer has NO Search option at all —
+// "if u see a search option that means its not expert". So select = click the
+// Expert radio at creation, then VERIFY Search is absent (else it's instant).
+// Never throws — a UI change just logs and continues rather than stalling.
 async function selectExpertMode() {
     try {
-        const clicked = await page.evaluate(() => {
-            const tab = [...document.querySelectorAll('div')].find(
-                (el) =>
-                    (el.textContent || '').trim() === 'Expert' &&
-                    /dfb78875/.test(el.className || '') &&
-                    el.getBoundingClientRect().width > 0);
-            if (!tab) return false;
-            tab.click();
-            return true;
+        const flipped = await page.evaluate(() => {
+            const out = [];
+            const radios = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')];
+            const expert = radios.find((r) => /expert/i.test(r.textContent || ''));
+            if (!expert) {
+                out.push('NO_MODE_TABS');
+            } else {
+                const isSel = expert.getAttribute('aria-checked') === 'true'
+                    || (expert.className || '').includes('_31a22b0');
+                if (!isSel) { expert.click(); out.push('Expert tab'); }
+            }
+            for (const el of document.querySelectorAll('.ds-toggle-button')) {
+                const label = (el.textContent || '').trim();
+                if (label === 'DeepThink' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('DeepThink ON'); }
+            }
+            return out;
         });
-        if (!clicked) {
-            console.log('⚠ expert mode tab not found on new-chat page — default mode will be used');
-            return;
+        await sleep(900); // composer re-renders for the selected mode
+        const searchPresent = await page.evaluate(() =>
+            [...document.querySelectorAll('.ds-toggle-button')].some(
+                (el) => (el.textContent || '').trim() === 'Search'));
+        if (searchPresent) {
+            console.log('⚠ expert select FAILED — Search option still present (thread is INSTANT, not expert)');
+        } else {
+            console.log(flipped && flipped.length
+                ? '🧠 new chat set to EXPERT mode (' + flipped.join(', ') + ') — Search absent, verified'
+                : '🧠 already expert (no Search option, DeepThink on)');
         }
-        await sleep(800); // composer re-renders for expert mode
-        await ensureToggles(); // DeepThink ON
-        console.log('🧠 new chat set to EXPERT mode (DeepThink on)');
     } catch (e) {
         console.log('⚠ selectExpertMode failed:', String(e.message).slice(0, 60));
     }
