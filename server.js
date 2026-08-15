@@ -474,11 +474,27 @@ function extractSubmitText(text) {
         .replace(/\\\\/g, '\\')
         .trim() || null;
 }
+function stripInjectedContract(text) {
+    if (typeof text !== 'string') return text;
+    // The gateway injects a tool-contract preamble ("You have access to the
+    // tools below...") into the USER prompt. When a renderer hiccup or the
+    // virtual-list reader picks the wrong row, that injected text leaks into
+    // the visible answer. Strip it so the client only sees the real reply.
+    return text
+        .replace(/You have access to the tools below\.[\s\S]*?(?=\n\n### |\n\n## |\{\s*"tool"|$)/g, (m) =>
+            /\{\s*"tool"/.test(m) ? '' : ''
+        )
+        .replace(/^You have access to the tools below\.[\s\S]*?(?=\n\n### |\n\n## |\{\s*"tool")/, '');
+}
+
 function cleanWebchatText(text) {
     if (typeof text !== 'string') return text;
-    return text
+    return stripInjectedContract(text)
         .replace(/^\s*Thought for \d+ seconds?\s*\n*/i, '')
         .replace(/\n*\s*This response is AI-generated, for reference only\.?\s*$/i, '')
+        // 08-14: DeepSeek's generation status line leaks as a visible footer
+        // on some renderer builds ("✻ Cooked for 29s"). Strip it everywhere.
+        .replace(/✻\s*(Cooked|Churned|Generated|Done|Thought)\s+for\s+\d+\s*s?\.?/gi, '')
         .trim();
 }
 
