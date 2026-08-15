@@ -1335,8 +1335,13 @@ async function openNewChat() {
     console.log('🆕 Opening a NEW chat');
     // 08-13 MULTI-SITE: deepseek's "new chat" is the /a/chat root; other
     // webchats (qwen/kimi/gemini) don't have that — their root IS a new chat.
+    // 08-15 (OWNER CORRECTION): the Instant/Expert/Vision mode tabs (radiogroup
+    // b0db7355) render ONLY on /a/chat/new — the /a/chat LIST page has just the
+    // DeepThink/Search toggles, so selectExpertMode found no tabs there and
+    // every swap created an INSTANT thread (Search option present = not expert,
+    // owner rule) → perpetual swap churn. Navigate to /a/chat/new instead.
     const newChatUrl = new URL(config.webchatUrl).host.includes('deepseek')
-        ? 'https://chat.deepseek.com/a/chat'
+        ? 'https://chat.deepseek.com/a/chat/new'
         : config.webchatUrl;
     await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForChatInput();

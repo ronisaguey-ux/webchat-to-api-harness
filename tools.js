@@ -532,6 +532,7 @@ function cleanProse(s) {
         .replace(/```(?:json)?/gi, '')
         .replace(new RegExp('^\\s*' + chrome.source), '')
         .replace(new RegExp(chrome.source + '\\s*$'), '')
+        .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*$/i, '')
         .trim();
 }
 
