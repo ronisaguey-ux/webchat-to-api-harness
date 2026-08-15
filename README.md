@@ -212,3 +212,49 @@ context handoff, and troubleshooting recipes.
 | Tool call not recognized | check the response shape — parser needs a balanced `{"tool","params"}` block |
 | Rate limited | rotate `WEBCHAT_URL` between chats, or run several instances |
 | Browser crashed | restart the server; cookies make reconnect painless |
+| `API Error: Stream idle timeout - no chunks received` / tab goes quiet mid-turn | **known issue, see below** — the webchat SSE stream died mid-generation; restarting the gateway is NOT enough, reload the tab (recovery below) |
+
+## ⚠️ Known issue: stream idle timeout / wedged tab (2026-08-15)
+
+**Symptom.** A request errors with `API Error: Stream idle timeout - no chunks
+received`, the gateway logs `⚠️ upstream stream error (mid-SSE reset):
+terminated`, and the tab goes quiet: it stops generating mid-turn, never
+finishes, and every subsequent send queues behind the dead in-flight
+exchange. Restarting the gateway process does **not** help — a fresh instance
+re-attaches to the *same frozen tab* and wedges again within minutes.
+
+**Root cause.** The webchat frontend's SSE stream died while a generation was
+in flight. The tab's page state still believes it is mid-generation, so the
+gateway's send mutex stays locked ("waiting for the in-flight message") and
+the queued send — including any `injectMainReplies` payload that was already
+stamped as seen — never reaches the tab. The tab itself is *idle*, not busy.
+
+**Diagnosis.** Via CDP (the browser exposes `/json/list`): if the tab's DOM
+has **no stop button** (`document.querySelector('[class*="stop"]')`), the tab
+is NOT generating — it is wedged. Check the gateway log for `mid-SSE reset`
+or `stream idle timeout`.
+
+**Recovery (in order).**
+
+1. **Reload the tab** — the thread history is server-side, nothing is lost:
+   connect to the tab's `webSocketDebuggerUrl` (WebSocket, send
+   `suppress_origin=true` — Chrome rejects cross-origin CDP sockets
+   otherwise) and issue `Page.reload`. Wait for the chat input to be found
+   (`✅ Chat input found — logged in.`).
+2. **Restart the gateways** by PID (`kill <pid>`) so they re-attach to the
+   reloaded tab. Never `pkill -f` — several unrelated processes match.
+3. **Re-stamp lost queue entries.** `injectMainReplies` advances its
+   seen-marker (`.main_reply_seen_<PORT>.json`) when it *builds* the block —
+   if that send then dies in the mutex queue, the entries were marked seen
+   but never delivered. Bump each undelivered entry's `ts` in the outbox
+   JSON to a fresh value > the marker, and pre-arm the OTHER gateway's marker
+   to the same value if two gateways share one thread (filter is
+   strictly-greater, so equal never re-injects — this prevents a duplicate
+   dump from the second gateway).
+4. Verify with a tiny round-trip: a `/v1/chat/completions` request asking for
+   `PONG`. A `PONG` response through the reloaded tab proves the chain is
+   healthy; the next real send then carries the re-stamped entries.
+
+**Prevention.** Keep the send mutex and wedge-guard (restarts silent
+listeners) — they are correct. The missing piece is tab-level self-healing:
+when a stream dies mid-turn, the tab must be reloaded, not just the gateway.
