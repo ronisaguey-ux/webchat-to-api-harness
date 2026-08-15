@@ -912,27 +912,37 @@ async function waitForResponse(before, typedText) {
     // the tab (the model finished just after the last poll). Deliver it
     // instead of failing the request — the answer is real model output and
     // the round logic (tool parse / format check) handles it normally.
-    try {
-        const tee = await readStreamedAnswer(teeStart);
-        if (tee.found && tee.text.trim().length > 0) {
-            console.log('⏱ timeout — rescuing the answer from the stream tee');
-            return tee.text;
-        }
-        const last = await snapshotChat();
-        // 08-13: never rescue while a generation is still running — the
-        // newest row may be a stale previous answer or a stream fragment
-        // (observed: the 20197-char gemini request rescued a 22-char row).
-        const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
-        if (busyNow) {
-            console.log('⏱ deadline hit while still generating — not rescuing stale rows');
-        } else {
+    // 08-13 WEDGE FIX: while the model is STILL GENERATING past the deadline
+    // (long cogitations on big tasks), keep waiting — bounded by the hard cap —
+    // instead of throwing. A throw here is exactly what made webchat tasks
+    // "stop mid task": the client saw an error while the tab was mid-thought.
+    while (Date.now() < hardCap) {
+        try {
+            const tee = await readStreamedAnswer(teeStart);
+            if (tee.found && tee.text.trim().length > 0) {
+                console.log('⏱ timeout — rescuing the answer from the stream tee');
+                return tee.text;
+            }
+            const last = await snapshotChat();
+            // 08-13: never rescue while a generation is still running — the
+            // newest row may be a stale previous answer or a stream fragment
+            // (observed: the 20197-char gemini request rescued a 22-char row).
+            const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+            if (busyNow) {
+                console.log('⏱ still generating past the deadline — extending (bounded by hard cap)');
+                await sleep(1500);
+                continue;
+            }
             const ans = (last.answer || '').trim();
             if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans) && !/^You have access to the tools below/.test(ans)) {
                 console.log('⏱ timeout — rescuing the answer already on the tab');
                 return last.answer;
             }
+            break; // idle and no answer — give up below
+        } catch {
+            await sleep(1500);
         }
-    } catch {}
+    }
     throw new Error(`Timed out after ${config.timeout}ms waiting for a response`);
 }
 

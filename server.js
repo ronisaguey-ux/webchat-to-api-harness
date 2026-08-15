@@ -144,6 +144,9 @@ const WEBCHAT_FORMAT =
     'ALWAYS wrap your JSON in a markdown code fence: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
     'The fence is MANDATORY: without it this chat renders your backticks as formatting and corrupts your content.\n' +
     'ONE tool call at a time — pick a single tool from the list below and call it. Never list multiple calls, never narrate.\n' +
+    'PAUSE CONTROL (tool call+done, user rule 08-13): add "next":"done" to ANY tool call — ' +
+    '{"tool":"<name>","params":{...},"next":"done"} — the tool runs, its output is sent to the user, and you are NOT ' +
+    'prompted again until the user sends a new message. Omit it (or set "next":"1") to keep working round after round.\n' +
     'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
     'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string; write_file content with ' +
     'quotes/newlines must be escaped, not triple-quoted.\n' +
@@ -167,6 +170,9 @@ const CONV_FORMAT =
     '(delivered to the user verbatim).\n' +
     '2. Your tool call, fenced: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
     'ONE tool call per reply. The fence is MANDATORY.\n' +
+    'PAUSE CONTROL (tool call+done, user rule 08-13): add "next":"done" to ANY tool call — ' +
+    '{"tool":"<name>","params":{...},"next":"done"} — the tool runs, its output is sent to the user, and you are NOT ' +
+    'prompted again until the user sends a new message. Omit it (or set "next":"1") to keep working round after round.\n' +
     'JSON RULE (critical): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
     'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string — file content with ' +
     'quotes/newlines must be escaped, never triple-quoted.\n' +
@@ -278,11 +284,28 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     // per-request context estimate. When it crosses the threshold the loop
     // stops and the handoff flow takes over (see runContextHandoff).
     let cycleTokens = 0;
+    let sendRetriesLeft = 1; // 08-13: one resend when a send times out — the
+    // tab can drop a followUp while busy and the loop would otherwise hang to
+    // the 180s deadline (the "stops mid task" wedge on helpotron).
     const countedSend = async (msg, defs) => {
         cycleTokens += estimateTokens(msg) + TOOL_SECTION_TOKENS;
-        const r = await sendPrompt(msg, defs);
-        cycleTokens += estimateTokens(r);
-        return r;
+        try {
+            const r = await sendPrompt(msg, defs);
+            cycleTokens += estimateTokens(r);
+            return r;
+        } catch (e) {
+            if (sendRetriesLeft > 0 && /Timed out/.test(String(e.message))) {
+                sendRetriesLeft--;
+                console.log('⏱ send timed out — resending with a RETRY banner');
+                const r = await sendPrompt(
+                    '### RETRY (the previous message may not have reached you — here it is again)\n' + msg,
+                    defs
+                );
+                cycleTokens += estimateTokens(r);
+                return r;
+            }
+            throw e;
+        }
     };
 
     let response = await countedSend(prompt, toolDefs);
@@ -328,6 +351,16 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
             lastToolInfo = { tool: call.toolName, args: call.args };
             const result = await executeTool(call.toolName, call.args);
+            // TOOL CALL+DONE (user rule 08-13): the model added "next":"done"
+            // to the call — run the tool, send its output to the client, and
+            // go IDLE: no followUp message to the tab until the next client
+            // request wakes the gateway. (+1 / omitted = keep looping below.)
+            if (/["']next["']\s*:\s*["'](done|0|false|stop)["']/i.test(response)) {
+                console.log(`⏸ tool call+done — ${call.toolName} ran once, pausing (no further prompts until woken)`);
+                return `[⏸ paused — tool call+done: ${call.toolName} ran and its output was delivered. ` +
+                    `Result: ${JSON.stringify(result)}\n\nThe harness will not prompt the model again until you ` +
+                    `send a new message.]`;
+            }
             // NEVER tell the model it's done after a tool result (08-12:
             // "Now give your final answer" made DeepSeek finalize after the
             // FIRST call by yapping a plan). Keep it in tool mode: next tool
