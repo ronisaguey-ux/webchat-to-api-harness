@@ -10,9 +10,13 @@
 // the gateway rewrites it to auto/best-coding (its own free upstreams; never
 // the paid key on this route).
 
-const JUDGE_URL = process.env.DRIFT_JUDGE_URL || 'http://127.0.0.1:8080/v1/messages';
+const JUDGE_URL = process.env.DRIFT_JUDGE_URL || 'http://127.0.0.1:8085/v1/messages';
 const JUDGE_MODEL = process.env.DRIFT_JUDGE_MODEL || 'omniroute';
-const JUDGE_TIMEOUT_MS = Number(process.env.DRIFT_JUDGE_TIMEOUT_MS || 90000);
+const JUDGE_TIMEOUT_MS = Number(process.env.DRIFT_JUDGE_TIMEOUT_MS || 60000);
+// 08-15: the omniroute free pool gets rate-limited (Felo 429 / exhausted
+// connections) — the judge then falls back to the free gemini tab gateway.
+const JUDGE_FALLBACK_URL = process.env.DRIFT_JUDGE_FALLBACK_URL || 'http://127.0.0.1:8085/v1/messages';
+const JUDGE_FALLBACK_MODEL = process.env.DRIFT_JUDGE_FALLBACK_MODEL || 'gemini 3.7 flash webchat';
 
 const JUDGE_SYSTEM = [
   'You are the DRIFT MONITOR for a DeepSeek webchat work session. Your ONLY job:',
@@ -50,11 +54,11 @@ function extractVerdict(text) {
   return null;
 }
 
-async function judgeDrift(thinkText, taskHint) {
+async function callJudge(thinkText, taskHint, url, model) {
   const excerpt = String(thinkText || '').slice(0, 12000);
   const task = String(taskHint || '').slice(0, 1500);
   const body = {
-    model: JUDGE_MODEL,
+    model,
     max_tokens: 200,
     stream: false,
     messages: [
@@ -71,7 +75,7 @@ async function judgeDrift(thinkText, taskHint) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), JUDGE_TIMEOUT_MS);
   try {
-    const res = await fetch(JUDGE_URL, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -104,6 +108,23 @@ async function judgeDrift(thinkText, taskHint) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function judgeDrift(thinkText, taskHint) {
+  // Primary: omniroute via the 8080 gateway (free upstreams only — owner
+  // design: the judge's ONE job). The free pool rate-limits under load
+  // (Felo 429 / exhausted connections, observed 08-15) — retry once on
+  // fast errors, then fall back to the free gemini tab gateway.
+  let v = await callJudge(thinkText, taskHint, JUDGE_URL, JUDGE_MODEL);
+  if (v.error && v.reason && !/aborted|timed out|timeout/i.test(v.reason)) {
+    v = await callJudge(thinkText, taskHint, JUDGE_URL, JUDGE_MODEL);
+  }
+  if (v.error || v.drifted === null) {
+    const f = await callJudge(thinkText, taskHint, JUDGE_FALLBACK_URL, JUDGE_FALLBACK_MODEL);
+    if (!f.error && f.drifted !== null) return { ...f, judge: 'gemini-fallback' };
+    return v; // last resort: report the primary's error — the gate still pauses
+  }
+  return v;
 }
 
 module.exports = { judgeDrift, JUDGE_SYSTEM };

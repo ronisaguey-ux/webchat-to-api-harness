@@ -11,8 +11,7 @@ const {
     resetTeeForHandoff, takeThreadSwap,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
-const { checkDrift } = require('./drift');
-const { judgeDrift } = require('./drift_judge');
+const { MultiSignalGatewayGate } = require('./drift_v2');
 
 // ── Main-reply injection (08-14, user) ───────────────────────────────────
 // The webchat can message MAIN via the send_message_to_main tool. MAIN
@@ -329,7 +328,8 @@ async function isConnected() {
 // salient instruction slot, positioned after the user request.
 const WEBCHAT_PREAMBLE =
     'You are inside an automated tool-calling harness. Your replies are parsed by a machine — ' +
-    'nobody reads them. You never plan, summarize, describe what you will do, or ask permission: you act.';
+    'nobody reads them. You never plan, summarize, describe what you will do, or ask permission: you act.' +
+    ' ALWAYS reply in ENGLISH — never in Chinese or any other language, even if the chat history or the user message uses another language. Your tool calls AND your final answer text are always English.';
 
 // ── Tool-call size cap (user rule 08-13) ────────────────────────────────
 // The chat renderer truncates very long messages, which corrupts fenced JSON
@@ -520,68 +520,36 @@ function continueDirective(userPrompt) {
         'submit_answer instead.';
 }
 
-// ── DRIFT DETECTOR (owner 08-15: "its paradigm for optimality") ──
-// Env-gated: the supervisor sets DRIFT_DETECT=1 on the personal gateway only.
-// Before the final answer is committed, the model's PRIVATE THINKING
-// (captured from the completion-stream THINK fragments by browser.js) is
-// scored for direct refusal / fake compliance / off-task drift. A gate trip
-// goes to the omniroute judge (free upstreams — never the paid key); a
-// confirmed drift PAUSES the exchange, writes drift_report.json, and reports
-// to main (claude_inbox.json, the MAIN-DIRECT channel), who adjudicates:
-// valid → reseed + re-fire (drift_reseed.js); invalid → the exchange resumes.
-const DRIFT_DETECT = process.env.DRIFT_DETECT === '1';
+// ── DRIFT DETECTOR v2 (owner 08-15: event-driven, judge-on-escalation) ──
+const DRIFT_DETECT = process.env.DRIFT_DETECT;
 const DRIFT_REPORT_DIR = process.env.DRIFT_REPORT_DIR || '/home/roni/Roni_Workspace/audits_plans/drift_reports';
 const MAIN_INBOX_FILE = process.env.MAIN_INBOX_FILE || '/home/roni/Roni_Workspace/audits_plans/claude_inbox.json';
-const DRIFT_PAUSE_TEXT =
-    '⚠️ [DRIFT-PAUSED] The drift detector flagged this exchange (thinking scored as ' +
-    'refusal / fake-compliance / off-task) and the answer is HELD for main to adjudicate. ' +
-    'A report was written to drift_reports/ and main was notified — the task will be ' +
-    'reseeded and re-fired if the verdict holds.';
+const DRIFT_PAUSE_TEXT = '⚠️ [DRIFT-PAUSED] The drift detector flagged this exchange and the answer is HELD for main to adjudicate. A report was written to drift_reports/ and main was notified.';
+const driftGate = new MultiSignalGatewayGate({ mode: Number(DRIFT_DETECT || '2') });
 
 async function reportDrift(r) {
     try {
         fs.mkdirSync(DRIFT_REPORT_DIR, { recursive: true });
         const fname = 'drift_' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
         const fpath = path.join(DRIFT_REPORT_DIR, fname);
-        fs.writeFileSync(fpath, JSON.stringify({
-            ts: new Date().toISOString(),
-            score: r.score,
-            matches: r.matches,
-            threshold: r.threshold,
-            verdict: r.verdict,
-            taskHint: String(r.userPrompt || '').slice(0, 1500),
-            thinkExcerpt: String(r.thinkText || '').slice(-4000),
-        }, null, 2));
+        fs.writeFileSync(fpath, JSON.stringify({ ts: new Date().toISOString(), score: r.score, matches: r.matches, threshold: r.threshold, verdict: r.verdict, taskHint: String(r.userPrompt || '').slice(0, 1500), thinkExcerpt: String(r.thinkText || '').slice(-4000) }, null, 2));
         fs.writeFileSync(path.join(DRIFT_REPORT_DIR, 'drift_report.json'), fs.readFileSync(fpath));
         const inbox = JSON.parse(fs.readFileSync(MAIN_INBOX_FILE, 'utf-8'));
-        inbox.push({
-            ts: new Date().toISOString(),
-            from: 'drift-detector',
-            text: 'DRIFT DETECTED on webchat 8080 (score ' + r.score + ', judge: ' +
-                (r.verdict ? (r.verdict.drifted ? 'VALID' : 'overruled') : 'no-verdict') +
-                (r.verdict && r.verdict.reason ? ' — ' + r.verdict.reason : '') +
-                ') — report: ' + fpath + ' — adjudicate: VALID → reseed + re-fire, INVALID → resume',
-        });
+        inbox.push({ ts: new Date().toISOString(), from: 'drift-detector-v2', text: 'DRIFT DETECTED on webchat 8080 (score ' + r.score + ') — report: ' + fpath });
         fs.writeFileSync(MAIN_INBOX_FILE, JSON.stringify(inbox, null, 2));
-        console.log(`🛡 DRIFT DETECTED (score ${r.score}) — exchange paused, reported to main`);
-    } catch (e) {
-        console.warn('⚠️ drift report write failed:', e.message);
-    }
+        console.log('🛡 DRIFT DETECTED (score ' + r.score + ') — exchange paused, reported to main');
+    } catch (e) { console.warn('⚠️ drift report write failed:', e.message); }
 }
 
-// Gate the final answer: returns the answer text (delivered) or the pause text.
 async function maybePauseForDrift(text, userPrompt) {
-    if (!DRIFT_DETECT) return text;
+    if (driftGate.mode === 0) return text;
     let thinkText;
     try { thinkText = await getAndClearThinkBuf(); } catch { return text; }
     if (!thinkText || !thinkText.trim()) return text;
-    const gate = checkDrift(thinkText);
-    if (!gate.drifted) return text;
-    let verdict = null;
-    try { verdict = await judgeDrift(thinkText, userPrompt); } catch { verdict = null; }
-    if (verdict && verdict.drifted === false) return text; // judge overruled — deliver
-    await reportDrift({ ...gate, verdict, thinkText, userPrompt });
-    return DRIFT_PAUSE_TEXT + (verdict && verdict.reason ? '\n\nJudge: ' + verdict.reason : '');
+    const result = await driftGate.feed(thinkText, userPrompt);
+    if (!result.paused) return text;
+    await reportDrift({ ...result.gate, verdict: result.verdict, thinkText, userPrompt });
+    return DRIFT_PAUSE_TEXT + (result.verdict && result.verdict.reason ? '\n\nJudge: ' + result.verdict.reason : '');
 }
 
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
@@ -1105,15 +1073,21 @@ function persistThreadSwap(oldId, newId, newUrl) {
     const changed = [];
     try {
         const sv = fs.readFileSync(supervisor, 'utf8');
-        if (sv.includes(oldId)) {
+        if (sv.includes(oldId) || sv.includes(oldId.slice(0, 8))) {
             // 08-13: the supervisor pins use the 8-char id PREFIX for
             // TAB_URL_SUBSTRING (TAB_URL_SUBSTRING=51455c98) while oldId is
             // the full UUID — the full-id split never matched, so the
             // substring pin went stale after handoffs (8082's pin died this
             // way 08-13). Replace both forms with the new 8-char prefix.
+            // 08-15 BUGFIX: oldId can ALSO be the 8-char prefix itself (the
+            // expert-swap path passes config.tabUrlSubstring = env pin), so
+            // the WEBCHAT_URL split left the old uuid tail glued to the new
+            // URL (feb229fa-...-6a26-4835-acc2 corruption, pinned a dead
+            // thread, every 8080 send after it went to a fresh empty chat).
+            // Regex on the prefix + any uuid tail for BOTH oldId forms.
             const old8 = oldId.slice(0, 8), new8 = newId.slice(0, 8);
             fs.writeFileSync(supervisor, sv
-                .split('WEBCHAT_URL=https://chat.deepseek.com/a/chat/s/' + oldId).join('WEBCHAT_URL=' + newUrl)
+                .replace(new RegExp('WEBCHAT_URL=https://chat\\.deepseek\\.com/a/chat/s/' + old8 + '[0-9a-f-]*'), 'WEBCHAT_URL=' + newUrl)
                 .split('TAB_URL_SUBSTRING=' + oldId).join('TAB_URL_SUBSTRING=' + new8)
                 .split('TAB_URL_SUBSTRING=' + old8).join('TAB_URL_SUBSTRING=' + new8));
             changed.push('stack_supervisor.sh');
@@ -1124,8 +1098,11 @@ function persistThreadSwap(oldId, newId, newUrl) {
     }
     try {
         const cj = fs.readFileSync(chatJs, 'utf8');
-        if (cj.includes(oldId)) {
-            fs.writeFileSync(chatJs, cj.split('https://chat.deepseek.com/a/chat/s/' + oldId).join(newUrl));
+        if (cj.includes(oldId) || cj.includes(oldId.slice(0, 8))) {
+            // same prefix-vs-full-uuid fix as the supervisor pin above
+            fs.writeFileSync(chatJs, cj.replace(
+                new RegExp('https://chat\\.deepseek\\.com/a/chat/s/' + oldId.slice(0, 8) + '[0-9a-f-]*'),
+                newUrl));
             changed.push('chat.js');
             console.log(`📝 chat.js pin: ${oldId} → ${newId}`);
         }
