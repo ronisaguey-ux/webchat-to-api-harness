@@ -3,3 +3,4 @@ node_modules/
 .cookies.json
 *.log
 chat.js
+bash_tool_log.jsonl

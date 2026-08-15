@@ -13,6 +13,12 @@ const {
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 const { MultiSignalGatewayGate } = require('./drift_v2');
 
+let driftClean = null;
+try {
+    const driftPkg = require('../LLM-Drift-Detector');
+    driftClean = driftPkg.driftClean;
+} catch (e) { /* optional background layer */ }
+
 // ── Main-reply injection (08-14, user) ───────────────────────────────────
 // The webchat can message MAIN via the send_message_to_main tool. MAIN
 // replies into claude_webchat_outbox.json with "to": <this gateway's thread
@@ -207,6 +213,10 @@ async function countedSend(msg, defs) {
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+
+if (typeof driftClean === 'function') {
+    driftClean({ silent: true }).catch(() => {});
+}
 
 // ── Upstream passthrough ──────────────────────────────────────────────
 // The /model picker needs ONE base URL that offers BOTH models:
