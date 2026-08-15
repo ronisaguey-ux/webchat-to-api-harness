@@ -53,6 +53,68 @@ function injectMainReplies(msg) {
 const MIN_SEND_INTERVAL_MS = parseInt(process.env.MIN_SEND_INTERVAL_MS || '6000', 10);
 let lastSendAt = 0;
 
+// 08-14 GLOBAL SEND MUTEX (owner rule: deepseek webchat supports ONE message
+// in-flight per account — "u cant have 2 deepseek webchats working at once",
+// but "if u make sure a message is never sent to more then one chat at once
+// u can basically have infinite chats open"). ALL deepseek-tab gateways
+// (8080/8081/8082/8094, any browser) serialize on a shared lock held across
+// the full send→response window, so tabs never generate concurrently.
+// mkdir is atomic (one winner), a heartbeat keeps the mtime fresh so long
+// generations aren't stolen, and a 120s-stale steal frees the lock if a
+// gateway dies mid-hold. Non-deepseek gates (qwen/kimi/gemini) skip it.
+const DEEPSEEK_LOCK_DIR = '/tmp/deepseek_webchat_mutex';
+const LOCK_STEAL_MS = 120000;
+const LOCK_HEARTBEAT_MS = 30000;
+const LOCK_ACQUIRE_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_LOCK_TIMEOUT_MS || '1800000', 10);
+let lockHeartbeat = null;
+let lockDepth = 0;
+
+function usesDeepSeek() {
+    return /chat\.deepseek\.com/.test(String(config.webchatUrl || ''));
+}
+
+async function acquireDeepSeekLock() {
+    if (!usesDeepSeek()) return;
+    // Reentrant: context-handoff / retry flows send nested messages from
+    // within an already-locked request (same process) — depth-count them.
+    if (lockDepth > 0) { lockDepth++; return; }
+    const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+    let waited = false;
+    while (true) {
+        try {
+            fs.mkdirSync(DEEPSEEK_LOCK_DIR);
+            break; // acquired
+        } catch (e) { /* held by another gateway */ }
+        if (!waited) {
+            waited = true;
+            console.log('🔒 deepseek mutex: queued — waiting for the in-flight message (one at a time)');
+        }
+        try {
+            const st = fs.statSync(DEEPSEEK_LOCK_DIR);
+            if (Date.now() - st.mtimeMs > LOCK_STEAL_MS) {
+                fs.rmdirSync(DEEPSEEK_LOCK_DIR); // dead holder → steal
+                continue;
+            }
+        } catch (e) { /* stolen between stat+rmdir; retry */ }
+        if (Date.now() > deadline) {
+            throw new Error('DeepSeek send mutex: another chat is mid-generation (lock timeout)');
+        }
+        await sleep(200);
+    }
+    lockDepth = 1;
+    lockHeartbeat = setInterval(() => {
+        try { fs.utimesSync(DEEPSEEK_LOCK_DIR, new Date(), new Date()); } catch (e) {}
+    }, LOCK_HEARTBEAT_MS);
+}
+
+function releaseDeepSeekLock() {
+    if (lockDepth <= 0) return;
+    lockDepth--;
+    if (lockDepth > 0) return; // nested chain still active
+    if (lockHeartbeat) { clearInterval(lockHeartbeat); lockHeartbeat = null; }
+    try { fs.rmdirSync(DEEPSEEK_LOCK_DIR); } catch (e) {}
+}
+
 // 08-13 CONTEXT-HANDOFF (real measure): the completion XHR's REQUEST body
 // size (history + system + tools + message, chars) — exactly what DeepSeek
 // counts against its per-request cap (observed failing at ~135k chars ≈ 32k
@@ -74,6 +136,11 @@ let lastHandoffAt = 0;
 // at every handleRequest start and whenever a tool executes.
 let activeHandoffCtx = null;
 async function countedSend(msg, defs) {
+    // 08-14 GLOBAL SEND MUTEX: wait for any other deepseek-tab gateway to
+    // finish its generation before sending (owner rule: one in-flight
+    // message per account). Held through the response; released in finally.
+    await acquireDeepSeekLock();
+    try {
     // 08-13 RATE-LIMIT GATE: queue-spaced sends (see MIN_SEND_INTERVAL_MS
     // above). DeepSeek rejected burst traffic with a hint-error that this
     // harness previously could not see — requests hung until timeout, the
@@ -129,6 +196,9 @@ async function countedSend(msg, defs) {
             return r;
         }
         throw e;
+    }
+    } finally {
+        releaseDeepSeekLock();
     }
 }
 
