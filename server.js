@@ -520,6 +520,19 @@ function continueDirective(userPrompt) {
         'submit_answer instead.';
 }
 
+function greetingDirective(userPrompt) {
+    if (!userPrompt || typeof userPrompt !== 'string') return '';
+    const clean = userPrompt.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '');
+    const greetings = ['yo', 'hi', 'hello', 'hey', 'yo u there', 'you there', 'sup', 'whats up', 'whatsup', 'howdy', 'test', 'yo bro', 'yo man'];
+    if (greetings.includes(clean)) {
+        return '\n### INSTRUCTION FOR GREETING\n' +
+            'The user is simply greeting you ("' + userPrompt.trim() + '"). ' +
+            'Do NOT execute any tools. Do NOT call read_file, list_dir, or run_bash. ' +
+            'Reply immediately with a brief, friendly greeting in plain text.\n';
+    }
+    return '';
+}
+
 // ── DRIFT DETECTOR v2 (owner 08-15: event-driven, judge-on-escalation) ──
 const DRIFT_DETECT = process.env.DRIFT_DETECT;
 const DRIFT_REPORT_DIR = process.env.DRIFT_REPORT_DIR || '/home/roni/Roni_Workspace/audits_plans/drift_reports';
@@ -559,6 +572,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
     prompt += config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT;
     prompt += continueDirective(userPrompt);
+    prompt += greetingDirective(userPrompt);
     prompt += `### RESPONSE\n`;
 
     if (isAborted?.()) {
