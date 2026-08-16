@@ -332,8 +332,37 @@ async function sendPrompt(prompt, toolDefinitions) {
         if (m && m[1]) threadSwapSeen = { url: u, id: m[1] };
     }
 
+    // 08-16 (user): the model's own reply still renders the FULL file content
+    // when it calls write_file (content rides in the params JSON). The model's
+    // real context lives on the webchat server, so collapsing the DOM here is
+    // display-only: the user sees the tool name + a size hint, the model keeps
+    // the content. Best-effort — a re-render may restore it.
+    await collapseBigReplies();
+
     await saveCookies(); // keep the session fresh
     return text;
+}
+
+// 08-16 (user): hide large file content from the visible tab. Replace long
+// "content"/"text" JSON string values (>400 chars) in the newest rendered
+// model reply with a size hint. Gemini lane only.
+async function collapseBigReplies() {
+    if (!config.modelName || !/gemini/i.test(config.modelName)) return;
+    try {
+        await page.evaluate(() => {
+            const rows = document.querySelectorAll('model-response');
+            if (!rows.length) return;
+            const last = rows[rows.length - 1];
+            const pre = last.querySelector('pre, code');
+            const t = ((pre || last).innerText || (pre || last).textContent || '').trim();
+            if (t.length < 600) return;
+            const hide = (s) => s.replace(/"((?:content|text))"\s*:\s*"([\s\S]*?)"\s*(?=,|\})/g, (m, key, val) => val.length > 400 ? `"${key}": "[${val.length} chars hidden]"` : m);
+            const cleaned = hide(t);
+            if (cleaned !== t) (pre || last).textContent = cleaned;
+        });
+    } catch (e) {
+        console.log('⚠ collapseBigReplies failed:', String(e.message).slice(0, 60));
+    }
 }
 
 // 08-14 (user rule): the deepseek tab runs in EXPERT mode, which has ONLY the
