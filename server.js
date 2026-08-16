@@ -53,6 +53,151 @@ function injectMainReplies(msg) {
     }
 }
 
+// ── Readable tool receipts (08-16, user) ─────────────────────────────────
+// The raw tool-call JSON and the "Tool call returned: json {...}" envelope
+// made the tab and the streamed progress illegible. These helpers render a
+// Claude-Code-style receipt: the actual bash command (truncated), file + stats
+// for read_file, a red/green diff for write_file, and the bash output with a
+// cap. Used both for the SSE text blocks the client sees and the follow-up
+// message typed into the tab.
+function truncateStr(s, n) {
+    if (typeof s !== 'string') s = String(s ?? '');
+    return s.length > n ? s.slice(0, n) + `\n… [truncated — ${s.length - n} more chars]` : s;
+}
+
+function argsSummary(toolName, args) {
+    try {
+        const a = args ?? {};
+        if (toolName === 'run_bash') return `$ ${truncateStr(String(a.command ?? ''), 300)}`;
+        if (toolName === 'read_file') return `→ ${a.path ?? '?'}`;
+        if (toolName === 'write_file') return `→ ${a.path ?? '?'}`;
+        if (toolName === 'list_dir') return `→ ${a.path ?? '?'}`;
+        if (toolName === 'git_status') return `→ repo: ${a.repo ?? 'oculus'}`;
+        if (toolName === 'send_message') return `→ ${truncateStr(String(a.text ?? ''), 120)}`;
+        const j = JSON.stringify(a);
+        return j.length > 150 ? j.slice(0, 150) + '…' : j;
+    } catch { return ''; }
+}
+
+// Minimal LCS line diff in unified-ish +/- form, capped for chat display.
+// The `diff` fence is syntax-highlighted red/green by DeepSeek's markdown
+// renderer, which is what gives write_file its Claude-Code look. 08-16:
+// each line now carries its OLD (for `-`) or NEW (for `+`) 1-based line
+// number (`-12 | …` / `+13 | …`) so the reader sees exactly which lines
+// changed without re-counting. Returns { text, added, removed }.
+function diffLines(oldStr, newStr) {
+    try {
+        const B = String(newStr ?? '').replace(/\r\n/g, '\n').split('\n');
+        if (B.length > 2500) B.length = 2500;
+        const out = [];
+        let added = 0, removed = 0;
+        // Brand-new file (no old content): every line is an addition, numbered
+        // from the new file's line 1.
+        if (!oldStr) {
+            B.forEach((l, idx) => { out.push(`+${idx + 1} | ${l}`); });
+            added = B.length;
+            if (out.length > 500) {
+                return { text: out.slice(0, 500).join('\n') + `\n… [+ ${added} lines total]`, added, removed };
+            }
+            return { text: out.join('\n'), added, removed };
+        }
+        const A = String(oldStr).replace(/\r\n/g, '\n').split('\n');
+        const n = A.length, m = B.length;
+        if (n > 2500) A.length = 2500;
+        if (m > 2500) B.length = 2500;
+        const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+        for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+            dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        let i = 0, j = 0;
+        while (i < n && j < m) {
+            if (A[i] === B[j]) { i++; j++; }
+            else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push(`-${i + 1} | ${A[i]}`); i++; removed++; }
+            else { out.push(`+${j + 1} | ${B[j]}`); j++; added++; }
+        }
+        while (i < n) { out.push(`-${i + 1} | ${A[i]}`); i++; removed++; }
+        while (j < m) { out.push(`+${j + 1} | ${B[j]}`); j++; added++; }
+        if (!added && !removed) return { text: '', added, removed };
+        let d = out.slice(0, 500).join('\n');
+        if (out.length > 500) d += `\n… [${removed} removed, ${added} added, ${out.length - 500} more diff lines]`;
+        return { text: d, added, removed };
+    } catch { return { text: '', added: 0, removed: 0 }; }
+}
+
+// 08-16: render read_file content with 1-based line numbers and a head cap.
+// Large reads are MINIMIZED to the given char cap with a "N lines hidden"
+// marker instead of dumping the whole file.
+function numberLines(content, cap) {
+    const lines = String(content ?? '').replace(/\r\n/g, '\n').split('\n');
+    let shown = lines;
+    let dropped = 0;
+    if (cap && cap > 0) {
+        let acc = 0, cut = 0;
+        for (; cut < lines.length; cut++) {
+            if (acc + lines[cut].length + 1 > cap) break;
+            acc += lines[cut].length + 1;
+        }
+        if (cut < lines.length) { shown = lines.slice(0, cut); dropped = lines.length - cut; }
+    }
+    const w = Math.max(3, String(lines.length).length);
+    return {
+        text: shown.map((l, idx) => `${String(idx + 1).padStart(w)} | ${l}`).join('\n'),
+        shown: shown.length,
+        total: lines.length,
+        dropped,
+    };
+}
+
+// One readable block describing a finished tool call + its result. `cap` is
+// the content/output cap for the view: small for the client's streamed text,
+// generous for the tab follow-up (the model reads the result from the tab).
+function formatToolResultView(call, result, cap) {
+    const name = call.toolName;
+    const args = call.args ?? {};
+    const limit = cap || 6000;
+    try {
+        if (name === 'run_bash') {
+            const ok = !!result.success;
+            const status = ok ? '✅ bash command finished' : '❌ bash command failed';
+            const detail = result.error ? ` (${result.error})` : '';
+            let out = `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 400)}\n\n${status}${detail}\n`;
+            const stdout = String(result.stdout ?? '').trim();
+            const stderr = String(result.stderr ?? '').trim();
+            if (stdout) out += `\n\`\`\`\n${truncateStr(stdout, limit)}\n\`\`\`\n`;
+            if (stderr) out += `\n\`\`\`\nstderr:\n${truncateStr(stderr, Math.min(limit, 6000))}\n\`\`\`\n`;
+            return out;
+        }
+        if (name === 'read_file') {
+            const content = String(result.content ?? '');
+            const total = result.totalLength ?? content.length;
+            const numbered = numberLines(content, limit);
+            const head = `📄 read_file → ${args.path ?? '?'} (~${numbered.total} lines, ${total} chars)`;
+            let shown = numbered.text;
+            if (numbered.dropped) {
+                shown += `\n… [minimized — ${numbered.dropped} of ${numbered.total} lines hidden]`;
+                if (result.truncated) shown += ` (file truncated at ${limit} chars)`;
+            }
+            return `${head}\n\n\`\`\`\n${shown}\n\`\`\``;
+        }
+        if (name === 'write_file') {
+            const path = args.path ?? '?';
+            const diff = diffLines(result.oldContent, args.content);
+            if (!diff.text) return `✏️ write_file → ${path} (no content change)`;
+            const bits = [];
+            if (diff.added) bits.push(`adding ${diff.added} line${diff.added === 1 ? '' : 's'} to this file`);
+            if (diff.removed) bits.push(`deleting ${diff.removed} line${diff.removed === 1 ? '' : 's'}`);
+            return `✏️ write_file → ${path} — ${bits.join(', ')}\n\n\`\`\`diff\n${diff.text}\n\`\`\``;
+        }
+        if (!result || result.success === false) {
+            return `🔧 ${name} ${argsSummary(name, args)}\n\n❌ ${(result && result.error) || 'tool failed'}`;
+        }
+        const j = JSON.stringify(result ?? {});
+        const capped = j.length > limit ? j.slice(0, limit) + '… [truncated]' : j;
+        return `🔧 ${name} ${argsSummary(name, args)}\n\n\`\`\`json\n${capped}\n\`\`\``;
+    } catch (e) {
+        return `🔧 ${name} — (result formatting error: ${e.message})`;
+    }
+}
+
 // 08-13 RATE-LIMIT GATE (user-visible hang fix): DeepSeek's account limiter
 // rejects bursts with "Messages too frequent. Try again later." — parallel
 // consumers (user client + orchestrator) hammering the same account made
@@ -719,14 +864,18 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             } else {
                 result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
             }
+            // 08-16 (user): stream a readable receipt to the client — the exact
+            // command / file / output, not a bare "🔧 toolname" — so anyone
+            // watching the webchat knows what just ran. The tab follow-up
+            // below carries the full result (belt-capped) for the model.
+            if (call.toolName !== 'send_message') {
+                onProgress?.({ type: 'text', text: formatToolResultView(call, result, 6000) });
+            }
             // 08-14 WEDGE ROOT-CAUSE belt: whatever a tool returns, the result
             // message must stay small — a huge read_file output previously
             // ballooned the next prompt to 6.2M chars and wedged the tab.
-            // (read_file itself now caps at 200K; this catches every other tool.)
-            const resultJson = JSON.stringify(result);
-            const cappedResult = resultJson.length > 150000
-                ? resultJson.slice(0, 150000) + '… [tool result truncated — pass maxLength for head reads]'
-                : resultJson;
+            // (read_file itself now caps at 200K; the receipt below is capped
+            // at 150K and never re-serializes the full result JSON twice.)
             // 08-13 EVENING (user rule): NEVER end the tool loop after a tool
             // call — the model used "next":"done" mid-task and the harness
             // went idle with the task unfinished. The turn ends ONLY when the
@@ -736,10 +885,16 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // "Now give your final answer" made DeepSeek finalize after the
             // FIRST call by yapping a plan). Keep it in tool mode: next tool
             // call, or submit_answer when the task is genuinely complete.
-            // The result is fenced so the chat renderer shows it VERBATIM —
-            // file contents contain backticks that markdown would eat.
+            // 08-16 (user): present the result as a Claude-Code-style receipt
+            // instead of the raw "Tool call X returned: json {...}" envelope —
+            // the file path + stats, the exact bash command with its output, or
+            // a red/green write_file diff. The receipt (150K belt) already
+            // carries the full content for read_file/run_bash and the diff for
+            // write_file, so NO separate full-result JSON block — that would
+            // double the message and re-wedge the tab. send_message needs no
+            // receipt: its text was already delivered to the client above.
             const followUp =
-                `Tool call "${call.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
+                (call.toolName === 'send_message' ? '' : formatToolResultView(call, result, 150000) + '\n\n') +
                 (config.allowPlainText
                     ? 'You MUST send ONE plain-text 💬 line before your next tool call (your thinking + what the ' +
                       'tool is about to do and why — delivered to the user verbatim; user rule 08-13), then your ' +
@@ -981,7 +1136,7 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
                 const p = String(call.args?.path || '');
                 if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
                 response = await countedSend(
-                    `Tool call "${call.toolName}" returned:\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` +
+                    formatToolResultView(call, result, 6000) + '\n\n' +
                     'The task is: write the handoff document via write_file (if you have not yet) at EXACTLY ' +
                     `${config.handoffFile}, then reply with a fenced submit_answer — one line confirming the path.`,
                     toolDefs
@@ -1460,7 +1615,7 @@ app.post('/v1/messages', async (req, res) => {
                 // not have — "No such tool available: send_message" — and the
                 // turn broke. Emit a short text progress line instead; the
                 // 💬 narration already explains what the tool is doing.
-                const t = '🔧 ' + evt.name;
+                const t = '🔧 ' + evt.name + ' ' + argsSummary(evt.name, evt.args ?? {});
                 ev('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
                 ev('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: t } });
                 ev('content_block_stop', { type: 'content_block_stop', index: blockIndex });

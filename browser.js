@@ -87,7 +87,7 @@ async function initBrowser({ reconnect = false } = {}) {
         browser = await puppeteer.connect({
             browserWSEndpoint: wsUrl,
             defaultViewport: null, // don't resize their window
-            protocolTimeout: 120000, // tab can cogitate for minutes before answering
+            protocolTimeout: 240000, // tab can cogitate for minutes before answering
         });
         console.log('✅ Attached to existing browser.');
         return;
@@ -450,8 +450,13 @@ async function typePrompt(text) {
 
     if (set) return;
 
-    // contenteditable: focus, clear, then insertText — newlines are
-    // inserted literally (sendCharacter never synthesizes Enter).
+    // contenteditable: focus, clear, then insert the WHOLE text as a single
+    // Input.insertText CDP command — newlines are inserted literally, never
+    // synthesized into Enter keypresses (the keyboard.type() hazard).
+    // 08-16 FIX: page.keyboard.sendCharacter() emits one insertText PER
+    // CHARACTER — the ~190K-char audit digest = ~190K CDP round-trips, which
+    // blew the 120s protocolTimeout on the Gemini lane ("Input.insertText timed
+    // out"). A single command carries the whole prompt natively.
     await page.evaluate((sels) => {
         for (const sel of sels) {
             const el = document.querySelector(sel);
@@ -463,7 +468,9 @@ async function typePrompt(text) {
     await page.keyboard.press('KeyA');
     await page.keyboard.up('Control');
     await page.keyboard.press('Backspace');
-    await page.keyboard.sendCharacter(text);
+    const cdp = await page.createCDPSession();
+    await cdp.send('Input.insertText', { text });
+    await cdp.detach();
 }
 
 // ── Send: Enter on the focused input, click-fallback if it stays full. ──

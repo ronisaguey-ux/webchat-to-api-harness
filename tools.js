@@ -78,8 +78,19 @@ const TOOL_DEFINITIONS = [
             required: ['path', 'content'],
         },
         handler: async (args) => {
+            let oldContent = null;
+            try {
+                oldContent = fs.readFileSync(args.path, 'utf-8');
+            } catch (e) {
+                oldContent = null; // new file — no diff against anything
+            }
             fs.writeFileSync(args.path, args.content, 'utf-8');
-            return { success: true, message: `Written to ${args.path}` };
+            return {
+                success: true,
+                message: `Written to ${args.path}`,
+                oldContent,
+                newLength: String(args.content ?? '').length,
+            };
         },
     },
     {
