@@ -782,21 +782,10 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             continue;
         }
 
-        // CONVERSATION MODE (08-12, ALLOW_PLAIN_TEXT=true): personal threads
-        // reply like a friend. A prose-only reply is delivered to the client
-        // and the model gets a nudge back so it continues with its tool call
-        // (the user's harness request 08-13: "it sends the message, then a
-        // message back so it can send the tool call"). Two prose-only rounds
-        // with no tool call: the conversation IS the answer (casual chat, or
-        // the model declining tools).
+        // CONVERSATION MODE (ALLOW_PLAIN_TEXT=true): personal threads
+        // reply directly in natural text / markdown without artificial tool nudges.
         if (config.allowPlainText) {
             const prose = cleanWebchatText(cleanProse(response));
-            if (proseRounds < 2) {
-                proseRounds++;
-                if (prose) onProgress?.({ type: 'text', text: prose });
-                response = await countedSend(PROSE_NUDGE, toolDefs);
-                continue;
-            }
             return await maybePauseForDrift(finalAnswerFor(prose), userPrompt);
         }
 
