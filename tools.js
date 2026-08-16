@@ -474,6 +474,70 @@ const TOOL_DEFINITIONS = [
             return { success: true, message: 'Message sent to main; its reply will appear in your next message.' };
         },
     },
+    {
+        name: 'send_message_to_antigravity',
+        category: 'interagent',
+        description:
+            'Send a structured message or task to Antigravity (AGY). ' +
+            'Wakes the Antigravity core immediately.',
+        parameters: {
+            type: 'object',
+            properties: {
+                subject: { type: 'string', description: 'Subject of the message' },
+                content: { type: 'string', description: 'Body text / instructions for Antigravity' },
+                priority: { type: 'string', enum: ['normal', 'high', 'urgent'], description: 'Message priority' },
+            },
+            required: ['content'],
+        },
+        handler: async (args) => {
+            const INBOX = `${os.homedir()}/.claude/inbox/messages.jsonl`;
+            const content = String(args?.content || '').trim();
+            if (!content) return { success: false, error: 'empty content' };
+            const entry = {
+                id: `msg_${Math.floor(Date.now() / 1000)}_${Math.random().toString(16).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                from: 'webchat',
+                to: 'antigravity',
+                subject: String(args.subject || 'Webchat Directive'),
+                priority: String(args.priority || 'normal'),
+                content,
+                status: 'unread',
+                reply_to: null,
+            };
+            try {
+                fs.mkdirSync(`${os.homedir()}/.claude/inbox`, { recursive: true });
+                fs.appendFileSync(INBOX, JSON.stringify(entry) + '\n', 'utf-8');
+                return { success: true, message: 'Message sent to Antigravity inbox.' };
+            } catch (e) {
+                return { success: false, error: e.message };
+            }
+        },
+    },
+    {
+        name: 'send_telegram_message',
+        category: 'chat',
+        description: 'Send a message directly to the user on Telegram.',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'Text message to send to Telegram user' },
+            },
+            required: ['text'],
+        },
+        handler: async (args) => {
+            const text = String(args?.text || '').trim();
+            if (!text) return { success: false, error: 'empty text' };
+            const sendScript = '/home/roni/Roni_workspace/oculus/scripts/telegram-monitor/bin/send-telegram.sh';
+            const envFile = `${os.homedir()}/.config/oculus/orchestrator.env`;
+            const cmd = `set -a; [ -f "${envFile}" ] && source "${envFile}"; set +a; bash "${sendScript}" "${text.replace(/"/g, '\\"')}"`;
+            return new Promise((resolve) => {
+                const child = spawn('/bin/bash', ['-c', cmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+                child.on('close', (code) => {
+                    resolve({ success: code === 0, message: code === 0 ? 'Sent to Telegram.' : 'Failed sending to Telegram.' });
+                });
+            });
+        },
+    },
 ];
 
 // ──────────────────────────────────────────────────────
