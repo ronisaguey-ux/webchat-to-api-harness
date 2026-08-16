@@ -1220,15 +1220,32 @@ async function waitForResponse(before, typedText) {
                 if (!looksLikeTruncatedAnswer(answerText)) return state.answer;
                 // else: mid-stream fragment — do NOT accept; keep polling
             }
-        } else if (grew && !busy && state.text.length > 0 && state.text.length === lastLen) {
+        } else if (grew && state.text.length > 0 && state.text.length === lastLen) {
             // 08-13 MULTI-SITE: same '…'/dots placeholder guard as the vl path
             // — gemini's composer renders a "…" row while cogitating and the
             // count-mode accept returned it as the final answer. The !busy
             // requirement (08-13) defers acceptance until the stop control
             // clears — streaming rows grow in count AND text, and accepting
             // them mid-stream returned fragments and stale rescues.
+            // 08-16 GEMINI PHANTOM-STOP FIX (scoped to gemini ONLY, user
+            // 08-16): gemini keeps its "Stop response" control in the DOM
+            // after the answer commits (unclickable, persists for minutes),
+            // so isForeignBusy() stays true and the !busy gate never fired —
+            // every gemini request burned the full timeout + rescue. A STABLE
+            // answer carrying a complete tool JSON (gemini's reply format:
+            // `JSON\n{"tool":"submit_answer","params":{...}}`) is the finished
+            // reply — accept it even while the phantom stop is up. Other
+            // sites' stop controls are trusted, so they keep the strict gate.
             const ctext = state.text.trim();
             if (ctext === '…' || /^\.{2,4}$/.test(ctext)) { await sleep(1500); continue; }
+            if (busy) {
+                const isGemini = new URL(config.webchatUrl).host.includes('gemini');
+                const toolDone = isGemini
+                    && /"tool"\s*:\s*"/.test(ctext)
+                    && (/\{\s*"tool"/.test(ctext) || /submit_answer|"params"/.test(ctext))
+                    && /\}\s*$/.test(ctext);
+                if (!toolDone) { await sleep(1500); continue; }
+            }
             return state.text;
         }
         if (grew && state.text.length === 0) {
