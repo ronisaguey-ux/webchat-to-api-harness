@@ -626,6 +626,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     let proseRounds = 0;      // conversation mode: consecutive prose-only replies
     let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
     let narrationNudged = false; // strict mode: send_message narration taught once per request
+    let emptyAnswerNudged = false; // 08-16: empty submit_answer retried once before the placeholder
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
 
     for (let round = 0; round < config.maxToolRounds; round++) {
@@ -688,10 +689,19 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // whether the request needed work — no min-call gate).
             if (call.toolName === SUBMIT_TOOL) {
                 const answer = cleanWebchatText(call.args?.text ?? call.args?.message ?? call.args?.content ?? '');
-                return await maybePauseForDrift(
-                    answer || extractSubmitText(response) || '[webchat model submitted an empty answer]',
-                    userPrompt
-                );
+                const final = answer || extractSubmitText(response);
+                // 08-16 EMPTY-ANSWER FIX: an empty submit_answer was surfaced
+                // verbatim ("[webchat model submitted an empty answer]") and
+                // Claude Code interrupted the turn. Nudge ONCE to deliver a
+                // real answer; only fall back to the placeholder on a repeat.
+                if (!final && !emptyAnswerNudged) {
+                    emptyAnswerNudged = true;
+                    console.log('⚠️ empty submit_answer — nudging the model to deliver its real answer');
+                    onProgress?.({ type: 'rejected', text: 'your submit_answer was empty — deliver your real final answer in the text field' });
+                    response = await countedSend(EMPTY_ANSWER_MSG, toolDefs);
+                    continue;
+                }
+                return await maybePauseForDrift(final || '[webchat model submitted an empty answer]', userPrompt);
             }
             onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
             lastToolInfo = { tool: call.toolName, args: call.args };
@@ -852,6 +862,13 @@ const NARRATION_MSG =
     'send_message first: one short 💬 line with what you are thinking and what the tool call you are about ' +
     'to make does and why (delivered to the user verbatim). Reply NOW with that send_message call. ' +
     'Then continue with your work tool call as usual.';
+
+const EMPTY_ANSWER_MSG =
+    '### EMPTY ANSWER (08-16)\n' +
+    'Your submit_answer had an EMPTY text field — it reached the user as nothing. ' +
+    'Deliver your real final answer now: a fenced submit_answer with the actual ' +
+    'content in the text field. If you have not finished the task, continue working ' +
+    'with your tools until it is done, then submit the full final answer.';
 
 const PROSE_NUDGE =
     'Your message was delivered to the user. Continue the task: send your NEXT tool call JSON, fenced as ```json ... ``` — ' +
@@ -1446,9 +1463,15 @@ app.post('/v1/messages', async (req, res) => {
                 return;
             }
             if (evt.type === 'tool') {
-                const id = 'toolu_' + Math.random().toString(36).slice(2, 10);
-                ev('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'tool_use', id, name: evt.name, input: {} } });
-                ev('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: JSON.stringify(evt.args ?? {}) } });
+                // 08-16 TOOL-VISIBILITY FIX: the gateway executes webchat tools
+                // internally, so streaming them as tool_use made the CLIENT
+                // (Claude Code) try to execute gateway-internal tools it does
+                // not have — "No such tool available: send_message" — and the
+                // turn broke. Emit a short text progress line instead; the
+                // 💬 narration already explains what the tool is doing.
+                const t = '🔧 ' + evt.name;
+                ev('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+                ev('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: t } });
                 ev('content_block_stop', { type: 'content_block_stop', index: blockIndex });
                 blockIndex++;
                 return;
