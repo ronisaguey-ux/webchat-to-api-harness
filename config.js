@@ -89,9 +89,9 @@ const cfg = {
     selectors: {
         input: (process.env.SELECTOR_INPUT || 'textarea, div[contenteditable="true"]')
             .split(',').map((s) => s.trim()).filter(Boolean),
-        send: (process.env.SELECTOR_SEND || 'div[role="button"].ds-button--primary, div[role="button"].ds-button--filled, button[type="submit"], .send-button, [data-testid="send-button"], button[aria-label="Send message"], div[role="button"]')
+        send: (process.env.SELECTOR_SEND || 'button[aria-label="Send message"], button[aria-label*="Send" i], div[role="button"].ds-button--primary, div[role="button"].ds-button--filled, button[type="submit"], .send-button, [data-testid="send-button"]')
             .split(',').map((s) => s.trim()).filter(Boolean),
-        message: (process.env.SELECTOR_MESSAGE || '.message, .chat-message, .response, [data-message-author-role], .ds-markdown, .model-response-text, .user-query, message-content')
+        message: (process.env.SELECTOR_MESSAGE || 'model-response, [data-message-author-role="model"], .model-response-text, .response, .ds-markdown, .message, .chat-message')
             .split(',').map((s) => s.trim()).filter(Boolean),
     },
 };
