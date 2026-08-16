@@ -738,14 +738,27 @@ async function snapshotChat() {
         const recent = [];
         for (const s of sels) {
             for (const el of document.querySelectorAll(s)) {
-                n++;
                 const t = (el.innerText || '').trim();
+                // 08-16 COUNT-MODE USER-ROW FIX: user rows (the gateway's own
+                // prompt echo) must NOT inflate the row count. Count growth
+                // drives the accept ("a new response arrived"), and a rendered
+                // user row grew the count while lastEl stayed the PREVIOUS
+                // response — so waitForResponse accepted that stale reply as
+                // the answer (gemini: "read a random file" → the prior "yo"
+                // greeting). Exclude user rows from BOTH count and lastEl.
+                const isUserRow = el.tagName === 'USER-QUERY'
+                    || (el.getAttribute && el.getAttribute('data-message-author-role') === 'user')
+                    || /^You have access to the tools below/.test(t)
+                    || /### SYSTEM INSTRUCTION|### USER MESSAGE/.test(t);
+                if (isUserRow) continue;
+                // Empty rows (streaming placeholders / stop controls) must not
+                // inflate the count either — an empty new row grew the count
+                // while lastEl fell back to the PREVIOUS response, re-triggering
+                // the stale-accept (probe 3 captured probe 2's "FOOXY").
                 if (t.length === 0) continue;
+                n++;
                 if (seen.has(el)) continue;
                 seen.add(el);
-                // 08-15 NARRATION FIX: skip gateway-prompt echoes (user rows)
-                // so they never leak into the narration join below.
-                if (/You have access to the tools below|### SYSTEM INSTRUCTION|### USER MESSAGE/.test(t)) continue;
                 lastEl = el;
                 recent.push(el);
                 if (recent.length > 3) recent.shift();
@@ -1220,7 +1233,7 @@ async function waitForResponse(before, typedText) {
                 if (!looksLikeTruncatedAnswer(answerText)) return state.answer;
                 // else: mid-stream fragment — do NOT accept; keep polling
             }
-        } else if (grew && state.text.length > 0 && state.text.length === lastLen) {
+        } else if (grew && state.text.length > 0 && state.text.length === lastLen && state.text !== before.text) {
             // 08-13 MULTI-SITE: same '…'/dots placeholder guard as the vl path
             // — gemini's composer renders a "…" row while cogitating and the
             // count-mode accept returned it as the final answer. The !busy
