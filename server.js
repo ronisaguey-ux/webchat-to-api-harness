@@ -790,6 +790,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     // attempt gets a correction — never a raw leak to the client.
     let proseRounds = 0;      // conversation mode: consecutive prose-only replies
     let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
+    let formatErrorRounds = 0; // consecutive non-tool plain-text replies (always-tool mode)
     let narrationNudged = false; // strict mode: send_message narration taught once per request
     let emptyAnswerNudged = false; // 08-16: empty submit_answer retried once before the placeholder
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
@@ -826,6 +827,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
 
         if (parsed.toolCalls.length > 0) {
             malformedRounds = 0;
+            formatErrorRounds = 0;
             proseRounds = 0;
             const call = parsed.toolCalls[0];
             // The model's intent message rides ahead of the tool call — the
@@ -949,9 +951,20 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // chrome glued to an opening brace — raw triple quotes, raw newlines,
         // or a truncated brace made the parse fail). Send it back as a
         // correction — never ship the raw row text to the client.
-        if (looksLikeBrokenToolJson(response) && malformedRounds < 3) {
+        if (looksLikeBrokenToolJson(response)) {
+            if (malformedRounds >= 3) {
+                // 08-16 (user): sustained degradation. Three corrections already
+                // went back and the model STILL can't emit a parseable tool call.
+                // The old code fell through to the FORMAT_ERROR loop and ground
+                // to round 40 (~8 min of churn) for a model that was never going
+                // to recover. Bail NOW with a clear marker so the client can
+                // resume from the last completed tool instead of waiting.
+                console.log(`⚠️ 3+ consecutive malformed tool replies (round ${round + 1}) — bailing early. RAW: ${String(response).slice(0, 2000)}`);
+                onProgress?.({ type: 'rejected', text: 'webchat model degraded — malformed tool calls; aborting this round' });
+                return exhaustedMarker('[⚠️ webchat model degraded mid-task (malformed tool calls) — resume from the last completed tool call and retry] ', response);
+            }
             malformedRounds++;
-            console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent`);
+            console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent. RAW: ${String(response).slice(0, 2000)}`);
             onProgress?.({ type: 'rejected', text: 'malformed tool JSON — correction sent' });
             response = await countedSend(MALFORMED_MSG, toolDefs);
             continue;
@@ -972,6 +985,14 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // "continue").
         if (round < config.maxToolRounds - 1) {
             const yap = looksLikeYap(response);
+            if (++formatErrorRounds >= 4) {
+                // 08-16 (user): same degradation as the malformed bail — 4+
+                // plain-text replies in a row means the model is stuck, not
+                // "one more nudge away". Stop grinding to round 40.
+                console.log(`⚠️ 4+ consecutive plain-text replies (round ${round + 1}) — bailing early. RAW: ${String(response).slice(0, 2000)}`);
+                onProgress?.({ type: 'rejected', text: 'webchat model stuck replying without tool calls — aborting this round' });
+                return exhaustedMarker('[⚠️ webchat model kept replying without tool-call JSON (4+ rounds) — resume from the last completed tool call and retry] ', response);
+            }
             console.log(`⚠️ webchat replied without tool JSON (round ${round + 1})${yap ? ' [progress-report yap]' : ''} — sending FORMAT ERROR`);
             onProgress?.({ type: 'rejected', text: yap ? 'plain-text progress report — rejected, demanding the next tool call' : 'plain-text reply — format error sent, demanding fenced tool JSON' });
             response = await countedSend(yap ? YAP_ERROR_MSG : FORMAT_ERROR_MSG, toolDefs);
@@ -986,6 +1007,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
 
     // Round budget exhausted without a submit_answer. Cap what the client sees
     // (08-12: the degraded model echoed the entire system prompt here).
+    console.log(`⚠️ round budget exhausted (${config.maxToolRounds}) without submit_answer. RAW: ${String(response).slice(0, 2000)}`);
     return exhaustedMarker('[⚠️ webchat model did not submit a final answer within the round budget] ', response);
 }
 
