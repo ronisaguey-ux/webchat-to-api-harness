@@ -401,22 +401,23 @@ const WEBCHAT_FORMAT =
     'final plain-text answer through submit_answer:\n' +
     '```json\n{"tool":"submit_answer","params":{"text":"your final answer"}}\n```\n';
 
-// Conversation/harness mode format (ALLOW_PLAIN_TEXT — the personal thread):
-// the model is a working assistant, not a tool loop. It MAY send a one-line
-// "what I'm about to do" message before its tool call (delivered verbatim),
-// and MAY answer pure chat in plain text (that IS the answer). JSON strings
-// must still be valid JSON — the raw-triple-quote failure (08-13: the model
-// dumped write_file content as """...""" inside the envelope and the whole
-// reply leaked raw to the client) is prohibited explicitly.
+const CONV_PREAMBLE =
+    'You are an AI coding assistant communicating with the user in an interactive terminal session. ' +
+    'ALWAYS reply in ENGLISH. ' +
+    'If the user greets you or asks a conversational question, answer directly in natural text. ' +
+    'When executing a tool action, you MUST state what you are about to do before the tool call.';
+
 const CONV_FORMAT =
-    '### RESPONSE FORMAT\n' +
-    'If the request requires actions (reading files, executing bash, searching, inspecting codebase):\n' +
-    'Call the appropriate tool immediately in a markdown code fence:\n' +
-    '```json\n{"tool":"<name>","params":{...}}\n```\n' +
-    'Do NOT just state what you will do — actually CALL the tool (e.g. read_file, run_bash, list_dir).\n' +
-    'If the request is simple conversation or chat (greetings, questions not needing tools), answer directly in plain text.\n' +
-    'When finished with all work, deliver your final answer in plain text or via submit_answer:\n' +
-    '```json\n{"tool":"submit_answer","params":{"text":"your final message to the user"}}\n```\n';
+    '### RESPONSE INSTRUCTIONS (STRICT)\n' +
+    '1. GREETINGS & CONVERSATION: If the user says hello, asks a conversational question, or gives a non-tool message (e.g. "yo", "yo u there", "how are you"), reply directly in friendly, concise plain text. Do NOT execute any tools for greetings.\n' +
+    '2. TOOL ACTIONS (MANDATORY NARRATION BEFORE TOOL):\n' +
+    '   When the user asks for a task that requires tools (reading files, executing bash commands, searching, editing):\n' +
+    '   You MUST start your response with one clear 💬 explanation line describing what you are about to do and why, followed immediately by your tool call in a code fence:\n' +
+    '   <One clear sentence explaining the tool action you are about to take>\n' +
+    '   ```json\n' +
+    '   {"tool":"<name>","params":{...}}\n' +
+    '   ```\n' +
+    '3. COMPLETION: When the task is complete and verified, deliver your final summary in plain text or via submit_answer.\n';
 
 // ── Always-tool mode (user directive 08-12) ─────────────────────────────
 // The webchat model must NEVER reply in plain text: every response is a tool
@@ -552,7 +553,8 @@ async function maybePauseForDrift(text, userPrompt) {
 }
 
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
-    let prompt = `### SYSTEM INSTRUCTION\n${WEBCHAT_PREAMBLE}\n\n`;
+    const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
+    let prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
     if (systemText) prompt += `${systemText}\n\n`;
     prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
     prompt += config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT;
@@ -644,7 +646,12 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             const call = parsed.toolCalls[0];
             // The model's intent message rides ahead of the tool call — the
             // client sees "what I'm about to do" before the 🔧 line.
-            if (parsed.prose) onProgress?.({ type: 'text', text: parsed.prose });
+            if (parsed.prose) {
+                onProgress?.({ type: 'text', text: parsed.prose });
+            } else if (call.toolName !== SUBMIT_TOOL && call.toolName !== 'send_message') {
+                const autoNarration = `Let me run ${call.toolName} to inspect and perform the requested task.`;
+                onProgress?.({ type: 'text', text: autoNarration });
+            }
 
             // 08-13 EVENING (user rule "force it"): a work tool call with NO
             // prose and NO send_message means the model skipped narration —
