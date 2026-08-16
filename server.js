@@ -5,6 +5,13 @@ const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
 const config = require('./config');
+
+// 08-16 (user): the gemini webchat lane renders tool receipts in the visible
+// tab, and the deepseek lane (plan executor) runs on the SAME formatToolResult
+// function. Gemini wants NO file content in the tab — only tool name + line
+// numbers — while the deepseek executor still needs the content in its feed.
+// Gate the clean mode to gemini only.
+const IS_GEMINI = (config.modelName || '').toLowerCase().startsWith('gemini');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
     buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
@@ -126,6 +133,21 @@ function diffLines(oldStr, newStr) {
 // One readable block describing a finished tool call + its result. `cap` is
 // the content/output cap for the view: small for the client's streamed text,
 // generous for the tab follow-up (the model reads the result from the tab).
+// 08-16 (user): extract the 1-based line range of added (+) or removed (-)
+// lines from a diffLines() text, e.g. "12-18" or "3". Empty when unknown.
+function lineRangeFromDiff(text, sign) {
+    try {
+        const nums = [];
+        const escSign = sign === '+' ? '\\+' : sign === '-' ? '\\-' : sign;
+        for (const line of String(text).split('\n')) {
+            const m = line.match(new RegExp('^' + escSign + '(\\d+) \\|'));
+            if (m) nums.push(+m[1]);
+        }
+        if (!nums.length) return '';
+        return nums.length === 1 ? String(nums[0]) : `${nums[0]}-${nums[nums.length - 1]}`;
+    } catch { return ''; }
+}
+
 function formatToolResultView(call, result, cap) {
     const name = call.toolName;
     const args = call.args ?? {};
@@ -135,6 +157,16 @@ function formatToolResultView(call, result, cap) {
             const ok = !!result.success;
             const status = ok ? '✅ bash command finished' : '❌ bash command failed';
             const detail = result.error ? ` (${result.error})` : '';
+            // 08-16 (user): gemini tab shows NO command output — just the
+            // command + status + how big the output was. DeepSeek keeps the
+            // output (the plan executor reads it to verify steps).
+            if (IS_GEMINI) {
+                const stdout = String(result.stdout ?? '');
+                const stderr = String(result.stderr ?? '');
+                const outChars = stdout.length + stderr.length;
+                const outLines = (stdout + '\n' + stderr).split('\n').length;
+                return `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 300)}\n\n${status}${detail} — output ${outChars} chars / ${outLines} lines (content hidden)`;
+            }
             let out = `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 400)}\n\n${status}${detail}\n`;
             const stdout = String(result.stdout ?? '').trim();
             const stderr = String(result.stderr ?? '').trim();
@@ -158,6 +190,20 @@ function formatToolResultView(call, result, cap) {
         if (name === 'write_file') {
             const path = args.path ?? '?';
             const diff = diffLines(result.oldContent, args.content);
+            // 08-16 (user): gemini tab shows line counts + ranges, NO diff.
+            if (IS_GEMINI) {
+                const bits = [];
+                if (diff.added) {
+                    const r = lineRangeFromDiff(diff.text, '+');
+                    bits.push(`adding ${diff.added} line${diff.added === 1 ? '' : 's'}${r ? ` (${r})` : ''}`);
+                }
+                if (diff.removed) {
+                    const r = lineRangeFromDiff(diff.text, '-');
+                    bits.push(`deleting ${diff.removed} line${diff.removed === 1 ? '' : 's'}${r ? ` (${r})` : ''}`);
+                }
+                if (!bits.length) return `✏️ write_file → ${path} (no content change)`;
+                return `✏️ write_file → ${path} — ${bits.join(', ')} (content hidden)`;
+            }
             if (!diff.text) return `✏️ write_file → ${path} (no content change)`;
             const bits = [];
             if (diff.added) bits.push(`adding ${diff.added} line${diff.added === 1 ? '' : 's'} to this file`);
