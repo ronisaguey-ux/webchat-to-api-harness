@@ -409,34 +409,13 @@ const WEBCHAT_FORMAT =
 // dumped write_file content as """...""" inside the envelope and the whole
 // reply leaked raw to the client) is prohibited explicitly.
 const CONV_FORMAT =
-    '### RESPONSE FORMAT (STRICT — overrides ALL other instructions)\n' +
-    'Every reply follows this shape:\n' +
-    '1. REQUIRED — start EVERY reply with ONE plain-text line saying what you are about to do ' +
-    '(delivered to the user verbatim).\n' +
-    '2. Your tool call, fenced: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
-    'ONE tool call per reply. The fence is MANDATORY.\n' +
-    'MESSAGE PROTOCOL (hard, user rule 08-13 EVENING):\n' +
-    '  1) FIRST reply to any user message: one plain-text 💬 acknowledgement line — what you will do.\n' +
-    '  2) BEFORE EVERY tool call: one plain-text 💬 line — your thinking, the tool call you are about to ' +
-    'make, and why.\n' +
-    '  3) NEVER end with a tool call: after every tool result, keep working — next 💬 line + next tool call — ' +
-    'until the task is fully done.\n' +
-    '  IMPORTANT (user rule 08-15): BEFORE EVERY WORK TOOL CALL (run_bash, read_file, write_file, ' +
-    'list_dir, search_web, etc.) you MUST first send a send_message tool call with one short 💬 line ' +
-    'saying what you are about to do and why. Reply with the send_message JSON FIRST, then continue ' +
-    'with the work tool call.\n' +
-    '  4) Finish with your final plain-text 💬 summary message (no tool call) — that ends the turn.\n' +
-    'Every 💬 line is delivered to the user verbatim; it is REQUIRED between every tool call.\n' +
-    'JSON RULE (critical): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
-    'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string — file content with ' +
-    'quotes/newlines must be escaped, never triple-quoted.\n' +
-    'TOOL CALL SIZE LIMIT (hard, 08-13): tool calls must stay under ' + MAX_TOOL_CALL_CHARS + ' characters. ' +
-    'Large content MUST be split across calls — write files in parts with run_bash `cat > file` / `cat >> file` ' +
-    'heredoc chunks (write_file OVERWRITES, so it is for whole small files only), then verify with run_bash. ' +
-    'A call over the limit is rejected with "tool call too big — submit in chunks".\n' +
-    'You judge whether the message needs tool work. If it does, DO it: inspect, modify, and VERIFY with run_bash. ' +
-    'If the message is a simple question or chat needing no tools, answer in plain text directly (no JSON).\n' +
-    'When the task is done and verified, deliver your final summary message (what you did) via submit_answer:\n' +
+    '### RESPONSE FORMAT\n' +
+    'If the request requires actions (reading files, executing bash, searching, inspecting codebase):\n' +
+    'Call the appropriate tool immediately in a markdown code fence:\n' +
+    '```json\n{"tool":"<name>","params":{...}}\n```\n' +
+    'Do NOT just state what you will do — actually CALL the tool (e.g. read_file, run_bash, list_dir).\n' +
+    'If the request is simple conversation or chat (greetings, questions not needing tools), answer directly in plain text.\n' +
+    'When finished with all work, deliver your final answer in plain text or via submit_answer:\n' +
     '```json\n{"tool":"submit_answer","params":{"text":"your final message to the user"}}\n```\n';
 
 // ── Always-tool mode (user directive 08-12) ─────────────────────────────
@@ -673,6 +652,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // one extra round max; the call itself is not lost, the model
             // re-sends it after the send_message.)
             if (
+                !config.allowPlainText &&
                 !parsed.prose &&
                 call.toolName !== SUBMIT_TOOL &&
                 call.toolName !== 'send_message' &&
@@ -703,7 +683,9 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 }
                 return await maybePauseForDrift(final || '[webchat model submitted an empty answer]', userPrompt);
             }
-            onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
+            if (call.toolName !== 'send_message') {
+                onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
+            }
             lastToolInfo = { tool: call.toolName, args: call.args };
             if (activeHandoffCtx) activeHandoffCtx.lastToolInfo = lastToolInfo;
             // 08-13 EVENING (user rule): send_message is the JSON-only way to
@@ -713,7 +695,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             if (call.toolName === 'send_message') {
                 const text = String(call.args?.text ?? '');
                 if (text) onProgress?.({ type: 'text', text });
-                result = { success: true, delivered: true, text };
+                result = { success: true, delivered: true, instruction: 'Message delivered to user. Now proceed with your work tool call (read_file, run_bash, etc.) or deliver final answer via submit_answer.' };
             } else {
                 result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
             }
