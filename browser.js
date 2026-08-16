@@ -808,11 +808,19 @@ async function isForeignBusy() {
                     || s === 'stop generation' || s === 'stop stream'
                     || s === '停止' || s === '停止生成' || s === '停止响应';
             };
+            const isVisible = (el) => {
+                if (!el) return false;
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') !== null) return false;
+                if (el.getAttribute('aria-hidden') === 'true') return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) return false;
+                return el.offsetParent !== null || el.getClientRects().length > 0;
+            };
             for (const el of document.querySelectorAll('[aria-label]')) {
-                if (stopish(el.getAttribute('aria-label'))) return true;
+                if (stopish(el.getAttribute('aria-label')) && isVisible(el)) return true;
             }
             for (const b of document.querySelectorAll('button')) {
-                if (stopish(b.innerText)) return true;
+                if (stopish(b.innerText) && isVisible(b)) return true;
             }
             return false;
         });
@@ -1257,7 +1265,8 @@ async function waitForResponse(before, typedText) {
                     && /"tool"\s*:\s*"/.test(ctext)
                     && (/\{\s*"tool"/.test(ctext) || /submit_answer|"params"/.test(ctext))
                     && /\}\s*$/.test(ctext);
-                if (!toolDone) { await sleep(1500); continue; }
+                const plainTextDone = config.allowPlainText && ctext.length > 0;
+                if (!toolDone && !plainTextDone) { await sleep(1500); continue; }
             }
             return state.text;
         }
