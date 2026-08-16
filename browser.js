@@ -1173,6 +1173,9 @@ async function readStreamedAnswer(startIndex) {
 // is the exact prompt we typed — the user message rendering it must NOT
 // be accepted as the response (DeepSeek cogitates for seconds before its
 // answer replaces it as the last item).
+function isGeminiWebchat() {
+    return /gemini/i.test(config.webchatUrl) || /gemini/i.test(config.modelName || '');
+}
 async function waitForResponse(before, typedText) {
     // 08-13 SSE-TEE: the completion XHR's streamed body is now the primary
     // answer source (the DOM stopped rendering responses in this env). Tee
@@ -1226,6 +1229,16 @@ async function waitForResponse(before, typedText) {
             console.log('⏳ poll evaluate failed (page busy?), retrying:', String(e.message).slice(0, 70));
             await sleep(1500);
             continue;
+        }
+        // 08-16 GEMINI API-ERROR BAIL: gemini renders a transient inline error
+        // banner ("● API Error — The response stopped arriving", "Something
+        // went wrong with this response") when a generation dies mid-stream.
+        // The phantom-stop keeps busy=true, so without this the loop ground to
+        // the hard cap (timeout×5, 25 min on the 300s gemini timeout) for a
+        // reply that never arrives. Fail fast with a clear marker instead —
+        // the client retries and the tab stays usable.
+        if (isGeminiWebchat() && /API Error|response stopped arriving|went wrong with this response|response was not generated|wasn'?t generated/i.test(state.body || '')) {
+            throw new Error('Gemini API error detected in tab (generation stopped) — resend the prompt');
         }
         // User-row guard (08-12): the typedText contains-check is NOT enough —
         // DeepSeek's renderer consumes ```json fence markers into code-block
