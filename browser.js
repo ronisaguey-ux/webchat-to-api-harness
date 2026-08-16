@@ -332,33 +332,50 @@ async function sendPrompt(prompt, toolDefinitions) {
         if (m && m[1]) threadSwapSeen = { url: u, id: m[1] };
     }
 
-    // 08-16 (user): the model's own reply still renders the FULL file content
-    // when it calls write_file (content rides in the params JSON). The model's
-    // real context lives on the webchat server, so collapsing the DOM here is
-    // display-only: the user sees the tool name + a size hint, the model keeps
-    // the content. Best-effort — a re-render may restore it.
+    // 08-16 (user): the visible tab must show each tool call ONCE, clean —
+    // collapse the model's raw tool-call reply to its 💬 line so only the
+    // gateway's typed receipt shows the tool. Display-only: the model's real
+    // context lives on the webchat server. Best-effort — a re-render may
+    // restore the JSON until the next request re-collapses it.
     await collapseBigReplies();
 
     await saveCookies(); // keep the session fresh
     return text;
 }
 
-// 08-16 (user): hide large file content from the visible tab. Replace long
-// "content"/"text" JSON string values (>400 chars) in the newest rendered
-// model reply with a size hint. Gemini lane only.
+// 08-16 (user): the visible gemini tab must show tool calls ONCE and clean —
+// no raw JSON envelope, no double rendering. The model's reply is two things
+// stuck in one bubble: a 💬 narration line + the fenced JSON tool call. The
+// gateway's typed receipt right below already shows the tool name + status,
+// so collapse the model's reply to just its 💬 line (or a bare "→ tool" marker
+// if the model skipped narration). The model's real context lives on the
+// webchat server; editing the DOM here is display-only. Best-effort.
 async function collapseBigReplies() {
     if (!config.modelName || !/gemini/i.test(config.modelName)) return;
     try {
         await page.evaluate(() => {
             const rows = document.querySelectorAll('model-response');
             if (!rows.length) return;
-            const last = rows[rows.length - 1];
-            const pre = last.querySelector('pre, code');
-            const t = ((pre || last).innerText || (pre || last).textContent || '').trim();
-            if (t.length < 600) return;
-            const hide = (s) => s.replace(/"((?:content|text))"\s*:\s*"([\s\S]*?)"\s*(?=,|\})/g, (m, key, val) => val.length > 400 ? `"${key}": "[${val.length} chars hidden]"` : m);
-            const cleaned = hide(t);
-            if (cleaned !== t) (pre || last).textContent = cleaned;
+            const collapseRow = (row) => {
+                const t = (row.innerText || row.textContent || '').trim();
+                if (!/"tool"\s*:/.test(t)) return false;
+                // The model's final answer IS a submit_answer tool call whose
+                // "text" param is the reply the user reads — never collapse it.
+                if (/"tool"\s*:\s*"submit_answer"/.test(t)) return false;
+                const keep = t.split('\n').map(l => l.trim()).filter(l => l.includes('💬')).join(' ');
+                const name = (t.match(/"tool"\s*:\s*"([^"]+)"/) || [])[1];
+                const marker = keep || (name ? `→ ${name}` : '');
+                if (marker && marker !== t) { row.textContent = marker; return true; }
+                return false;
+            };
+            // Newest first so the just-captured reply is handled first; walk all
+            // rows so a re-render that restored old JSON gets cleaned again.
+            let changed = 0;
+            for (let i = rows.length - 1; i >= 0; i--) {
+                if (collapseRow(rows[i])) changed++;
+            }
+            if (changed) console.log(`collapsed ${changed} tool-call rows`);
+            return;
         });
     } catch (e) {
         console.log('⚠ collapseBigReplies failed:', String(e.message).slice(0, 60));
