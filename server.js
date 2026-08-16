@@ -497,11 +497,13 @@ function stripInjectedContract(text) {
 function cleanWebchatText(text) {
     if (typeof text !== 'string') return text;
     return stripInjectedContract(text)
+        .replace(/^\s*Gemini said\s*\n*/gi, '')
+        .replace(/\bGemini said\b\s*/gi, '')
+        .replace(/^\s*JSON\s*\n+/gi, '')
+        .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)?\n+/gi, '')
         .replace(/^\s*Thought for \d+ seconds?\s*\n*/i, '')
         .replace(/\n*\s*This response is AI-generated, for reference only\.?\s*$/i, '')
-        // 08-14: DeepSeek's generation status line leaks as a visible footer
-        // on some renderer builds ("✻ Cooked for 29s"). Strip it everywhere.
-        .replace(/✻\s*(Cooked|Churned|Generated|Done|Thought)\s+for\s+\d+\s*s?\.?/gi, '')
+        .replace(/✻\s*(Cooked|Churned|Generated|Done|Thought|Brewed|Crunched|Baked|Cogitated)\s+for\s+\d+\s*s?\.?/gi, '')
         .trim();
 }
 

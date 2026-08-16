@@ -596,6 +596,8 @@ function cleanProse(s) {
     if (typeof s !== 'string') return '';
     const chrome = /(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)/i;
     return s
+        .replace(/Gemini said\s*/gi, '')
+        .replace(/^JSON\s*/i, '')
         .replace(/```(?:json)?/gi, '')
         .replace(new RegExp('^\\s*' + chrome.source), '')
         .replace(new RegExp(chrome.source + '\\s*$'), '')

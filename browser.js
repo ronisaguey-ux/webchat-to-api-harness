@@ -756,7 +756,13 @@ async function snapshotChat() {
                 lastEl = el;
             }
         }
-        let txt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
+        let rawTxt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
+        let txt = rawTxt
+            .replace(/^\s*Gemini said\s*\n*/gi, '')
+            .replace(/\bGemini said\b\s*/gi, '')
+            .replace(/^\s*JSON\s*\n+/gi, '')
+            .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)?\n+/gi, '')
+            .trim();
         return { mode: 'count', count: n, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
     }, config.selectors.message);
 }
