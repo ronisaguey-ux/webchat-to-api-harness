@@ -1256,8 +1256,7 @@ async function waitForResponse(before, typedText) {
                     && /"tool"\s*:\s*"/.test(ctext)
                     && (/\{\s*"tool"/.test(ctext) || /submit_answer|"params"/.test(ctext))
                     && /\}\s*$/.test(ctext);
-                const plainTextDone = config.allowPlainText && ctext.length > 0;
-                if (!toolDone && !plainTextDone) { await sleep(1500); continue; }
+                if (!toolDone) { await sleep(1500); continue; }
             }
             return state.text;
         }
