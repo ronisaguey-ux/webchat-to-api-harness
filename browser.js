@@ -735,7 +735,6 @@ async function snapshotChat() {
         let n = 0;
         let lastEl = null;
         const seen = new Set();
-        const recent = [];
         for (const s of sels) {
             for (const el of document.querySelectorAll(s)) {
                 // If el is contained inside an already seen container, skip nested duplicate
@@ -755,17 +754,9 @@ async function snapshotChat() {
                 n++;
                 seen.add(el);
                 lastEl = el;
-                if (t.length > 0) {
-                    recent.push(el);
-                    if (recent.length > 3) recent.shift();
-                }
             }
         }
         let txt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
-        if (recent.length > 1 && txt.includes('{') && /tool/.test(txt)) {
-            const joined = recent.map((e) => e.innerText || '').join('\n');
-            txt = joined.slice(0, 100000);
-        }
         return { mode: 'count', count: n, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
     }, config.selectors.message);
 }
@@ -1235,7 +1226,7 @@ async function waitForResponse(before, typedText) {
                 if (!looksLikeTruncatedAnswer(answerText)) return state.answer;
                 // else: mid-stream fragment — do NOT accept; keep polling
             }
-        } else if (grew && state.text.length > 0 && state.text.length === lastLen && state.text !== before.text) {
+        } else if ((grew || state.text !== before.text) && state.text.length > 0 && state.text.length === lastLen) {
             // 08-13 MULTI-SITE: same '…'/dots placeholder guard as the vl path
             // — gemini's composer renders a "…" row while cogitating and the
             // count-mode accept returned it as the final answer. The !busy
