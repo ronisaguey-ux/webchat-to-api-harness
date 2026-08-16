@@ -687,24 +687,21 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 continue;
             }
 
-            // The model delivered its final answer through submit_answer.
-            // Accepted unconditionally (user rule 08-12: the model decides
-            // whether the request needed work — no min-call gate).
-            if (call.toolName === SUBMIT_TOOL) {
-                const answer = cleanWebchatText(call.args?.text ?? call.args?.message ?? call.args?.content ?? '');
+            // The model delivered its final answer through submit_answer / submit_message.
+            // Accepted unconditionally: ends the tool loop and delivers the final answer.
+            const isSubmit = call.toolName === SUBMIT_TOOL || call.toolName === 'submit_message' || call.toolName === 'task_complete' || call.toolName === 'done';
+            if (isSubmit) {
+                const answer = cleanWebchatText(call.args?.text ?? call.args?.message ?? call.args?.content ?? call.args?.summary ?? '');
                 const final = answer || extractSubmitText(response);
-                // 08-16 EMPTY-ANSWER FIX: an empty submit_answer was surfaced
-                // verbatim ("[webchat model submitted an empty answer]") and
-                // Claude Code interrupted the turn. Nudge ONCE to deliver a
-                // real answer; only fall back to the placeholder on a repeat.
+                // 08-16 EMPTY-ANSWER FIX: an empty submit was surfaced verbatim; nudge once for real answer
                 if (!final && !emptyAnswerNudged) {
                     emptyAnswerNudged = true;
-                    console.log('⚠️ empty submit_answer — nudging the model to deliver its real answer');
-                    onProgress?.({ type: 'rejected', text: 'your submit_answer was empty — deliver your real final answer in the text field' });
+                    console.log('⚠️ empty submit answer — nudging the model to deliver its real answer');
+                    onProgress?.({ type: 'rejected', text: 'your submit was empty — deliver your real final answer in the text field' });
                     response = await countedSend(EMPTY_ANSWER_MSG, toolDefs);
                     continue;
                 }
-                return await maybePauseForDrift(final || '[webchat model submitted an empty answer]', userPrompt);
+                return await maybePauseForDrift(final || '[webchat model completed the task]', userPrompt);
             }
             if (call.toolName !== 'send_message') {
                 onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
