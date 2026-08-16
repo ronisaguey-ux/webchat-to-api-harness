@@ -245,9 +245,19 @@ function isWebchatModel(body) {
 // in the 9223 GUI browser); anymodel drives THIS instance's deepseek tab;
 // everything else (deepseek-v4-flash) proxies upstream to the paid API.
 const WEBCHAT_ROUTES = {};
+// 08-16 QUOTE-STRIP FIX: the launcher passes
+// WEBCHAT_ROUTES="'gemini webchat'=http://127.0.0.1:8085,..." and the shell
+// keeps the single quotes INSIDE the env value, so name/target arrive with
+// quotes attached ('gemini 3.7 flash webchat' !== 'gemini 3.7 flash webchat').
+// The route then never matched and gemini requests fell through to the paid
+// DeepSeek proxy → 400 "supported API model names are deepseek-v4-*".
 for (const pair of (process.env.WEBCHAT_ROUTES || '').split(',')) {
-    const [name, target] = pair.split('=');
-    if (name && target) WEBCHAT_ROUTES[name.trim()] = target.trim();
+    const eq = pair.indexOf('=');
+    if (eq === -1) continue;
+    const clean = (s) => s.trim().replace(/^['"]|['"]$/g, '');
+    const name = clean(pair.slice(0, eq));
+    const target = clean(pair.slice(eq + 1));
+    if (name && target) WEBCHAT_ROUTES[name] = target;
 }
 
 // Transparent proxy: status + headers + body (SSE passthrough when streaming).
@@ -1295,6 +1305,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 // stream=true gets the full Anthropic SSE event sequence — Claude Code
 // REQUIRES streaming, so this is the path that matters.
 app.post('/v1/messages', async (req, res) => {
+    // 08-16 HEARTBEAT-GUARD FIX: the keepalive interval only exists on the
+    // streaming branch, but the catch block cleared it unconditionally — a
+    // NON-stream request (curl, some clients) that threw in handleRequest
+    // landed in the catch with heartbeat in the const TDZ → ReferenceError →
+    // the whole gateway process crashed ("connection refused" for everyone).
+    let heartbeat = null;
     try {
         const { system, messages, tools, model, stream } = req.body || {};
         // 08-14 GATEWAY PICKER: strip the claude/ prefix from discovery-row
@@ -1397,7 +1413,7 @@ app.post('/v1/messages', async (req, res) => {
         // tab). SSE comment lines are ignored by every SSE parser — they
         // feed the watchdog without polluting the event stream. Started
         // BEFORE enqueue() so queued clients (single-lane tab) are fed too.
-        const heartbeat = setInterval(() => {
+        heartbeat = setInterval(() => {
             if (!res.writableEnded && !res.destroyed) res.write(': keepalive\n\n');
         }, 15000);
 
@@ -1452,7 +1468,7 @@ app.post('/v1/messages', async (req, res) => {
         res.on('close', () => { aborted = true; });
 
         const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted));
-        if (text === null) { clearInterval(heartbeat); return; } // aborted — nothing more to write
+        if (text === null) { if (heartbeat) clearInterval(heartbeat); return; } // aborted — nothing more to write
 
 
         ev('content_block_start', {
@@ -1478,10 +1494,10 @@ app.post('/v1/messages', async (req, res) => {
             usage: { output_tokens: text.length },
         });
         ev('message_stop', { type: 'message_stop' });
-        clearInterval(heartbeat);
+        if (heartbeat) clearInterval(heartbeat);
         res.end();
     } catch (error) {
-        clearInterval(heartbeat);
+        if (heartbeat) clearInterval(heartbeat);
         console.error('❌ Error:', error);
         // 08-13 EVENING: the 08-12 writableEnded guard missed the SSE path —
         // ev() writes had ALREADY sent headers when handleRequest threw (180s
