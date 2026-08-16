@@ -525,8 +525,11 @@ const TOOL_DEFINITIONS = [
             required: ['text'],
         },
         handler: async (args) => {
-            const text = String(args?.text || '').trim();
+            let text = String(args?.text || '').trim();
             if (!text) return { success: false, error: 'empty text' };
+            if (!text.toLowerCase().startsWith('webchat:')) {
+                text = `webchat: ${text}`;
+            }
             const sendScript = '/home/roni/Roni_workspace/oculus/scripts/telegram-monitor/bin/send-telegram.sh';
             const envFile = `${os.homedir()}/.config/oculus/orchestrator.env`;
             const cmd = `set -a; [ -f "${envFile}" ] && source "${envFile}"; set +a; bash "${sendScript}" "${text.replace(/"/g, '\\"')}"`;
