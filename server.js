@@ -56,10 +56,10 @@ function injectMainReplies(msg) {
 // ── Readable tool receipts (08-16, user) ─────────────────────────────────
 // The raw tool-call JSON and the "Tool call returned: json {...}" envelope
 // made the tab and the streamed progress illegible. These helpers render a
-// Claude-Code-style receipt: the actual bash command (truncated), file + stats
-// for read_file, a red/green diff for write_file, and the bash output with a
-// cap. Used both for the SSE text blocks the client sees and the follow-up
-// message typed into the tab.
+// Claude-Code-style receipt: the actual bash command (truncated), file + line
+// range for read_file (NO content dump), a red/green diff for write_file, and
+// the bash output with a cap. Used both for the SSE text blocks the client
+// sees and the follow-up message typed into the tab.
 function truncateStr(s, n) {
     if (typeof s !== 'string') s = String(s ?? '');
     return s.length > n ? s.slice(0, n) + `\n… [truncated — ${s.length - n} more chars]` : s;
@@ -123,30 +123,6 @@ function diffLines(oldStr, newStr) {
     } catch { return { text: '', added: 0, removed: 0 }; }
 }
 
-// 08-16: render read_file content with 1-based line numbers and a head cap.
-// Large reads are MINIMIZED to the given char cap with a "N lines hidden"
-// marker instead of dumping the whole file.
-function numberLines(content, cap) {
-    const lines = String(content ?? '').replace(/\r\n/g, '\n').split('\n');
-    let shown = lines;
-    let dropped = 0;
-    if (cap && cap > 0) {
-        let acc = 0, cut = 0;
-        for (; cut < lines.length; cut++) {
-            if (acc + lines[cut].length + 1 > cap) break;
-            acc += lines[cut].length + 1;
-        }
-        if (cut < lines.length) { shown = lines.slice(0, cut); dropped = lines.length - cut; }
-    }
-    const w = Math.max(3, String(lines.length).length);
-    return {
-        text: shown.map((l, idx) => `${String(idx + 1).padStart(w)} | ${l}`).join('\n'),
-        shown: shown.length,
-        total: lines.length,
-        dropped,
-    };
-}
-
 // One readable block describing a finished tool call + its result. `cap` is
 // the content/output cap for the view: small for the client's streamed text,
 // generous for the tab follow-up (the model reads the result from the tab).
@@ -167,16 +143,17 @@ function formatToolResultView(call, result, cap) {
             return out;
         }
         if (name === 'read_file') {
+            // 08-16 (user): NO content dump — just which file and which lines
+            // were read. The full output is dropped from both the streamed
+            // receipt and the tab follow-up.
             const content = String(result.content ?? '');
+            const lines = content ? content.split('\n').length : 0;
             const total = result.totalLength ?? content.length;
-            const numbered = numberLines(content, limit);
-            const head = `📄 read_file → ${args.path ?? '?'} (~${numbered.total} lines, ${total} chars)`;
-            let shown = numbered.text;
-            if (numbered.dropped) {
-                shown += `\n… [minimized — ${numbered.dropped} of ${numbered.total} lines hidden]`;
-                if (result.truncated) shown += ` (file truncated at ${limit} chars)`;
+            let out = `📄 read_file → ${args.path ?? '?'}${lines ? ` (lines 1-${lines})` : ' (empty)'}`;
+            if (result.truncated || total > content.length) {
+                out += ` — truncated at ${content.length} chars (${total} total)`;
             }
-            return `${head}\n\n\`\`\`\n${shown}\n\`\`\``;
+            return out;
         }
         if (name === 'write_file') {
             const path = args.path ?? '?';
