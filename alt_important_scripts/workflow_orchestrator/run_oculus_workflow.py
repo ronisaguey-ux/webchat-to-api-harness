@@ -1,6 +1,26 @@
 import os
+from functools import wraps
+from flask import Flask, request, abort
 from pathlib import Path
 
+app = Flask(__name__)
+API_KEY = os.environ.get("OCULUS_API_KEY", "default-key")  # should be set in production
+
+def require_api_key(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if request.headers.get("X-API-Key") != API_KEY:
+            abort(401)
+        return f(*args, **kwargs)
+    return wrapper
+
+@app.route("/webhook", methods=["POST"])
+@require_api_key
+def webhook():
+    # Placeholder for webhook handling
+    return {"status": "ok"}
+
+# Original TelegramBot class (kept for compatibility)
 class TelegramBot:
     def __init__(self, state_dir: str):
         self.state_dir = Path(state_dir)
@@ -21,7 +41,6 @@ class TelegramBot:
         last_path.write_text(str(self.last_update_id))
 
     def process_updates(self, updates):
-        """Process a list of update objects, skipping those already processed."""
         for update in updates:
             update_id = getattr(update, 'update_id', None)
             if update_id is None:
@@ -35,7 +54,6 @@ class TelegramBot:
         return True
 
     def dispatch(self, update):
-        """Placeholder for actual command dispatching."""
         print(f"Dispatching update {update.update_id}")
 
     def run_polling(self, poll_func):
