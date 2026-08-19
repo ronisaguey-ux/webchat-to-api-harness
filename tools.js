@@ -1,7 +1,28 @@
 const fs = require('fs');
 const os = require('os');
+const path = require('path');
 const { spawn } = require('child_process');
 const config = require('./config');
+
+// 08-17 EXECUTION-LANE CWD FIX (plan-execution root cause): the OCULUS
+// executor verifies/commits from the git root (/home/roni/Roni_Workspace/oculus)
+// but the webchat expert's relative file/bash ops resolved against the server
+// cwd (repo root) — so expert code landed ONE level above where verification
+// ran (fake-passes + HALTs, steps 490/491). Webchat lanes launched with
+// GIT_ROOT=<git-root> get git-root resolution; other lanes (audit/gemini, no
+// GIT_ROOT) keep verbatim path behavior.
+const GIT_ROOT = process.env.GIT_ROOT || '';
+function resolvePath(p) {
+    if (!GIT_ROOT || typeof p !== 'string' || p === '') return p;
+    if (path.isAbsolute(p)) return p;
+    return path.join(GIT_ROOT, p);
+}
+// Rewrite the expert's learned "cd /home/roni/Roni_Workspace" (repo root) to
+// the git root. "cd .../oculus" is left untouched.
+function gitRootCd(cmd) {
+    if (!GIT_ROOT) return cmd;
+    return String(cmd).replace(/(^|[\s;&|]+)cd\s+\/home\/roni\/Roni[_Ww]orkspace(?![./\w-])/g, `$1cd ${GIT_ROOT}`);
+}
 
 // 08-14 WEDGE ROOT-CAUSE ceiling: tool RESULTS must never round-trip a huge
 // file through the chat tab (read_file on a 5.86MB state file → 6.2M-char
@@ -46,7 +67,8 @@ const TOOL_DEFINITIONS = [
             required: ['path'],
         },
         handler: async (args) => {
-            const content = fs.readFileSync(args.path, 'utf-8');
+            const resolved = resolvePath(args.path);
+            const content = fs.readFileSync(resolved, 'utf-8');
             // 08-14 WEDGE ROOT-CAUSE: read_file without maxLength returned the
             // FULL file (5.86MB cross_eval_state.json) into the tool-result
             // message → next prompt = 6,197,724 chars → the webchat tab choked
@@ -78,16 +100,17 @@ const TOOL_DEFINITIONS = [
             required: ['path', 'content'],
         },
         handler: async (args) => {
+            const resolved = resolvePath(args.path);
             let oldContent = null;
             try {
-                oldContent = fs.readFileSync(args.path, 'utf-8');
+                oldContent = fs.readFileSync(resolved, 'utf-8');
             } catch (e) {
                 oldContent = null; // new file — no diff against anything
             }
-            fs.writeFileSync(args.path, args.content, 'utf-8');
+            fs.writeFileSync(resolved, args.content, 'utf-8');
             return {
                 success: true,
-                message: `Written to ${args.path}`,
+                message: `Written to ${resolved}`,
                 oldContent,
                 newLength: String(args.content ?? '').length,
             };
@@ -117,7 +140,8 @@ const TOOL_DEFINITIONS = [
                             '(it executes webchat-model-controlled strings — read the README warning).',
                     });
                 }
-                const cmd = String(args.command || "");
+                const origCmd = String(args.command || "");
+                const cmd = gitRootCd(origCmd);
                 // 08-14 DENY-BY-DEFAULT guard (owner directive): hard-block
                 // dangerous patterns even when BASH_ALLOWED=true. git push is
                 // allowed ONLY to feature branches (explicit branch check).
@@ -158,7 +182,7 @@ const TOOL_DEFINITIONS = [
                 try {
                     fs.appendFileSync(
                         "/home/roni/Roni_Workspace/webchat-api/bash_tool_log.jsonl",
-                        JSON.stringify({ ts: new Date().toISOString(), cmd }) + os.EOL
+                        JSON.stringify({ ts: new Date().toISOString(), cmd: origCmd, executed: cmd, gitRoot: GIT_ROOT }) + os.EOL
                     );
                 } catch (e) { /* logging must never block execution */ }
 // spawn + stdio→temp files instead of execFile + pipes: execFile
@@ -182,6 +206,7 @@ const TOOL_DEFINITIONS = [
                 const child = spawn('/bin/bash', ['-s'], {
                     detached: true,
                     stdio: ['pipe', outFd, errFd],
+                    ...(GIT_ROOT ? { cwd: GIT_ROOT } : {}),
                 });
                 child.stdin.write(cmd);
                 child.stdin.end();
@@ -225,7 +250,7 @@ const TOOL_DEFINITIONS = [
             required: ['path'],
         },
         handler: async (args) => {
-            const files = fs.readdirSync(args.path);
+            const files = fs.readdirSync(resolvePath(args.path));
             return { success: true, files };
         },
     },
@@ -610,8 +635,8 @@ function cleanProse(s) {
         .replace(/Gemini said\s*/gi, '')
         .replace(/^JSON\s*/i, '')
         .replace(/```(?:json)?/gi, '')
-        .replace(new RegExp('^\\s*' + chrome.source), '')
-        .replace(new RegExp(chrome.source + '\\s*$'), '')
+        .replace(new RegExp('^\\s*' + chrome.source, 'i'), '')
+        .replace(new RegExp(chrome.source + '\\s*$', 'i'), '')
         .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*$/i, '')
         .trim();
 }

@@ -12,13 +12,22 @@ let page = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 08-14 EXPERT SWAP (user rule: deepseek webchat runs in EXPERT mode — mode
-// is locked at thread creation, so an instant thread must be swapped to a
-// fresh expert chat). sendPrompt records the fresh thread here when the swap
-// fired; server.js consumes it via takeThreadSwap() and pins respawns, the
-// same way a context-handoff pins its new thread.
-let swappingToExpert = false;
+// 08-17 INSTANT SWAP (user rule: deepseek webchat runs in INSTANT mode with
+// DeepThink + Search ON — mode is locked at thread creation, so an EXPERT
+// thread must be swapped to a fresh instant chat). sendPrompt records the
+// fresh thread here when the swap fired; server.js consumes it via
+// takeThreadSwap() and pins respawns, the same way a context-handoff pins its
+// new thread.
+let swappingToInstant = false;
 let threadSwapSeen = null;
+// 08-17 TEE-START RACE FIX: waitForResponse filters tee entries to "this
+// request" by seq > teeStart. Capturing teeStart at waitForResponse entry is
+// TOO LATE when deepseek answers FAST — the completion XHR already pushed its
+// entry (seq == teeStart), so the filter excludes the only entry and the wait
+// hangs on the frozen DOM. Capture the seq right after the tee is armed, BEFORE
+// the send; the completion then always pushes seq > teeStart. Set by
+// sendMessage, consumed one-shot by waitForResponse.
+let requestTeeStart = null;
 function takeThreadSwap() {
     const t = threadSwapSeen;
     threadSwapSeen = null;
@@ -266,23 +275,24 @@ async function sendPrompt(prompt, toolDefinitions) {
     // hang on evaluate while fresh ones always work (observed on Gemini).
     await initBrowser({ reconnect: true });
     await connectToWebchat(config.webchatUrl);
-    // 08-14 (user rule): the deepseek webchat runs in EXPERT mode. An instant
-    // thread (Search chip present) cannot be switched in place — swap to a
-    // fresh EXPERT chat; the in-flight prompt becomes its first message.
-    // EXPERT_SWAP_INSTANT=1 gates this to the instances that want it (8080 —
-    // the telegram responder's thread must never be silently swapped).
+    // 08-17 (user rule): the deepseek webchat runs in INSTANT mode with
+    // DeepThink + Search ON. An EXPERT thread (no Search chip) cannot be
+    // switched in place — swap to a fresh INSTANT chat; the in-flight prompt
+    // becomes its first message. INSTANT_SWAP_EXPERT=1 gates this to the
+    // instances that want it (8080 — the telegram responder's thread must
+    // never be silently swapped).
     if (
-        process.env.EXPERT_SWAP_INSTANT === '1' &&
+        process.env.INSTANT_SWAP_EXPERT === '1' &&
         new URL(config.webchatUrl).host.includes('deepseek') &&
-        (await isInstantThread())
+        !(await isInstantThread())
     ) {
-        console.log('🧪 pinned thread is INSTANT — swapping to a fresh EXPERT chat');
-        swappingToExpert = true;
+        console.log('🧪 pinned thread is EXPERT — swapping to a fresh INSTANT chat');
+        swappingToInstant = true;
         await openNewChat();
     }
-    // 08-14: keep DeepThink ON for the deepseek tab (expert mode has only the
-    // DeepThink chip — Search is never touched). No-op for foreign webchats
-    // (no such chips) and never throws.
+    // 08-17: force DeepThink + Search ON for the deepseek tab (instant mode
+    // has both chips). No-op for foreign webchats (no such chips) and never
+    // throws.
     await ensureToggles();
     console.log(`📤 Sending prompt (${prompt.length} chars)`);
 
@@ -322,11 +332,11 @@ async function sendPrompt(prompt, toolDefinitions) {
     const text = await waitForResponse(before, fullPrompt);
     console.log(`📥 Response received (${text.length} chars)`);
 
-    // 08-14 EXPERT-SWAP PIN: the first send on a fresh thread is what creates
+    // 08-17 INSTANT-SWAP PIN: the first send on a fresh thread is what creates
     // it — capture the new /s/ id so server.js can pin respawns (mirrors the
-    // handoff flow). Only when this send performed an expert swap.
-    if (swappingToExpert) {
-        swappingToExpert = false;
+    // handoff flow). Only when this send performed an instant swap.
+    if (swappingToInstant) {
+        swappingToInstant = false;
         const u = page.url();
         const m = u.match(/\/a\/chat\/s\/([0-9a-f-]+)/);
         if (m && m[1]) threadSwapSeen = { url: u, id: m[1] };
@@ -382,26 +392,24 @@ async function collapseBigReplies() {
     }
 }
 
-// 08-14 (user rule): the deepseek tab runs in EXPERT mode, which has ONLY the
-// DeepThink chip (instant mode is the one with DeepThink + Search — the chip
-// set IS the mode). So keep DeepThink on and NEVER touch Search: force-on it
-// on an instant thread would lock that thread into instant. Idempotent, every
-// request (a reload or tab flip can reset the chips). Foreign webchats have
-// no such chips — harmless no-op.
+// 08-17 (user rule): the deepseek tab runs in INSTANT mode, which has BOTH the
+// DeepThink and Search chips — force both ON so every prompt gets reasoning
+// plus live search. Idempotent, every request (a reload or tab flip can reset
+// the chips). Foreign webchats have no such chips — harmless no-op.
 async function ensureToggles() {
     try {
         const clicked = await page.evaluate(() => {
             const flipped = [];
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
-                if (label !== 'DeepThink') continue;
+                if (label !== 'DeepThink' && label !== 'Search') continue;
                 if (el.getAttribute('aria-pressed') === 'true') continue;
                 el.click();
                 flipped.push(label);
             }
             return flipped;
         });
-        if (clicked && clicked.length) console.log('🧠 DeepThink enabled');
+        if (clicked && clicked.length) console.log('🧠 toggles enabled: ' + clicked.join(', '));
     } catch (e) {
         console.log('⚠ toggle ensure failed:', String(e.message).slice(0, 60));
     }
@@ -420,32 +428,33 @@ async function isInstantThread() {
     }
 }
 
-// 08-14 (user rule): select EXPERT mode on a fresh new-chat page. Mode is
+// 08-17 (user rule): select INSTANT mode on a fresh new-chat page. Mode is
 // locked at thread creation, so this works ONLY on the new-chat composer.
 // 08-15 (USER CORRECTION): the Instant/Expert/Vision tabs were NEVER removed —
 // they are a radiogroup (div.b0db7355, role="radio" options; dfb78875 = the
 // unselected option's inner div, aa40b5de + _31a22b0 on the selected radio).
-// My earlier probe missed them because they are NOT <button>s. The REAL expert
-// check per owner rule: an expert composer has NO Search option at all —
-// "if u see a search option that means its not expert". So select = click the
-// Expert radio at creation, then VERIFY Search is absent (else it's instant).
+// My earlier probe missed them because they are NOT <button>s. The instant
+// check per owner rule: an instant composer HAS a Search option — "if u see a
+// search option that means its not expert". So select = click the Instant
+// radio at creation, then VERIFY Search IS present (else it's expert).
 // Never throws — a UI change just logs and continues rather than stalling.
-async function selectExpertMode() {
+async function selectInstantMode() {
     try {
         const flipped = await page.evaluate(() => {
             const out = [];
             const radios = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')];
-            const expert = radios.find((r) => /expert/i.test(r.textContent || ''));
-            if (!expert) {
+            const instant = radios.find((r) => /instant/i.test(r.textContent || ''));
+            if (!instant) {
                 out.push('NO_MODE_TABS');
             } else {
-                const isSel = expert.getAttribute('aria-checked') === 'true'
-                    || (expert.className || '').includes('_31a22b0');
-                if (!isSel) { expert.click(); out.push('Expert tab'); }
+                const isSel = instant.getAttribute('aria-checked') === 'true'
+                    || (instant.className || '').includes('_31a22b0');
+                if (!isSel) { instant.click(); out.push('Instant tab'); }
             }
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
                 if (label === 'DeepThink' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('DeepThink ON'); }
+                if (label === 'Search' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('Search ON'); }
             }
             return out;
         });
@@ -453,23 +462,23 @@ async function selectExpertMode() {
         const searchPresent = await page.evaluate(() =>
             [...document.querySelectorAll('.ds-toggle-button')].some(
                 (el) => (el.textContent || '').trim() === 'Search'));
-        if (searchPresent) {
-            console.log('⚠ expert select FAILED — Search option still present (thread is INSTANT, not expert)');
+        if (!searchPresent) {
+            console.log('⚠ instant select FAILED — Search option absent (thread is EXPERT, not instant)');
         } else {
             console.log(flipped && flipped.length
-                ? '🧠 new chat set to EXPERT mode (' + flipped.join(', ') + ') — Search absent, verified'
-                : '🧠 already expert (no Search option, DeepThink on)');
+                ? '🧠 new chat set to INSTANT mode (' + flipped.join(', ') + ') — Search present, verified'
+                : '🧠 already instant (Search option present, DeepThink on)');
         }
     } catch (e) {
-        console.log('⚠ selectExpertMode failed:', String(e.message).slice(0, 60));
+        console.log('⚠ selectInstantMode failed:', String(e.message).slice(0, 60));
     }
 }
 
 // ── Type into the chat input ──
 // Prefer the React-safe native-setter path (fast, works on textareas);
-// contenteditable editors (Gemini, …) fall back to focused insertText.
-// ⚠️ NEVER use page.keyboard.type() for multi-line prompts: it translates
-// "\n" into Enter keypresses, which SENDS the partial message mid-prompt.
+// contenteditable editors (Gemini, …) fall back to the hybrid path below.
+// ⚠️ keyboard.type() translates "\n" into Enter keypresses (partial send),
+// so newlines are never typed — they ride insertText instead.
 async function typePrompt(text) {
     // 08-12 23:30 handle-free (see sendMessage): query the LIVE element inside
     // the evaluate — no JSHandle args, nothing to detach when the SPA remounts
@@ -494,15 +503,25 @@ async function typePrompt(text) {
         return false;
     }, config.selectors.input, text);
 
-    if (set) return;
+    // 08-17 DEEPSEEK REACT-SYNC: the native-setter path populates the textarea
+    // DOM but deepseek's React model can desync from it — sends then carry a
+    // STALE value (verified 08-17: composer showed the typed text, the thread
+    // recorded an old string; the completion XHR carried the old prompt). Real
+    // key events wake the React model (probed live: keyboard-typed prompts hit
+    // the completion body verbatim). Force the hybrid path for deepseek too;
+    // other sites keep the fast native-setter path.
+    const deepseek = new URL(config.webchatUrl).host.includes('deepseek');
+    if (set && !deepseek) return;
 
-    // contenteditable: focus, clear, then insert the WHOLE text as a single
-    // Input.insertText CDP command — newlines are inserted literally, never
-    // synthesized into Enter keypresses (the keyboard.type() hazard).
-    // 08-16 FIX: page.keyboard.sendCharacter() emits one insertText PER
-    // CHARACTER — the ~190K-char audit digest = ~190K CDP round-trips, which
-    // blew the 120s protocolTimeout on the Gemini lane ("Input.insertText timed
-    // out"). A single command carries the whole prompt natively.
+    // contenteditable (gemini Quill/Angular) + deepseek (React-sync): HYBRID
+    // input.
+    // 08-16: bulk Input.insertText alone NEVER arms the editor — text lands in
+    // the DOM but the app's model stays empty, so Enter/send no-op ("stranded in
+    // composer"; observed on both 9224 and the GUI tab). REAL key events wake
+    // the editor and build the model; the tail then rides a fast insertText.
+    // Newlines through keyboard.type would be Enter keypresses (partial send),
+    // so they always go through insertText. Arm + clear FIRST so the Ctrl+A
+    // Backspace actually clears stale stranded text (it no-ops on a cold editor).
     await page.evaluate((sels) => {
         for (const sel of sels) {
             const el = document.querySelector(sel);
@@ -510,12 +529,40 @@ async function typePrompt(text) {
         }
     }, config.selectors.input);
     await sleep(400);
+    await page.keyboard.type(' ');
+    await sleep(150);
     await page.keyboard.down('Control');
     await page.keyboard.press('KeyA');
     await page.keyboard.up('Control');
     await page.keyboard.press('Backspace');
     const cdp = await page.createCDPSession();
-    await cdp.send('Input.insertText', { text });
+    const WAKE = 120;
+    // 08-17: batch insertText into large chunks instead of one round-trip per
+    // line. A huge prompt (helpotron ~224k chars / thousands of lines) was
+    // burning one CDP Input.insertText per line → ~thousands of round-trips →
+    // blew the 300s gateway timeout mid-insert, so the prompt never submitted.
+    const CHUNK = 8192;  // chars per insertText; flush only between lines so
+                         // segments/surrogate pairs are never split mid-string
+    const parts = text.split('\n');
+    let typed = 0;
+    let buf = '';
+    const flush = async () => { if (buf) { await cdp.send('Input.insertText', { text: buf }); buf = ''; } };
+    for (let i = 0; i < parts.length; i++) {
+        const seg = parts[i];
+        if (seg) {
+            if (typed < WAKE) {
+                const take = Math.min(seg.length, WAKE - typed);
+                await page.keyboard.type(seg.slice(0, take));
+                typed += take;
+                if (take < seg.length) buf += seg.slice(take);
+            } else {
+                buf += seg;
+            }
+        }
+        if (i < parts.length - 1) buf += '\n';
+        if (buf.length >= CHUNK) await flush();
+    }
+    await flush();
     await cdp.detach();
 }
 
@@ -548,6 +595,10 @@ async function sendMessage(input, text) {
     // rendering responses in this environment). Idempotent; re-arms itself
     // after navigations / context handoffs.
     await installStreamTee().catch((e) => console.log('⚠ stream tee install failed:', String(e.message).slice(0, 60)));
+    // 08-17 TEE-START RACE FIX: snapshot the tee seq AFTER the install (which
+    // may init the buffer on a fresh page) but BEFORE any send — the fast-reply
+    // race otherwise hides the completion (see requestTeeStart above).
+    requestTeeStart = await page.evaluate(() => (window.__wsTeeSeq || 0)).catch(() => 0);
     for (let attempt = 0; ; attempt++) {
         try {
             // Headless tabs restore a deep scroll position (thread URL reload)
@@ -703,11 +754,11 @@ async function sendMessage(input, text) {
                     }, config.selectors.send);
                     if (!pos) throw new Error('send button vanished before click');
                     await page.mouse.click(pos.x, pos.y);
-                    return;
+                    return verifySendCleared();
                 }
                 await page.keyboard.press('Enter');
             }
-            return;
+            return verifySendCleared();
         } catch (e) {
             const stale = /not clickable|not an Element|detached|context destroyed/i.test(e.message);
             if (!stale || attempt >= 2) throw e;
@@ -716,6 +767,41 @@ async function sendMessage(input, text) {
             input = await typePrompt(text);
         }
     }
+}
+
+// 08-16 SEND-VERIFY: an Enter press or send-button click can silently no-op
+// when React's composer state is out of sync with the DOM (stranded text —
+// the DOM shows the prompt, React thinks the composer is empty; observed on
+// gemini after a CDP session reconnect, 7678-char prompt). Before, sendMessage
+// returned straight into waitForResponse, which can't tell "still generating"
+// from "never sent", and ground to the hard cap (25 min) for a message that
+// isn't coming. Poll for the composer to clear; fail fast with a clear error
+// if it doesn't — the client retries and the tab stays usable.
+async function verifySendCleared() {
+    for (let i = 0; i < 10; i++) {
+        await sleep(1000);
+        const empty = await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const v = el.value !== undefined ? el.value : el.innerText || '';
+                if (v.trim().length > 0) return false;
+            }
+            return true;
+        }, config.selectors.input);
+        if (empty) return;
+    }
+    // 08-17: surface the REAL cause when gemini's backend rejected the send —
+    // the composer stays full because the request never committed (BardErrorInfo
+    // 1095/1096 = rate-limit/abuse block, NOT a React-state bug; reloading
+    // doesn't help, waiting out the cooldown does). Fall back to the old
+    // message when no backend code was recorded.
+    let bard = '';
+    try { bard = await page.evaluate(() => window.__wsLastBardError || ''); } catch { /* ignore */ }
+    if (bard) {
+        throw new Error(`webchat send failed — gemini backend rejected the send (BardErrorInfo ${bard} = rate-limit/abuse block). Wait out the cooldown; do NOT reload-hammer it.`);
+    }
+    throw new Error('webchat send failed — prompt stranded in composer (React out of sync). Reload the tab and resend.');
 }
 
 // ── Chat snapshot (build-agnostic) ─────────────────────────────
@@ -1008,6 +1094,32 @@ async function installStreamTee() {
             }
             return out;
         };
+        // 08-17 GEMINI 1096 SURFACING: when gemini's backend REJECTS a send,
+        // the composer stays populated and verifySendCleared misreports it as
+        // "React out of sync". The rejection is a StreamGenerate XHR whose
+        // body carries `BardErrorInfo [<code>]` (1095/1096 = rate-limit /
+        // abuse block — wait it out; hammering extends it). Record the last
+        // code so the send-failure path can report the real cause. Flag-guarded
+        // and placed BEFORE the v2 guard so gateway restarts arm it on the
+        // long-lived page without a reload (__wsUrl is set by the open-wrapper
+        // below before send ever runs).
+        if (!window.__wsBardErrArmed) {
+            window.__wsBardErrArmed = true;
+            const _gsSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function (...args) {
+                const x = this;
+                if (x.__wsUrl && x.__wsUrl.includes('StreamGenerate')) {
+                    x.addEventListener('loadend', () => {
+                        try {
+                            const t = String(x.responseText || '');
+                            const m = t.match(/BardErrorInfo[^]]*\[(\d+)\]/);
+                            if (m) window.__wsLastBardError = m[1];
+                        } catch { /* non-fatal */ }
+                    });
+                }
+                return _gsSend.apply(this, args);
+            };
+        }
         // 08-13 VERSIONED RE-ARM: the guard below must NOT skip an upgrade —
         // a long-lived page keeps the interceptor closure it got at install,
         // so code fixes (the 08-13 request-body capture) never reached pages
@@ -1183,7 +1295,12 @@ async function waitForResponse(before, typedText) {
     // while WE poll, so it belongs to this request (the queue is serialized).
     // 08-13 CAP BUG FIX: track the tee by seq — length-based starts break once
     // eviction keeps length pinned at 32 (new entries were invisible forever).
-    const teeStart = await page.evaluate(() => (window.__wsTeeSeq || 0)).catch(() => 0);
+    // 08-17 TEE-START RACE FIX: prefer the pre-send snapshot from sendMessage;
+    // the entry-time capture here is too late for fast deepseek replies.
+    const teeStart = requestTeeStart !== null
+        ? requestTeeStart
+        : await page.evaluate(() => (window.__wsTeeSeq || 0)).catch(() => 0);
+    requestTeeStart = null; // consume the one-shot snapshot
     let deadline = Date.now() + config.timeout;
     // Absolute cap so a pathological never-ending stream can't hang the client
     // forever — activity may extend the deadline, but not past this.
@@ -1237,7 +1354,7 @@ async function waitForResponse(before, typedText) {
         // the hard cap (timeout×5, 25 min on the 300s gemini timeout) for a
         // reply that never arrives. Fail fast with a clear marker instead —
         // the client retries and the tab stays usable.
-        if (isGeminiWebchat() && /API Error|response stopped arriving|went wrong with this response|response was not generated|wasn'?t generated/i.test(state.body || '')) {
+        if (isGeminiWebchat() && /API Error|response stopped arriving|went wrong with this response|response was not generated|wasn'?t generated|Something went wrong/i.test(state.body || '')) {
             throw new Error('Gemini API error detected in tab (generation stopped) — resend the prompt');
         }
         // User-row guard (08-12): the typedText contains-check is NOT enough —
@@ -1432,20 +1549,20 @@ async function openNewChat() {
     // webchats (qwen/kimi/gemini) don't have that — their root IS a new chat.
     // 08-15 (OWNER CORRECTION): the Instant/Expert/Vision mode tabs (radiogroup
     // b0db7355) render ONLY on /a/chat/new — the /a/chat LIST page has just the
-    // DeepThink/Search toggles, so selectExpertMode found no tabs there and
-    // every swap created an INSTANT thread (Search option present = not expert,
-    // owner rule) → perpetual swap churn. Navigate to /a/chat/new instead.
+    // DeepThink/Search toggles, so selectInstantMode found no tabs there and
+    // every swap created the wrong mode → perpetual swap churn. Navigate to
+    // /a/chat/new instead.
     const newChatUrl = new URL(config.webchatUrl).host.includes('deepseek')
         ? 'https://chat.deepseek.com/a/chat/new'
         : config.webchatUrl;
     await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForChatInput();
     await sleep(2500); // let the SPA settle the composer
-    // 08-14 (user rule): mode is locked at thread creation — select EXPERT
+    // 08-17 (user rule): mode is locked at thread creation — select INSTANT
     // on the fresh new-chat composer BEFORE the first message creates the
-    // thread (instant threads can never become expert afterwards).
+    // thread (expert threads can never become instant afterwards).
     if (new URL(config.webchatUrl).host.includes('deepseek')) {
-        await selectExpertMode();
+        await selectInstantMode();
         await sleep(500);
     }
     return page;

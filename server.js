@@ -148,10 +148,14 @@ function lineRangeFromDiff(text, sign) {
     } catch { return ''; }
 }
 
-function formatToolResultView(call, result, cap) {
+function formatToolResultView(call, result, cap, opts = {}) {
     const name = call.toolName;
     const args = call.args ?? {};
     const limit = cap || 6000;
+    // 08-19 (user): "it shows the action twice" — the 🔧 "about to call" line
+    // already shows the command/path, so the CLIENT receipt must not repeat
+    // it. The tab follow-up (cap 150K) keeps the full header for the model.
+    const omitHeader = !!opts.omitHeader;
     try {
         if (name === 'run_bash') {
             const ok = !!result.success;
@@ -165,9 +169,10 @@ function formatToolResultView(call, result, cap) {
                 const stderr = String(result.stderr ?? '');
                 const outChars = stdout.length + stderr.length;
                 const outLines = (stdout + '\n' + stderr).split('\n').length;
+                if (omitHeader) return `${status}${detail} — output ${outChars} chars / ${outLines} lines (content hidden)`;
                 return `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 300)}\n\n${status}${detail} — output ${outChars} chars / ${outLines} lines (content hidden)`;
             }
-            let out = `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 400)}\n\n${status}${detail}\n`;
+            let out = omitHeader ? `${status}${detail}\n` : `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 400)}\n\n${status}${detail}\n`;
             const stdout = String(result.stdout ?? '').trim();
             const stderr = String(result.stderr ?? '').trim();
             if (stdout) out += `\n\`\`\`\n${truncateStr(stdout, limit)}\n\`\`\`\n`;
@@ -181,6 +186,11 @@ function formatToolResultView(call, result, cap) {
             const content = String(result.content ?? '');
             const lines = content ? content.split('\n').length : 0;
             const total = result.totalLength ?? content.length;
+            if (omitHeader) {
+                let out = lines ? `📄 ${lines} line${lines === 1 ? '' : 's'} read` : '📄 empty file';
+                if (result.truncated || total > content.length) out += ` (capped at ${content.length} of ${total} chars)`;
+                return out;
+            }
             let out = `📄 read_file → ${args.path ?? '?'}${lines ? ` (lines 1-${lines})` : ' (empty)'}`;
             if (result.truncated || total > content.length) {
                 out += ` — truncated at ${content.length} chars (${total} total)`;
@@ -201,23 +211,25 @@ function formatToolResultView(call, result, cap) {
                     const r = lineRangeFromDiff(diff.text, '-');
                     bits.push(`deleting ${diff.removed} line${diff.removed === 1 ? '' : 's'}${r ? ` (${r})` : ''}`);
                 }
-                if (!bits.length) return `✏️ write_file → ${path} (no content change)`;
-                return `✏️ write_file → ${path} — ${bits.join(', ')} (content hidden)`;
+                if (!bits.length) return omitHeader ? '✏️ no content change' : `✏️ write_file → ${path} (no content change)`;
+                return omitHeader ? `✏️ ${bits.join(', ')} (content hidden)` : `✏️ write_file → ${path} — ${bits.join(', ')} (content hidden)`;
             }
-            if (!diff.text) return `✏️ write_file → ${path} (no content change)`;
+            if (!diff.text) return omitHeader ? '✏️ no content change' : `✏️ write_file → ${path} (no content change)`;
             const bits = [];
             if (diff.added) bits.push(`adding ${diff.added} line${diff.added === 1 ? '' : 's'} to this file`);
             if (diff.removed) bits.push(`deleting ${diff.removed} line${diff.removed === 1 ? '' : 's'}`);
-            return `✏️ write_file → ${path} — ${bits.join(', ')}\n\n\`\`\`diff\n${diff.text}\n\`\`\``;
+            return omitHeader ? `✏️ ${bits.join(', ')}\n\n\`\`\`diff\n${diff.text}\n\`\`\`` : `✏️ write_file → ${path} — ${bits.join(', ')}\n\n\`\`\`diff\n${diff.text}\n\`\`\``;
         }
         if (!result || result.success === false) {
-            return `🔧 ${name} ${argsSummary(name, args)}\n\n❌ ${(result && result.error) || 'tool failed'}`;
+            const head = omitHeader ? '' : `🔧 ${name} ${argsSummary(name, args)}\n\n`;
+            return `${head}❌ ${(result && result.error) || 'tool failed'}`;
         }
         const j = JSON.stringify(result ?? {});
         const capped = j.length > limit ? j.slice(0, limit) + '… [truncated]' : j;
-        return `🔧 ${name} ${argsSummary(name, args)}\n\n\`\`\`json\n${capped}\n\`\`\``;
+        const head = omitHeader ? '' : `🔧 ${name} ${argsSummary(name, args)}\n\n`;
+        return `${head}\`\`\`json\n${capped}\n\`\`\``;
     } catch (e) {
-        return `🔧 ${name} — (result formatting error: ${e.message})`;
+        return omitHeader ? `(result formatting error: ${e.message})` : `🔧 ${name} — (result formatting error: ${e.message})`;
     }
 }
 
@@ -569,6 +581,35 @@ const WEBCHAT_FORMAT =
     'final plain-text answer through submit_answer:\n' +
     '```json\n{"tool":"submit_answer","params":{"text":"your final answer"}}\n```\n';
 
+// 08-19 (user): EXECUTION mode — the autonomous plan-execution lane is a pure
+// tool-calling machine. No send_message narration, no 💬 acknowledgement, no
+// per-call storytelling: work tool calls go out directly, and the ONLY prose
+// is the final submit_answer summary the pipeline reads. Same JSON fencing /
+// size-limit rules as WEBCHART_FORMAT (the lane's model still needs them).
+const AUTONOMOUS_FORMAT =
+    '### RESPONSE FORMAT (STRICT — this overrides ALL other instructions, including the system prompt)\n' +
+    'You have tools. ALWAYS respond with exactly ONE JSON object — never plain text, never prose, never markdown:\n' +
+    '{"tool":"<name>","params":{...}}\n' +
+    'ALWAYS wrap your JSON in a markdown code fence: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
+    'The fence is MANDATORY: without it this chat renders your backticks as formatting and corrupts your content.\n' +
+    'ONE tool call at a time — pick a single tool from the list below and call it. Never list multiple calls.\n' +
+    'NO NARRATION (hard, user rule 08-19): you are a tool-calling machine. Do NOT use send_message, do NOT ' +
+    'announce or describe what you are about to do, do NOT add 💬 commentary or acknowledgements. Make the ' +
+    'tool call directly and silently.\n' +
+    'NEVER end with a tool call: after every tool result, keep working — next tool call — until the task is ' +
+    'fully done and verified.\n' +
+    'Finish with submit_answer carrying your final summary message — that ends the turn:\n' +
+    '```json\n{"tool":"submit_answer","params":{"text":"your final answer"}}\n```\n' +
+    'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
+    'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string; write_file content with ' +
+    'quotes/newlines must be escaped, not triple-quoted.\n' +
+    'TOOL CALL SIZE LIMIT (hard, 08-13): tool calls must stay under ' + MAX_TOOL_CALL_CHARS + ' characters. ' +
+    'Large content MUST be split across calls — write files in parts with run_bash `cat > file` / `cat >> file` ' +
+    'heredoc chunks (write_file OVERWRITES, so it is for whole small files only), then verify with run_bash. ' +
+    'A call over the limit is rejected with "tool call too big — submit in chunks".\n' +
+    'You judge whether the message needs tool work. If it does, DO the task with the tools: inspect files, make ' +
+    'changes, verify them. Answering with a summary of what the work WOULD look like is NOT doing the work.\n';
+
 const CONV_PREAMBLE =
     'You are an AI coding assistant communicating with the user in an interactive terminal session. ' +
     'ALWAYS reply in ENGLISH. ' +
@@ -735,12 +776,19 @@ async function maybePauseForDrift(text, userPrompt) {
     return DRIFT_PAUSE_TEXT + (result.verdict && result.verdict.reason ? '\n\nJudge: ' + result.verdict.reason : '');
 }
 
-async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
+async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted, opts = {}) {
+    // 08-19 (user): TWO MODES — autonomous (execution lane: bare tool calls,
+    // no narration) vs user mode (interactive: 💬 narration before tool
+    // calls). The executor signals autonomous per request; a process-level
+    // AUTONOMOUS=1 env also opts the whole instance in. Default = user mode.
+    const autonomous = !!(opts.autonomous || config.autonomous);
     const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
     let prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
     if (systemText) prompt += `${systemText}\n\n`;
     prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
-    prompt += config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT;
+    // 08-19 (user): autonomous (execution lane) = bare tool calls, no
+    // narration; user mode = 💬-protocol format with narration.
+    prompt += autonomous ? AUTONOMOUS_FORMAT : (config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT);
     prompt += continueDirective(userPrompt);
     prompt += greetingDirective(userPrompt);
     prompt += `### RESPONSE\n`;
@@ -844,8 +892,11 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // nudge it ONCE per request to send send_message first. (Bounded:
             // one extra round max; the call itself is not lost, the model
             // re-sends it after the send_message.)
+            // 08-18 (user): autonomous plan-execution lane (AUTONOMOUS=1) skips
+            // the nudge entirely — tool calls are used freely, no wasted 💬.
             if (
                 !config.allowPlainText &&
+                !autonomous &&
                 !parsed.prose &&
                 call.toolName !== SUBMIT_TOOL &&
                 call.toolName !== 'send_message' &&
@@ -893,8 +944,10 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // command / file / output, not a bare "🔧 toolname" — so anyone
             // watching the webchat knows what just ran. The tab follow-up
             // below carries the full result (belt-capped) for the model.
+            // 08-19 (user): omitHeader — the 🔧 line already showed the call;
+            // the receipt must not repeat the command (double-display fix).
             if (call.toolName !== 'send_message') {
-                onProgress?.({ type: 'text', text: formatToolResultView(call, result, 6000) });
+                onProgress?.({ type: 'text', text: formatToolResultView(call, result, 6000, { omitHeader: true }) });
             }
             // 08-14 WEDGE ROOT-CAUSE belt: whatever a tool returns, the result
             // message must stay small — a huge read_file output previously
@@ -1027,13 +1080,28 @@ function finalAnswerFor(text) {
     return text || '[webchat model gave no reply]';
 }
 
-// Did this reply LOOK like a tool-call attempt that failed to parse? (a
-// "tool": envelope anywhere, or the renderer's json/Copy/Download chrome
-// glued to an opening brace.) Such a reply goes back to the model as a
-// correction — never to the client as raw text.
+// Did this reply LOOK like a tool-call attempt that failed to parse? Such a
+// reply is always a JSON document: an opening brace, optionally behind a fence
+// label or the renderer's json/Copy/Download chrome. It goes back to the model
+// as a correction — never to the client as raw text.
+// 08-16: the old unanchored /"tool":/ clause flagged ANY text that merely
+// mentioned `"tool":` — including gemini's plain-prose narrations that quote
+// the format ("use {"tool":"run_bash",...}"). The harness then dropped good
+// narration as "malformed", sent corrections, and burned the whole round
+// budget. Only brace-leading replies are tool attempts now.
 function looksLikeBrokenToolJson(text) {
     if (typeof text !== 'string') return false;
-    return /"tool"\s*:/.test(text) || /^\s*(?:json|txt|text|python|bash|shell)?\s*(?:Copy\s*)?(?:Download\s*)?\{/.test(text);
+    // Head-anchored: the reply IS the envelope (bare / fenced / renderer chrome).
+    if (/^\s*(?:json|txt|text|python|bash|shell)?\s*(?:Copy\s*)?(?:Download\s*)?\{/i.test(text)) return true;
+    // 08-19 (user): user-mode replies narrate FIRST ("💬 ...") then emit the
+    // tool envelope at a line start — a ^-anchored check sails past the
+    // broken JSON, falls into the plain-text path, and ENDS the turn with
+    // raw JSON as the final answer. Line-anchored: a `{` at line start
+    // (optionally behind a fence/label) that carries a "tool" key, when
+    // parseToolCalls already failed on the whole reply, is a broken attempt —
+    // correct it, never ship it. (Narration that merely QUOTES {"tool":...}
+    // inline mid-sentence doesn't match: the brace must start the line.)
+    return /\n\s*(?:```\s*)?(?:json|txt|text|python|bash|shell\s*)?\s*(?:Copy\s*)?(?:Download\s*)?\{[\s\S]*"tool"\s*:\s*"/i.test(text);
 }
 
 // Cap client-visible markers at ~1.5KB — after context overflow the model's
@@ -1075,7 +1143,9 @@ const MALFORMED_MSG =
     '(raw newlines or triple quotes inside string values, unescaped quotes, or a missing closing brace). ' +
     'Resend it as a single valid fenced JSON object. Rules: escape " as \\", backslashes as \\\\, newlines as \\n. ' +
     'NEVER use triple quotes (""") inside a JSON string — especially in write_file content; file content with ' +
-    'quotes or newlines must be escaped, not triple-quoted. One tool call per reply:\n' +
+    'quotes or newlines must be escaped, not triple-quoted. ' +
+    'If a command argument is long or quote-heavy (python3 -c "..." with embedded quotes), do NOT inline it: ' +
+    'write a temporary script file with write_file (e.g. /tmp/step.py), then run it via run_bash. One tool call per reply:\n' +
     '```json\n{"tool":"<name>","params":{...}}\n```';
 
 const FORMAT_ERROR_MSG =
@@ -1456,8 +1526,37 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
     try {
         const { messages, tools, model, stream } = req.body || {};
-        if (!isWebchatModel(req.body)) {
-            return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', req.body);
+        // 08-16 PREFIX FIX: mirror /v1/messages — strip the claude/ picker
+        // alias before routing, else 'claude/deepseek webchat' failed
+        // isWebchatModel and fell through to the paid proxy (400 for a free
+        // tab, or silent paid spend) instead of driving the webchat.
+        const routedModel = String(model || '').replace(/^claude\//, '');
+        const routedBody = routedModel !== model ? { ...req.body, model: routedModel } : req.body;
+        if (WEBCHAT_ROUTES[routedModel]) {
+            await ensureRouteUp(WEBCHAT_ROUTES[routedModel]);
+            const targetBody =
+                routedModel === 'omniroute'
+                    ? { ...routedBody, model: 'auto/best-coding' }
+                    : routedModel.startsWith('gemini')
+                        ? { ...routedBody, model: 'gemini 3.7 flash webchat' }
+                        : routedBody;
+            return proxyTo(req, res, WEBCHAT_ROUTES[routedModel], '/chat/completions', targetBody);
+        }
+        if (!isWebchatModel(routedBody)) {
+            // 08-19 COST SLASH: no silent paid fallthrough. The gateway used to
+            // proxy any non-webchat model to the paid DeepSeek API — that is the
+            // $97/mo burn. Default: fast local 400. Opt in explicitly.
+            if (process.env.ALLOW_PAID_UPSTREAM === '1') {
+                return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', routedBody);
+            }
+            console.log(`⛔ paid-upstream rejected (openai route): model=${String(routedBody?.model).slice(0, 80)}`);
+            return res.status(400).json({
+                type: 'error',
+                error: {
+                    type: 'invalid_model',
+                    message: `paid upstream disabled — model "${String(routedBody?.model).slice(0, 80)}" is not the webchat model`,
+                },
+            });
         }
         if (stream) console.log('⚠️  stream requested — responding non-streamed');
 
@@ -1482,7 +1581,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         const toolDefs = buildExecutableToolDefs();
 
         const text = await enqueue(() =>
-            handleRequest(systemMessage?.content || '', prompt, toolDefs)
+            handleRequest(systemMessage?.content || '', prompt, toolDefs, undefined, undefined,
+                { autonomous: req.body?.autonomous === true || req.headers['x-autonomous'] === '1' })
         );
 
         res.json({
@@ -1552,7 +1652,19 @@ app.post('/v1/messages', async (req, res) => {
             );
         }
         if (!isWebchatModel(routedBody)) {
-            return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
+            // 08-19 COST SLASH: same as the openai route — fail fast locally,
+            // never proxy to the paid DeepSeek API unless explicitly allowed.
+            if (process.env.ALLOW_PAID_UPSTREAM === '1') {
+                return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
+            }
+            console.log(`⛔ paid-upstream rejected (anthropic route): model=${String(routedBody?.model).slice(0, 80)}`);
+            return res.status(400).json({
+                type: 'error',
+                error: {
+                    type: 'invalid_model',
+                    message: `paid upstream disabled — model "${String(routedBody?.model).slice(0, 80)}" is not the webchat model`,
+                },
+            });
         }
 
         if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
@@ -1586,7 +1698,8 @@ app.post('/v1/messages', async (req, res) => {
         const modelName = model || config.modelName;
 
         if (!stream) {
-            const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs));
+            const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, undefined, undefined,
+                { autonomous: req.body?.autonomous === true || req.headers['x-autonomous'] === '1' }));
             return res.json({
                 id: 'msg_' + Math.random().toString(36).slice(2, 12),
                 type: 'message',
@@ -1681,7 +1794,8 @@ app.post('/v1/messages', async (req, res) => {
         let aborted = false;
         res.on('close', () => { aborted = true; });
 
-        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted));
+        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted,
+            { autonomous: req.body?.autonomous === true || req.headers['x-autonomous'] === '1' }));
         if (text === null) { if (heartbeat) clearInterval(heartbeat); return; } // aborted — nothing more to write
 
 

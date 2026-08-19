@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ override: true });
 
 // chat.js overrides (paste your tab URL there — it wins over .env)
 let chat = {};
@@ -27,6 +27,11 @@ const cfg = {
     // instead of demanding fenced tool JSON — for personal threads whose model
     // talks like a friend. Tool calls still work when the model makes them.
     allowPlainText: process.env.ALLOW_PLAIN_TEXT === 'true',
+    // Autonomous mode (08-18): skip the send_message narration nudge before
+    // work tool calls — used by the autonomous plan-execution lane so the
+    // account isn't burned on one 💬 message per round. Personal threads keep
+    // the nudge (interactive visibility); the lane sets AUTONOMOUS=1.
+    autonomous: process.env.AUTONOMOUS === '1',
     headless: process.env.HEADLESS === 'true',
     modelName: process.env.MODEL_NAME || 'deepseek webchat',
     // 08-13 MULTI-SITE: env FIRST — chat.js carries a hardcoded 9224 URL, so
