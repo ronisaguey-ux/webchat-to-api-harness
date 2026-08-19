@@ -12,6 +12,16 @@ const config = require('./config');
 // GIT_ROOT=<git-root> get git-root resolution; other lanes (audit/gemini, no
 // GIT_ROOT) keep verbatim path behavior.
 const GIT_ROOT = process.env.GIT_ROOT || '';
+
+// 08-19 USER-SESSION SCOPING (root-cause fix: "wtf is going on" — the gemini
+// user session kept running oculus-harness actions instead of the user's
+// helpotron plan). User-mode gateways (ALLOW_PLAIN_TEXT=true, e.g. PORT=8085)
+// serve a NEUTRAL toolset: no oculus-category tools (audit_status, send_message_
+// to_main) and git_status defaults to the USER's repo (helpotron), not oculus.
+// Autonomous/executor lanes (no ALLOW_PLAIN_TEXT) keep the full harness toolset.
+const USER_MODE = process.env.ALLOW_PLAIN_TEXT === 'true';
+const DEFAULT_GIT_REPO = USER_MODE ? 'helpotron' : 'oculus';
+
 function resolvePath(p) {
     if (!GIT_ROOT || typeof p !== 'string' || p === '') return p;
     if (path.isAbsolute(p)) return p;
@@ -422,7 +432,7 @@ const TOOL_DEFINITIONS = [
             properties: {
                 repo: {
                     type: 'string',
-                    description: 'Repo: oculus (default), webchat-api, or helpotron',
+                    description: `Repo: ${DEFAULT_GIT_REPO} (default), webchat-api, or ${DEFAULT_GIT_REPO === 'oculus' ? 'helpotron' : 'oculus'}`,
                 },
             },
             required: [],
@@ -433,7 +443,7 @@ const TOOL_DEFINITIONS = [
                 'webchat-api': '/home/roni/Roni_Workspace/webchat-api',
                 helpotron: '/home/roni/Roni_Workspace/helpotron',
             };
-            const dir = repos[String((args && args.repo) || 'oculus')];
+            const dir = repos[String((args && args.repo) || DEFAULT_GIT_REPO)];
             if (!dir) {
                 return { success: false, error: `unknown repo; use one of: ${Object.keys(repos).join(', ')}` };
             }
@@ -584,7 +594,9 @@ const TOOL_DEFINITIONS = [
 // ──────────────────────────────────────────────────────
 function getToolDefinitions() {
     // Expose only the schema (name/category/description/parameters), never the handler
-    return TOOL_DEFINITIONS.map(({ handler, ...rest }) => rest);
+    return TOOL_DEFINITIONS
+        .filter((t) => !(USER_MODE && t.category === 'oculus'))
+        .map(({ handler, ...rest }) => rest);
 }
 
 async function executeTool(toolName, args, ctx) {
