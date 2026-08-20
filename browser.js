@@ -1627,6 +1627,11 @@ async function openNewChatAndSeed(text) {
 function buildFullPrompt(userPrompt, toolDefinitions) {
     let fullPrompt = '';
 
+    // 08-19 (user idea): the USER REQUEST leads — the model locks onto the
+    // real task before it sees any tool/protocol text. The format rules follow
+    // (tools section + the REMINDER below stays in the strongest last slot).
+    fullPrompt += `### USER REQUEST\n\n${userPrompt}\n\n`;
+
     if (toolDefinitions && toolDefinitions.length > 0) {
         let section =
             'You have access to the tools below. ALWAYS respond with exactly one JSON object ' +
@@ -1658,7 +1663,6 @@ function buildFullPrompt(userPrompt, toolDefinitions) {
         fullPrompt += section;
     }
 
-    fullPrompt += `### USER REQUEST\n\n${userPrompt}\n\n### RESPONSE\n`;
     // Absolute final slot, after everything: this is the strongest instruction
     // position, and it must reinforce the format for EVERY round (first message
     // AND follow-ups) — DeepSeek's chat behavior is to pause after tool work

@@ -156,15 +156,24 @@ function formatToolResultView(call, result, cap, opts = {}) {
     // already shows the command/path, so the CLIENT receipt must not repeat
     // it. The tab follow-up (cap 150K) keeps the full header for the model.
     const omitHeader = !!opts.omitHeader;
+    // 08-19 (user, de-lobotomize): forModel=true = this receipt goes INTO the
+    // agent's context (the follow-up), NOT to a human client. The agent MUST
+    // see the actual tool output — the 08-16 cosmetic rule (compact stats,
+    // content hidden) stripped the content from the gemini lane's context,
+    // which made the model re-read the same file in a loop: it executed the
+    // tool, learned only "34 lines (content hidden)", and never knew what
+    // the content was. Human-facing receipts keep the compact form.
+    const forModel = !!opts.forModel;
     try {
         if (name === 'run_bash') {
             const ok = !!result.success;
             const status = ok ? '✅ bash command finished' : '❌ bash command failed';
             const detail = result.error ? ` (${result.error})` : '';
-            // 08-16 (user): gemini tab shows NO command output — just the
+            // 08-16 (user): client receipt shows NO command output — just the
             // command + status + how big the output was. DeepSeek keeps the
-            // output (the plan executor reads it to verify steps).
-            if (IS_GEMINI) {
+            // output (the plan executor reads it to verify steps). The agent's
+            // own context (forModel) ALWAYS keeps the output.
+            if (IS_GEMINI && !forModel) {
                 const stdout = String(result.stdout ?? '');
                 const stderr = String(result.stderr ?? '');
                 const outChars = stdout.length + stderr.length;
@@ -181,8 +190,10 @@ function formatToolResultView(call, result, cap, opts = {}) {
         }
         if (name === 'read_file') {
             // 08-16 (user): NO content dump — just which file and which lines
-            // were read. The full output is dropped from both the streamed
-            // receipt and the tab follow-up.
+            // were read. The full output is dropped from the streamed client
+            // receipt. 08-19 (user, de-lobotomize): the AGENT's own context
+            // (forModel) MUST carry the content — a stats-only receipt made
+            // the gemini agent re-read the same file 4× in a loop.
             const content = String(result.content ?? '');
             const lines = content ? content.split('\n').length : 0;
             const total = result.totalLength ?? content.length;
@@ -195,13 +206,17 @@ function formatToolResultView(call, result, cap, opts = {}) {
             if (result.truncated || total > content.length) {
                 out += ` — truncated at ${content.length} chars (${total} total)`;
             }
+            if (forModel && content) {
+                out += '\n\n```\n' + truncateStr(content, limit) + '\n```';
+            }
             return out;
         }
         if (name === 'write_file') {
             const path = args.path ?? '?';
             const diff = diffLines(result.oldContent, args.content);
-            // 08-16 (user): gemini tab shows line counts + ranges, NO diff.
-            if (IS_GEMINI) {
+            // 08-16 (user): client receipt shows line counts + ranges, NO
+            // diff. The agent's own context (forModel) keeps the diff.
+            if (IS_GEMINI && !forModel) {
                 const bits = [];
                 if (diff.added) {
                     const r = lineRangeFromDiff(diff.text, '+');
@@ -1081,7 +1096,9 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // double the message and re-wedge the tab. send_message needs no
             // receipt: its text was already delivered to the client above.
             const followUp =
-                (call.toolName === 'send_message' ? '' : formatToolResultView(call, result, 150000) + '\n\n') +
+                // 08-19 (user, de-lobotomize): forModel=true — this receipt goes
+                // into the agent's context, so it MUST carry the real tool output.
+                (call.toolName === 'send_message' ? '' : formatToolResultView(call, result, 150000, { forModel: true }) + '\n\n') +
                 (config.allowPlainText
                     ? 'You MUST send ONE plain-text 💬 line before your next tool call (your thinking + what the ' +
                       'tool is about to do and why — delivered to the user verbatim; user rule 08-13), then your ' +
