@@ -229,6 +229,11 @@ ALLOWED_COMMANDS = {
     # (parser normalizes mypy --strict -> --follow-imports=skip). mypy/ruff/black
     # inspect source, they do not execute it; same trust class as pytest/grep.
     "mypy", "ruff", "black",
+    # 08-20 (step 829 + ~30 flutter steps): flutter/dart verification commands.
+    # On this box /home/roni/bin/flutter is a CI simulation stub (analyze/test
+    # exit 0), so these checks are deterministic. `cd X && flutter ...` chains
+    # are handled by the chain runner above.
+    "flutter", "dart",
 }
 
 class PlanNotApprovedError(Exception):
@@ -1617,6 +1622,57 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
     except Exception as e:
         return False, f"Security Violation: Command parsing error: {e}"
 
+    # 08-20 (steps 829 + ~55 chain-verifications): `&&`-chains are the plan
+    # generator's dominant verification idiom (`cd X && flutter analyze`,
+    # `grep -q A && grep -q B`, `python3 X && python3 Y`). Every segment is
+    # still argv-whitelisted, so a chain is honored WITHOUT a shell: split on
+    # standalone `&&` tokens and run each segment sequentially under
+    # shell=False; the first failing segment fails the whole command. A leading
+    # `cd X` segment adjusts the child cwd (relative to PIPELINE_WORK_DIR) for
+    # the remaining segments — `..`, absolute, or metachar targets are
+    # rejected. Any OTHER shell operator inside a segment (|, >, <, ;, &, $, `)
+    # keeps the strict rejection below, so pipes/redirects in chains stay
+    # blocked exactly like standalone ones.
+    child_cwd = PIPELINE_WORK_DIR
+    if "&&" in args:
+        segments, current = [], []
+        for a in args:
+            if a == "&&":
+                if not current:
+                    return False, f"Security Violation: empty segment in command: {cmd}"
+                segments.append(current)
+                current = []
+            else:
+                current.append(a)
+        if current:
+            segments.append(current)
+        for idx, seg in enumerate(segments):
+            # leading `cd X` is not an allowed binary itself — it is validated
+            # and consumed by the cd handling below (single bare dir target).
+            if idx == 0 and seg[0] == "cd" and len(seg) == 2:
+                continue
+            if not seg or seg[0].lstrip("./") not in ALLOWED_COMMANDS:
+                return False, f"Security Violation: segment '{seg[0] if seg else '?'}' not allowed in chain: {cmd}"
+            if any(a in (";", "|", ">", "<", "$", "`") for a in seg):
+                return False, f"Security Violation: shell operator inside chain segment: {cmd}"
+        if segments[0][0] == "cd" and len(segments[0]) == 2:
+            cd_target = segments[0][1]
+            if cd_target.startswith("/") or ".." in cd_target.split("/"):
+                return False, f"Security Violation: unsafe 'cd' target '{cd_target}' in chain."
+            child_cwd = os.path.join(PIPELINE_WORK_DIR, cd_target)
+            if not os.path.isdir(child_cwd):
+                return False, f"Security Violation: 'cd' target '{cd_target}' is not a directory under the work dir."
+            segments = segments[1:]
+        if not segments:
+            return False, "Security Violation: chain has no command after 'cd'."
+        cmd_plan = segments
+    else:
+        cmd_plan = [args]
+    # flat = the tokens that will actually run (chain cd-segment already
+    # stripped) — use_shell and the argv[0] check must see THESE, not the raw
+    # split (which still contains the `cd`/`&&` tokens for cd-chains).
+    flat = [a for seg in cmd_plan for a in seg]
+
     # 08-20 (step 828): operator detection on TOKENS, not the raw string.
     # A metachar INSIDE a quoted grep pattern ("git checkout -- <file>")
     # is inert under shell=False (argv exec — no redirection/globbing),
@@ -1624,27 +1680,12 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
     # token that IS a shell operator (unquoted `|`, `>`, `&&`, `;` ...)
     # reaches shell=True, where is_safe_command's strict rejection stays.
     _SHELL_OPS = ("|", ">", "<", "&&", "||", ";", "&", "$", "`")
-    use_shell = any(a in _SHELL_OPS for a in args)
+    use_shell = len(cmd_plan) == 1 and any(a in _SHELL_OPS for a in flat)
     if use_shell and not is_safe_command(cmd):
         return False, f"Security Violation: Command '{cmd}' failed whitelist validation."
 
-    if not args or args[0].lstrip("./") not in ALLOWED_COMMANDS:
-        return False, f"Security Violation: '{args[0] if args else cmd}' not allowed."
-
-    # Normalize 'python' to 'python3' for linux compatibility
-    if args[0] in ("python", "./python"):
-        args[0] = "python3"
-    # Run checks under the venv interpreter (sys.executable) — system python3
-    # lacks aiohttp/pytest, which made STEP 253's pytest verification fail
-    # spuriously and HALTs the whole pipeline (2026-08-05).
-    if args[0] == "python3":
-        args[0] = sys.executable
-    # Bare `pytest` on PATH is SYSTEM pytest (/usr/bin/python3, no ccxt) — the
-    # executor's venv has ccxt+aiohttp. STEP 200's `pytest tests/... -v` check
-    # failed on every retry under system pytest and HALTED the pipeline after
-    # OmniRoute(3)+webchat(2) (2026-08-15). Run it via the venv instead.
-    if args[0] == "pytest":
-        args = [sys.executable, "-m", "pytest"] + args[1:]
+    if len(cmd_plan) == 1 and (not flat or flat[0].lstrip("./") not in ALLOWED_COMMANDS):
+        return False, f"Security Violation: '{flat[0] if flat else cmd}' not allowed."
 
     temp_dir = tempfile.mkdtemp(prefix=f"oculus_term_{env_id}_")
     out_file = os.path.join(temp_dir, "cmd_out.txt")
@@ -1663,19 +1704,27 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
         # Stream stdout to a file on disk instead of buffering it in RAM.
         # This bounds per-command memory to the small diagnostic tail read below,
         # preventing pytest/mypy firehoses from blowing the process heap (OOM).
+        # 08-20 (chain support): multi-segment `&&` chains run one argv exec
+        # per segment, all with child_cwd (the `cd X &&` target when present).
+        # Normalization (python->venv, pytest->venv -m) applies per segment.
+        proc = None
         with open(out_file, "w") as fout:
-            if use_shell:
+            for seg in cmd_plan:
+                seg_args = list(seg)
+                if seg_args[0] in ("python", "./python"):
+                    seg_args[0] = "python3"
+                if seg_args[0] == "python3":
+                    seg_args[0] = sys.executable
+                if seg_args[0] == "pytest":
+                    seg_args = [sys.executable, "-m", "pytest"] + seg_args[1:]
                 proc = subprocess.run(
-                    cmd, shell=True, cwd=PIPELINE_WORK_DIR, env=env,
+                    cmd if use_shell else seg_args, shell=use_shell,
+                    cwd=child_cwd, env=env,
                     stdout=fout, stderr=subprocess.STDOUT,
                     text=True, timeout=timeout
                 )
-            else:
-                proc = subprocess.run(
-                    args, shell=False, cwd=PIPELINE_WORK_DIR, env=env,
-                    stdout=fout, stderr=subprocess.STDOUT,
-                    text=True, timeout=timeout
-                )
+                if proc.returncode != 0:
+                    break
         success = (proc.returncode == 0)
         output = ""
         try:

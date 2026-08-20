@@ -102,6 +102,10 @@ const ALLOWED_BINARIES = new Set([
     // (executor parser normalizes mypy --strict -> --follow-imports=skip).
     // These inspect source; they do not execute it (mypy -c type-checks only).
     'mypy', 'ruff', 'black',
+    // 08-20 (step 829 + ~30 flutter steps): flutter/dart verification commands.
+    // /home/roni/bin/flutter is a CI simulation stub on this box (exit 0 for
+    // analyze/test), so these checks are deterministic.
+    'flutter', 'dart',
 ]);
 // Code-exec flags that would nullify the whitelist (arbitrary code from a
 // whitelisted interpreter): python3 -c, bash -c/-s, node -e/-p, perl -e...
