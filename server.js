@@ -15,7 +15,7 @@ const IS_GEMINI = (config.modelName || '').toLowerCase().startsWith('gemini');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
     buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
-    resetTeeForHandoff, takeThreadSwap,
+    resetTeeForHandoff, takeThreadSwap, openNewChat,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 const { MultiSignalGatewayGate } = require('./drift_v2');
@@ -184,8 +184,26 @@ function formatToolResultView(call, result, cap, opts = {}) {
             let out = omitHeader ? `${status}${detail}\n` : `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 400)}\n\n${status}${detail}\n`;
             const stdout = String(result.stdout ?? '').trim();
             const stderr = String(result.stderr ?? '').trim();
-            if (stdout) out += `\n\`\`\`\n${truncateStr(stdout, limit)}\n\`\`\`\n`;
-            if (stderr) out += `\n\`\`\`\nstderr:\n${truncateStr(stderr, Math.min(limit, 6000))}\n\`\`\`\n`;
+            const totalOut = String(result.stdout ?? '').length + String(result.stderr ?? '').length;
+            let shownOut = 0;
+            if (stdout) {
+                const shown = truncateStr(stdout, limit);
+                shownOut += shown.length;
+                out += `\n\`\`\`\n${shown}\n\`\`\`\n`;
+            }
+            if (stderr) {
+                const shown = truncateStr(stderr, Math.min(limit, 6000));
+                shownOut += shown.length;
+                out += `\n\`\`\`\nstderr:\n${shown}\n\`\`\`\n`;
+            }
+            // 08-19 (user): when a tool's output is too long to fit, show it
+            // partially and WARN the agent how to page through the rest —
+            // never silently drop bytes it may need to verify the step.
+            if (forModel && totalOut > shownOut) {
+                out += `\n⚠️ OUTPUT TRUNCATED: ${totalOut} chars total, ${shownOut} shown. ` +
+                      `To see the rest, re-run the command with output redirected to a file ` +
+                      `(>> /tmp/out.txt) then call read_file with path + maxLength + offset to page through it.`;
+            }
             return out;
         }
         if (name === 'read_file') {
@@ -203,11 +221,21 @@ function formatToolResultView(call, result, cap, opts = {}) {
                 return out;
             }
             let out = `📄 read_file → ${args.path ?? '?'}${lines ? ` (lines 1-${lines})` : ' (empty)'}`;
+            const shown = forModel && content ? truncateStr(content, limit) : '';
             if (result.truncated || total > content.length) {
                 out += ` — truncated at ${content.length} chars (${total} total)`;
             }
             if (forModel && content) {
-                out += '\n\n```\n' + truncateStr(content, limit) + '\n```';
+                out += '\n\n```\n' + shown + '\n```';
+                // 08-19 (user): show it partially + warn how to get the rest —
+                // read_file with offset pages the next window; the agent must
+                // NOT re-read the head (that was the pre-fix loop pattern).
+                if (result.truncated) {
+                    const nextOffset = (result.offset ?? 0) + content.length;
+                    out += `\n\n⚠️ OUTPUT TRUNCATED: showing ${content.length} of ${total} chars. ` +
+                           `Call read_file again with path + offset=${nextOffset} (+ maxLength for window size) to see the rest. ` +
+                           `Keep paging until truncated is false.`;
+                }
             }
             return out;
         }
@@ -1107,7 +1135,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                       'message. Keep progress lines to one sentence — the work is the tool calls. ' +
                       'Verify with run_bash: syntax checks, import tests, dependency checks, and the project tests. ' +
                       'Do not claim completion for work you have not verified actually runs. ' +
-                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — pass maxLength for a specific head window. ' +
+                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — page through with maxLength + offset until truncated is false. ' +
                       'The next step: fenced {"tool":"<name>","params":{...}}.'
                     : 'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
                       'Reply with exactly ONE tool call per message, fenced as ```json ... ```. To speak to the user, ' +
@@ -1119,7 +1147,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                       'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
                       'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
                       'verified actually runs. ' +
-                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — pass maxLength for a specific head window. ' +
+                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — page through with maxLength + offset until truncated is false. ' +
                       'The next step: fenced {"tool":"<name>","params":{...}}.');
             response = await countedSend(followUp, toolDefs);
             continue;
@@ -1622,6 +1650,18 @@ app.get('/status', async (req, res) => {
 
 app.get('/tools', (req, res) => {
     res.json(getToolDefinitions());
+});
+
+// 08-19 (user): /newchat — the /newchat slash command in Claude Code curls
+// this to start a brand-new conversation in the controlled browser tab
+// (the old thread survives server-side; the tab navigates to a fresh chat).
+app.post('/v1/newchat', async (req, res) => {
+    try {
+        const p = await openNewChat();
+        res.json({ ok: true, url: p.url(), message: 'New chat started in the webchat tab' });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: String(e.message).slice(0, 300) });
+    }
 });
 
 // 08-14 OMNIROUTE SLOT (lazy-start feel): the omniroute_watchdog keeps
