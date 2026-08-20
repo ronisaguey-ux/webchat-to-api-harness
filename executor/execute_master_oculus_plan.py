@@ -1531,6 +1531,27 @@ def _trivial_command(cmd: str) -> bool:
     return False
 
 
+# 08-20 (config-clobber guard): webchat experts have twice replaced
+# workflow_orchestrator/oculus_config_workflow.yaml with unrelated content
+# (steps 809, 946). The orchestrator reads the config only at spawn, so a
+# clobbered config crash-loops the supervisor's orchestrator respawns until
+# a human restores it. Guard: restore any dirty protected infra file before
+# each webchat round, unless the current step legitimately targets it.
+_PROTECTED_WORKTREE_FILES = (
+    "workflow_orchestrator/oculus_config_workflow.yaml",
+)
+
+
+def _restore_protected_files(target_files: list) -> None:
+    for rel in _PROTECTED_WORKTREE_FILES:
+        if rel in (target_files or []):
+            continue
+        ok, out = run_isolated_shell_command(f"git status --porcelain -- {rel}", env_id="guard")
+        if ok and out.strip():
+            log_exec(f"  [GUARD] restoring clobbered protected file {rel}")
+            run_isolated_shell_command(f"git checkout -- {rel}", env_id="guard")
+
+
 def _extract_step_block(plan_path: str, step_idx: int) -> str:
     """Return the raw markdown block for one step (or '' if not found)."""
     if not os.path.exists(plan_path):
@@ -1771,13 +1792,17 @@ STRICT GUIDELINES — violating ANY is rejected:
 
 # ─── ISOLATED TERMINAL COMMAND EXECUTOR (SECURITY HARDENED) ─────────────────
 
-def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int = 300) -> tuple[bool, str]:
+def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int = 600) -> tuple[bool, str]:
     """
     Execute a command safely using shell=False and shlex.split() after passing command whitelist check.
-    NOTE: default timeout 300s (was 120) — the full-suite pytest check
+    NOTE: default timeout 600s (was 300, originally 120) — the full-suite pytest check
     (`pytest tests/ -q --strict-markers`) takes ~92s here and false-failed
     STEP 310's check #4 at 120s (2026-08-05). Verifications must not be
-    time-bounded tighter than the slowest legitimate check.
+    time-bounded tighter than the slowest legitimate check. 300s STILL
+    false-failed STEP 946's check #5 (2026-08-20): the RAM watchdog
+    SIGSTOPs the heavy pytest child at 75%+ usage and the 300s window
+    expired while paused (paused at 4.7min of a 5min run). 600s lets a
+    watchdog pause/resume cycle complete inside the window.
     """
     if "grep" in cmd and " '--" in cmd and " -- '--" not in cmd:
         cmd = cmd.replace(" '--", " -- '--")
@@ -2724,6 +2749,7 @@ async def main():
                     wc_round = 0
                     while not wc_ok:
                         wc_round += 1
+                        _restore_protected_files(step.get("target_files") or [])
                         ok_w, msg_w = await solve_step_with_webchat(session, step, graphify, wc_context)
                         if ok_w:
                             wc_ok = True
