@@ -229,6 +229,9 @@ ALLOWED_COMMANDS = {
     # (parser normalizes mypy --strict -> --follow-imports=skip). mypy/ruff/black
     # inspect source, they do not execute it; same trust class as pytest/grep.
     "mypy", "ruff", "black",
+    # 08-20 (step 71/1413): `chmod 644 test.key && python ...` chains — file
+    # permission change, not execution; same trust class as read-only tools.
+    "chmod",
     # 08-20 (step 60): plan checks invoke the orchestrator venv explicitly
     # (`.venv-orch/bin/python -c ...`). Same interpreter as sys.executable —
     # normalized below, so only the literal prefix needs to be allowed.
@@ -1626,6 +1629,20 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
     except Exception as e:
         return False, f"Security Violation: Command parsing error: {e}"
 
+    # 08-20 (steps 73/85/128/162/164/350/441/759...): the plan's env-prefix
+    # idiom (`OCULUS_ENV=production python -c ...`, `MCP_AUTH_TOKEN=test python
+    # ...`, `TELEGRAM_BOT_TOKEN= pytest ...`). A leading `KEY=value` token is
+    # inert in argv exec — apply it as a child env override and run the rest
+    # argv-style. Values containing shell operators (| ; > < $ ` &) are
+    # rejected so the shell path can never see one.
+    env_overrides = {}
+    while args and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", args[0]):
+        kv = args.pop(0)
+        key, _, value = kv.partition("=")
+        if any(m in value for m in (";", "|", ">", "<", "$", "`", "&")):
+            return False, f"Security Violation: unsafe env value in '{kv}'."
+        env_overrides[key] = value
+
     # 08-20 (steps 829 + ~55 chain-verifications): `&&`-chains are the plan
     # generator's dominant verification idiom (`cd X && flutter analyze`,
     # `grep -q A && grep -q B`, `python3 X && python3 Y`). Every segment is
@@ -1701,6 +1718,7 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
         # and matches conftest.py's own setdefault. Without it, any check that
         # imports `oculus` trips the entrypoint guard and hard-fails (STEP 659).
         env["OCULUS_ALLOW_EXTERNAL"] = "1"
+        env.update(env_overrides)  # env-prefix idiom (KEY=value cmd...)
         env["PYTHONPATH"] = os.path.dirname(PIPELINE_WORK_DIR) + ":" + PIPELINE_WORK_DIR + ":" + env.get("PYTHONPATH", "")
 
         # use_shell computed above from shlex TOKENS (step 828) — quoted
