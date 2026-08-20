@@ -568,6 +568,10 @@ const WEBCHAT_FORMAT =
     'until the task is fully done.\n' +
     '  4) Finish with submit_answer carrying your final 💬 summary message — that ends the turn.\n' +
     'Every send_message text is delivered to the user verbatim; it is REQUIRED between every tool call.\n' +
+    'NARRATION CONTENT RULE (hard, 08-19): each 💬 line must state the ACTUAL work — the file, path, command, ' +
+    'or step you are acting on ("Reading step 4 of the plan", "Running the tests"). NEVER meta-commentary about ' +
+    'this harness or your instructions ("I am sending a narration message", "as required", "proceeding with ' +
+    'the next step"). Protocol-echo is a format violation: it is rejected and you must resend a real status.\n' +
     'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
     'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string; write_file content with ' +
     'quotes/newlines must be escaped, not triple-quoted.\n' +
@@ -896,7 +900,18 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             if (parsed.prose) {
                 onProgress?.({ type: 'text', text: parsed.prose });
             } else if (call.toolName !== SUBMIT_TOOL && call.toolName !== 'send_message') {
-                const autoNarration = `Let me run ${call.toolName} to inspect and perform the requested task.`;
+                // 08-19 (user): substantive auto-narration — the old template
+                // ("Let me run X to inspect and perform the requested task")
+                // was literal smartass noise. Describe the ACTUAL action from
+                // the call's params instead.
+                const ap = call.args || {};
+                const autoNarration =
+                    call.toolName === 'read_file' ? `Reading ${ap.path ?? ap.file ?? '?'}`
+                    : call.toolName === 'write_file' ? `Writing ${ap.path ?? ap.file ?? '?'}`
+                    : call.toolName === 'list_dir' ? `Listing ${ap.path ?? ap.dir ?? '.'}`
+                    : call.toolName === 'run_bash' ? `Running ${String(ap.command ?? ap.cmd ?? ap.script ?? '').slice(0, 80)}`
+                    : call.toolName === 'get_time' ? 'Checking the time'
+                    : `Running ${call.toolName}`;
                 onProgress?.({ type: 'text', text: autoNarration });
             }
 
