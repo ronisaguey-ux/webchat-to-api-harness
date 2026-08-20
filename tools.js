@@ -98,6 +98,10 @@ const ALLOWED_BINARIES = new Set([
     'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'timeout',
     'curl', 'wget', 'nohup', 'bash', 'sh', 'env', 'export', 'source',
     'ps', 'df', 'du', 'free', 'jq', 'xargs',
+    // 08-20: lint/type-check verification tools used by the master plan
+    // (executor parser normalizes mypy --strict -> --follow-imports=skip).
+    // These inspect source; they do not execute it (mypy -c type-checks only).
+    'mypy', 'ruff', 'black',
 ]);
 // Code-exec flags that would nullify the whitelist (arbitrary code from a
 // whitelisted interpreter): python3 -c, bash -c/-s, node -e/-p, perl -e...
