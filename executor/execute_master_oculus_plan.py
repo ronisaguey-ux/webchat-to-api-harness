@@ -62,7 +62,11 @@ MASTER_PLAN_FILE = os.getenv("MASTER_PLAN_FILE", f"{AUDITS_PLANS_DIR}/master_ocu
 EXECUTION_STATE_FILE = os.getenv("EXECUTION_STATE_FILE", f"{AUDITS_PLANS_DIR}/plan_execution_state.json")
 EXECUTION_LOG_FILE = os.getenv("EXECUTION_LOG_FILE", f"{AUDITS_PLANS_DIR}/plan_execution.log")
 EXECUTION_JSON_LOG_FILE = os.getenv("EXECUTION_JSON_LOG_FILE", f"{AUDITS_PLANS_DIR}/plan_execution_logs.jsonl")
-FINAL_REPORT_FILE = os.getenv("FINAL_REPORT_FILE", f"{AUDITS_PLANS_DIR}/final_master_verification_report.md")
+# 2026-08-20: plan-scoped default — the helpotron lane's phase-2 report
+# (final_master_verification_report.md) would be silently overwritten by the
+# oculus lane's audit (and vice versa). Key by plan file, like the sweep
+# checkpoint. Env override still wins.
+FINAL_REPORT_FILE = os.getenv("FINAL_REPORT_FILE", f"{AUDITS_PLANS_DIR}/final_verification_report_{os.path.basename(MASTER_PLAN_FILE).replace('.md', '')}.md")
 SOT_FILE = os.getenv("SOT_FILE", f"{OCULUS_DIR}/OCULUS_IMPORTANT/OCULUS_SOURCE_OF_TRUTH_7_23.md")
 GRAPH_FILE = os.getenv("GRAPH_FILE", f"{OCULUS_DIR}/graphify-out/graph.json")
 KEY_FILE = os.getenv("DEEPSEEK_KEY_FILE", "/home/roni/Roni_workspace/tokens_keys/deepseek_api.json")
@@ -211,7 +215,17 @@ import shlex
 # shell-metachar rejection. A passing command can never reach the shell=True
 # fallback in run_isolated_shell_command (| > && all rejected), closing the
 # RCE-via-prompt-injection vector on that shell-execution path.
-ALLOWED_COMMANDS = {"pytest", "python", "git", "pip", "python3", "venv/bin/python"}
+# 2026-08-20 (steps 815/816 HALT): read-only inspection tools were missing —
+# plan VERIFICATION commands like `grep -n ...` / `test -f ...` were
+# whitelist-rejected and the step could never verify. Only read-only binaries
+# are added; the write-capable set stays as before.
+ALLOWED_COMMANDS = {
+    "pytest", "python", "git", "pip", "python3", "venv/bin/python",
+    # read-only inspection (verification commands)
+    "grep", "cat", "test", "[", "ls", "head", "tail", "wc", "find",
+    "diff", "stat", "cut", "tr", "sort", "uniq", "basename", "dirname",
+    "date", "file", "sed", "awk", "printf", "readlink",
+}
 
 class PlanNotApprovedError(Exception):
     """Raised when a plan's content hash has not been approved for execution."""
@@ -786,7 +800,7 @@ async def call_official_deepseek(session: aiohttp.ClientSession,
 
 def extract_json_from_text(text: str) -> dict:
     if not text:
-        raise ValueError("Empty text response")
+        return {}
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
     if m:
         try:
@@ -800,7 +814,12 @@ def extract_json_from_text(text: str) -> dict:
             return json.loads(text[first_brace:last_brace+1])
         except Exception:
             pass
-    return json.loads(text)
+    # 08-20 (step 2/3/6 HALT): plain-text replies (no JSON at all) must not
+    # raise — the escalation continues with verification on the current tree.
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
 
 
 async def solve_step_with_deepseek_expert(session: aiohttp.ClientSession, step: dict, graphify_ctx: dict,
@@ -938,6 +957,19 @@ CRITICAL REQUIREMENTS:
                 "git add -- " + " ".join(add_paths) if add_paths else "git status", timeout=15)
             c_msg = f"[STEP {step_idx}/{total_steps}] (DeepSeek Expert) {step['objective'][:70]}"
             ok_commit, commit_out = run_isolated_shell_command(f'git commit -m "{c_msg}"', timeout=15)
+            # 08-20 (audit BUG-11): commit failure must not silently pass. A
+            # clean tree (verification-only step) is a legitimate completion —
+            # marker-commit and push it; any other commit failure is a real
+            # failure and the worktree stays preserved for the next round.
+            if not ok_commit:
+                if "nothing to commit" in commit_out.lower() or "working tree clean" in commit_out.lower():
+                    log_exec(f"    [ds_verify] step {step_idx} passed verification with NO file changes — empty-diff marker commit.")
+                    run_isolated_shell_command(
+                        f'git commit --allow-empty -m "[STEP {step_idx}/{total_steps}] (DeepSeek Expert) '
+                        f'{step["objective"][:60]} (verification passed, no file changes)"', timeout=15)
+                else:
+                    log_exec(f"    [ds_verify] git commit FAILED: {commit_out[:200]}")
+                    return False, "DeepSeek Expert commit failed: " + commit_out[:200]
             for push_attempt in range(3):
                 ok_push, push_out = run_isolated_shell_command("git push origin HEAD", timeout=120)
                 if ok_push:
@@ -945,8 +977,8 @@ CRITICAL REQUIREMENTS:
                 await asyncio.sleep(2)
             return True, "DeepSeek Expert solved step"
         else:
-            execute_rollback(step["rollback_command"], target_files)
-            return False, "DeepSeek Expert verification failed"
+            return False, ("DeepSeek Expert verification failed"
+                           + _preserved_worktree_snippet(target_files))
     except Exception as err:
         return False, f"DeepSeek Expert parse error: {err}"
 
@@ -991,6 +1023,22 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
                 else:
                     body = await resp.text()
                     log_exec(f"    [WEBCHAT] gateway HTTP {resp.status}: {body[:120]}")
+        except asyncio.TimeoutError:
+            # 08-20 (audit BUG-07): str(asyncio.TimeoutError()) == "" — the old
+            # generic except logged a blank line and silently abandoned the
+            # request while the gateway kept generating (conversation desync).
+            # Log the real story; the deepseek send mutex keeps the retry from
+            # colliding with the still-running tab.
+            log_exec(f"    [WEBCHAT] attempt {attempt+1} TIMED OUT after {WEBCHAT_TIMEOUT}s — "
+                     f"gateway still generating (its reply will land in the thread; retrying now).")
+        except aiohttp.ServerDisconnectedError:
+            # 08-20 (audit BUG-13, observed live on step 813): the lane
+            # restarted mid-request — transient, back off and retry the same
+            # payload (the tab survives the gateway restart).
+            log_exec(f"    [WEBCHAT] attempt {attempt+1} server disconnected (lane restarted mid-request) — "
+                     f"backing off {8 * (attempt + 1)}s before retry.")
+            await asyncio.sleep(8 * (attempt + 1))
+            continue
         except Exception as e:
             log_exec(f"    [WEBCHAT] call attempt {attempt+1} error ({type(e).__name__}): {e}")
         await asyncio.sleep(2)
@@ -1147,6 +1195,20 @@ Reply with a short plain-text summary (plus the plan_edit JSON block if the step
         all_verifications_ok = False
         fail_detail = "No verification commands parsed for this step — refusing an unverified pass."
         log_exec("    [webchat_verify] NO verification commands parsed — HARD-FAIL (unverified pass refused)")
+    # 08-20 (audit perf): speculative py_compile fast-fail — if the step's
+    # verification includes py_compile on .py files, gate on it FIRST: a
+    # syntax error costs ~0.1s to catch instead of a full pytest run (the
+    # old order ran the whole suite and failed at the end).
+    py_targets = [tf for tf in (edit_target_files or target_files) if tf.endswith(".py")]
+    if py_targets and any("py_compile" in c for c in edit_ver_cmds):
+        ok_pc, pc_out = run_isolated_shell_command(
+            "python3 -m py_compile " + " ".join(shlex.quote(t) for t in py_targets),
+            env_id=f"wc_step_{step_idx}_pycompile", timeout=30)
+        if not ok_pc:
+            all_verifications_ok = False
+            fail_detail = (f"py_compile fast-fail: syntax error in {', '.join(py_targets)}:\n"
+                           + _feedback_snippet(pc_out))
+            log_exec(f"    [webchat_verify] py_compile FAST-FAIL on {py_targets}: {pc_out[:200]}")
     for i, vcmd in enumerate(edit_ver_cmds, 1):
         if "py_compile" in vcmd and any(ext in vcmd for ext in [".dart", ".js", ".ts", ".json", ".html", ".sh", ".yaml", ".yml", ".d", ".md"]):
             continue
@@ -1219,10 +1281,10 @@ Reply with a short plain-text summary (plus the plan_edit JSON block if the step
                     continue
                 if new_lines < 0.4 * old_lines:
                     log_exec(f"    [webchat_verify] SUSPECT SHRINK {tf}: {old_lines}->{new_lines} lines — wholesale replacement")
-                    execute_rollback(step["rollback_command"], target_files)
                     return False, (f"Webchat step verification failed (destructive shrink): {tf} shrank "
                                    f"{old_lines}->{new_lines} lines. Extend the existing file instead of "
-                                   f"replacing it (the step's instructions say so).")
+                                   f"replacing it (the step's instructions say so)."
+                                   + _preserved_worktree_snippet(target_files))
         # 08-20 (step 808): git add/commit return codes were UNCHECKED — a
         # failing pathspec or "nothing to commit" still returned success, so
         # steps phantom-completed with NO commit. A step is only complete when
@@ -1231,22 +1293,36 @@ Reply with a short plain-text summary (plus the plan_edit JSON block if the step
             "git add -- " + " ".join(add_paths) if add_paths else "git status", timeout=15)
         if not ok_add:
             log_exec(f"    [webchat_verify] git add FAILED: {add_out[:200]}")
-            execute_rollback(step["rollback_command"], target_files)
             return False, f"Webchat step verification failed (git add): {add_out[:200]}"
         c_msg = f"[STEP {step_idx}/{total_steps}] (Webchat Expert) {step['objective'][:70]}"
         ok_c, c_out = run_isolated_shell_command(f'git commit -m "{c_msg}"', timeout=15)
         if not ok_c:
-            log_exec(f"    [webchat_verify] git commit FAILED: {c_out[:200]}")
-            execute_rollback(step["rollback_command"], target_files)
-            return False, f"Webchat step verification failed (git commit): {c_out[:200]}"
+            if "nothing to commit" in c_out.lower() or "working tree clean" in c_out.lower():
+                # 08-20 (audit BUG-11): verification-only step — verification
+                # passed but produced NO file changes. That is a legitimate
+                # completion (audit/docs steps), not a commit failure. Leave a
+                # marker commit so the step is visible in history, then succeed.
+                log_exec(f"    [webchat_verify] step {step_idx} passed verification with NO file changes "
+                         f"(verification-only step) — committing an empty-diff marker.")
+                run_isolated_shell_command(
+                    f'git commit --allow-empty -m "[STEP {step_idx}/{total_steps}] (Webchat Expert) '
+                    f'{step["objective"][:60]} (verification passed, no file changes)"', timeout=15)
+            else:
+                log_exec(f"    [webchat_verify] git commit FAILED: {c_out[:200]}")
+                return False, (f"Webchat step verification failed (git commit): {c_out[:200]}"
+                               + _preserved_worktree_snippet(target_files))
         for push_attempt in range(3):
             ok_push, _ = run_isolated_shell_command("git push origin HEAD", timeout=120)
             if ok_push:
                 break
             await asyncio.sleep(2)
         return True, f"Webchat solved step: {resp[:200]}"
-    execute_rollback(step["rollback_command"], target_files)
-    return False, "Webchat step verification failed:\n" + fail_detail
+    # 08-20 (audit CRIT-01/BUG-02): NO destructive rollback between rounds —
+    # preserve the worktree and hand the next round the diff to patch in
+    # place. Only the HALT site (round-loop exhaustion) resets the tree.
+    wtree = _preserved_worktree_snippet(target_files)
+    return False, ("Webchat step verification failed:\n" + fail_detail +
+                   (wtree if wtree else "\n(worktree is clean — no changes were made this round)"))
 
 
 # ─── PLAN-STEP EDITING (fix a flawed step, never weaken it) ─────────────────
@@ -1286,10 +1362,41 @@ def _extract_step_block(plan_path: str, step_idx: int) -> str:
     return m.group(0) if m else ""
 
 
+def _resolve_old_text_in_block(block: str, old_text: str) -> str:
+    """Return the actual old_text span that exists in block, tolerating
+    whitespace drift (trailing spaces / indentation) between the webchat's
+    proposal and the plan file. Returns '' when no line-wise match exists.
+
+    08-20 (step 2/3/813/815 HALT): the webchat types old_text from memory;
+    exact-substring matching rejected EVERY surgical edit, so steps that
+    needed a plan fix could never get one (expert exhausted 6 rounds and
+    the pipeline HALTed). Line-wise stripped matching accepts the same
+    content with different whitespace; the returned span is the block's
+    REAL text, so replacement still edits the actual file bytes.
+    """
+    if old_text in block:
+        return old_text
+    old_lines = old_text.splitlines()
+    block_lines = block.splitlines()
+    if not old_lines:
+        return ""
+    for i, bl in enumerate(block_lines):
+        if bl.strip() != old_lines[0].strip():
+            continue
+        if i + len(old_lines) > len(block_lines):
+            continue
+        if all(o.strip() == b.strip() for o, b in zip(old_lines, block_lines[i:i + len(old_lines)])):
+            return "\n".join(block_lines[i:i + len(old_lines)])
+    return ""
+
+
 def _validate_step_edit(block: str, old_text: str, new_text: str, step_idx: int) -> "str | None":
     """Return an error string if the proposed plan edit violates guardrails, else None."""
     if old_text not in block:
-        return "old_text is not an exact substring of the step block"
+        resolved = _resolve_old_text_in_block(block, old_text)
+        if not resolved:
+            return "old_text is not an exact substring of the step block"
+        old_text = resolved
     old_lines = old_text.splitlines()
     new_lines = new_text.splitlines()
     old_head = old_lines[0].strip() if old_lines else ""
@@ -1352,6 +1459,13 @@ def _apply_step_edit(plan_path: str, block: str, old_text: str, new_text: str,
     except Exception:
         pass
     region = full[start_idx:start_idx + len(block)]
+    # 08-20: mirror the guard's whitespace-tolerant resolution so a
+    # validated-but-whitespace-drifted edit actually applies to the file.
+    if old_text not in region:
+        resolved = _resolve_old_text_in_block(region, old_text)
+        if not resolved:
+            return False, "old_text not found in step block"
+        old_text = resolved
     new_region = region.replace(old_text, new_text, 1)
     if new_region == region:
         return False, "plan-edit applied nothing"
@@ -1597,9 +1711,24 @@ def _git_add_paths(target_files: list[str]) -> list[str]:
     return valid
 
 
-def execute_rollback(rollback_cmd: str, target_files: list[str]) -> bool:
-    """Safely execute step rollback command and git checkout fallback."""
-    log_exec(f"  [ROLLBACK] Executing: {rollback_cmd}")
+def execute_rollback(rollback_cmd: str, target_files: list[str], hard: bool = False) -> bool:
+    """Rollback after a failed step.
+
+    08-20 (audit CRIT-01/BUG-02): the old between-round rollback was
+    DESTRUCTIVE — `git checkout -- {tf}` + `git clean -fd {tf}` for EVERY
+    target file wiped the previous round's partial progress, so multi-file
+    steps degenerated into N isolated one-shot attempts (files created in
+    round 1 were gone before round 2's feedback even arrived). The worktree
+    is now PRESERVED between rounds (soft rollback, the default): the round's
+    changes stay on disk, the failure feedback carries the uncommitted diff,
+    and the next round patches the specific defect. The destructive reset
+    runs ONLY at HALT (hard=True), when the step is being abandoned so the
+    main session restarts from a clean tree.
+    """
+    if not hard:
+        log_exec("  [ROLLBACK] soft — worktree PRESERVED for the next round (audit CRIT-01 fix); no checkout/clean")
+        return True
+    log_exec(f"  [ROLLBACK] HARD reset to step-start state: {rollback_cmd}")
     ok, out = run_isolated_shell_command(rollback_cmd, env_id="rollback")
     if not ok:
         log_exec(f"  [ROLLBACK] Primary rollback failed ({out}), applying git checkout fallback...")
@@ -1607,6 +1736,35 @@ def execute_rollback(rollback_cmd: str, target_files: list[str]) -> bool:
             run_isolated_shell_command(f"git checkout -- {tf}", env_id="rollback")
             run_isolated_shell_command(f"git clean -fd {tf}", env_id="rollback")
     return True
+
+
+def _preserved_worktree_snippet(target_files: list[str], limit: int = 2000) -> str:
+    """Uncommitted-diff feedback for the next round (audit BUG-02).
+
+    Tells the next webchat round exactly what the previous round changed so
+    it can patch the specific defect instead of recreating files from
+    scratch. Empty when the worktree is clean. Capped for prompt size.
+    """
+    try:
+        st = run_isolated_shell_command("git status --porcelain", env_id="preserve", timeout=10)
+        if not st[1].strip():
+            return ""
+        stat = run_isolated_shell_command(
+            "git diff --stat -- " + " ".join(shlex.quote(t) for t in target_files),
+            env_id="preserve", timeout=10)
+        diff = run_isolated_shell_command(
+            "git diff -- " + " ".join(shlex.quote(t) for t in target_files),
+            env_id="preserve", timeout=15)
+        parts = ["Changed files:\n" + st[1].strip()[:1000]]
+        if stat[1].strip():
+            parts.append("Diff stat:\n" + stat[1].strip()[:1000])
+        if diff[1].strip():
+            parts.append("Uncommitted diff (tail):\n" + diff[1].strip()[-limit:])
+        return ("\n\nWORKTREE STATE (your previous round's changes are PRESERVED — "
+                "patch the specific defect in place; do NOT recreate files from scratch):\n"
+                + "\n\n".join(parts))
+    except Exception:
+        return ""
 
 
 # ─── 5-SUBAGENT TEAM WORKFLOW FOR A SINGLE STEP ─────────────────────────────
@@ -1863,7 +2021,12 @@ async def run_final_deepseek_verification(session: aiohttp.ClientSession, steps:
     verified_results = []
     # 2026-08-07: per-step checkpoint — a crash/reboot mid-audit resumes instead
     # of re-running all steps. Loaded on start, appended per step, skips seen.
-    SWEEP_CKPT = os.path.join(AUDITS_PLANS_DIR, "sweep_checkpoint.jsonl")
+    # 2026-08-20: plan-scoped checkpoint — the helpotron lane's phase-2 audit
+    # wrote step_index 1/6/11 into the shared sweep_checkpoint.jsonl, which the
+    # oculus lane would later load as its OWN steps 1/6/11 (skipped + wrong
+    # results). Key by plan file so lanes never collide.
+    _plan_base = os.path.basename(MASTER_PLAN_FILE).replace('.md', '')
+    SWEEP_CKPT = os.path.join(AUDITS_PLANS_DIR, f"sweep_checkpoint_{_plan_base}.jsonl")
     ckpt_seen = set()
     if os.path.exists(SWEEP_CKPT):
         try:
@@ -2118,10 +2281,18 @@ def load_execution_state() -> dict:
 
 
 def save_execution_state(state: dict):
+    # 08-20 (audit CRIT-04/BUG-05): tmp+os.replace is atomic already, but the
+    # write itself was unflushed and unlocked — an fsync + flock on the temp
+    # write guarantees the rename only ever publishes a COMPLETE, durable file
+    # (no zero-byte/truncated state on crash or concurrent writers).
     tmp = EXECUTION_STATE_FILE + ".tmp"
     try:
         with open(tmp, "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
             json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+            fcntl.flock(f, fcntl.LOCK_UN)
         os.replace(tmp, EXECUTION_STATE_FILE)
     except Exception as e:
         log_exec(f"[state] Error saving state: {e}")
@@ -2138,6 +2309,19 @@ async def main():
     parser.add_argument("--no-precheck", action="store_true",
                         help="Disable step_already_verified precheck; run every pending step for real")
     args = parser.parse_args()
+
+    # 08-20 (audit CRIT-04/BUG-05): one executor per state file — a second
+    # concurrent instance would overwrite each other's checkpoints. flock is
+    # advisory but enforced at startup (the supervisor's spawn lock covers
+    # respawns; this guards manual double-starts / misconfigured lanes).
+    try:
+        _state_lock_path = EXECUTION_STATE_FILE + ".lock"
+        _state_lock_f = open(_state_lock_path, "w")
+        fcntl.flock(_state_lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        print(f"[FATAL] Another executor already holds {EXECUTION_STATE_FILE}.lock — "
+              f"refusing to start twice on the same state file.", flush=True)
+        sys.exit(1)
 
     global CONTINUE_ON_FAILURE
     if args.continue_on_failure:
@@ -2385,6 +2569,13 @@ async def main():
                             log_exec(f"[CALLS-MAIN] failed to write webchat inbox: {e}")
                         log_exec(f"[HALT] Step {s_idx} failed after the webchat expert exhausted its rounds. "
                                  f"Main session notified via webchat inbox. A step is never skipped.")
+                        # 08-20 (audit CRIT-01): the ONLY place the destructive
+                        # reset runs — the step is abandoned to the main session,
+                        # so restore the step-start tree for a clean handoff.
+                        # (target_files must come from the step dict here — the
+                        # per-round target_files variable is out of scope in main;
+                        # the 08-20 NameError crash fixed.)
+                        execute_rollback(step["rollback_command"], step.get("target_files") or [], hard=True)
                         sys.exit(2)
 
 
