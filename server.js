@@ -846,7 +846,10 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
     let formatErrorRounds = 0; // consecutive non-tool plain-text replies (always-tool mode)
     let narrationNudged = false; // strict mode: send_message narration taught once per request
+    let narrationLoopRounds = 0; // 08-19: consecutive send_message-only rounds (narration loop guard)
     let emptyAnswerNudged = false; // 08-16: empty submit_answer retried once before the placeholder
+    let workCallsMade = 0;      // 08-19: real (non-send_message/non-submit) tool calls executed
+    let noWorkNudged = false;   // 08-19: submit-without-work rejected once, then accepted
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
 
     for (let round = 0; round < config.maxToolRounds; round++) {
@@ -884,6 +887,10 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             formatErrorRounds = 0;
             proseRounds = 0;
             const call = parsed.toolCalls[0];
+            // 08-19 (user): a real work tool call breaks the narration loop.
+            if (call.toolName !== 'send_message' && call.toolName !== SUBMIT_TOOL) {
+                narrationLoopRounds = 0;
+            }
             // The model's intent message rides ahead of the tool call — the
             // client sees "what I'm about to do" before the 🔧 line.
             if (parsed.prose) {
@@ -918,6 +925,19 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // Accepted unconditionally: ends the tool loop and delivers the final answer.
             const isSubmit = call.toolName === SUBMIT_TOOL || call.toolName === 'submit_message' || call.toolName === 'task_complete' || call.toolName === 'done';
             if (isSubmit) {
+                // 08-19 (user): strict mode = tool-calling machine. A final
+                // answer with ZERO work tool calls means the model yapped out
+                // instead of acting (observed: gemini answered "the tool
+                // definitions do not match" without touching read_file).
+                // Reject once and order it to work; then accept whatever
+                // comes next so a stubborn model can't loop forever.
+                if (!config.allowPlainText && workCallsMade === 0 && !noWorkNudged) {
+                    noWorkNudged = true;
+                    console.log('⚠️ submit_answer with no work tool call — ordering a work call first');
+                    onProgress?.({ type: 'rejected', text: 'final answer submitted without performing any tool call' });
+                    response = await countedSend(NO_WORK_MSG, toolDefs);
+                    continue;
+                }
                 const answer = cleanWebchatText(call.args?.text ?? call.args?.message ?? call.args?.content ?? call.args?.summary ?? '');
                 const final = answer || extractSubmitText(response);
                 // 08-16 EMPTY-ANSWER FIX: an empty submit was surfaced verbatim; nudge once for real answer
@@ -940,10 +960,25 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // progress event (rendered "💬 <text>") instead of running a tool.
             let result;
             if (call.toolName === 'send_message') {
+                // 08-19 (user): narration-loop guard — consecutive
+                // send_message-only rounds mean the model acknowledges but
+                // never acts. Block send_message after 3; abort after 6.
+                narrationLoopRounds += 1;
+                if (narrationLoopRounds >= 6) {
+                    console.log(`⚠️ narration loop — aborting request after ${narrationLoopRounds} consecutive send_message calls`);
+                    onProgress?.({ type: 'rejected', text: 'model stuck in narration loop — no work tool call after 6 send_message rounds' });
+                    return null;
+                }
+                if (narrationLoopRounds >= 3) {
+                    console.log(`⚠️ narration loop guard (${narrationLoopRounds} consecutive send_message) — blocking send_message`);
+                    response = await countedSend(NARRATION_LOOP_MSG, toolDefs);
+                    continue;
+                }
                 const text = String(call.args?.text ?? '');
                 if (text) onProgress?.({ type: 'text', text });
                 result = { success: true, delivered: true, instruction: 'Message delivered to user. Now proceed with your work tool call (read_file, run_bash, etc.) or deliver final answer via submit_answer.' };
             } else {
+                workCallsMade += 1; // 08-19: count for the no-work-submit gate below
                 result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
             }
             // 08-16 (user): stream a readable receipt to the client — the exact
@@ -1127,6 +1162,27 @@ const NARRATION_MSG =
     'send_message first: one short 💬 line with what you are thinking and what the tool call you are about ' +
     'to make does and why (delivered to the user verbatim). Reply NOW with that send_message call. ' +
     'Then continue with your work tool call as usual.';
+
+// 08-19 (user: "make everything a tool call... so it gets into the habit of
+// using tool calls"): the model ACKNOWLEDGES via send_message but never
+// follows up with a work tool call — the harness burned all 40 rounds on
+// narration. Guard: after 3 consecutive send_message-only rounds, send_message
+// is blocked for the rest of the request; a 6th consecutive one aborts.
+const NARRATION_LOOP_MSG =
+    '### NARRATION-LOOP GUARD (hard, user rule 08-19)\n' +
+    'You have sent several consecutive send_message calls WITHOUT doing any work. That is a loop, not ' +
+    'a task. send_message is now BLOCKED for the rest of this request — your next reply MUST be a ' +
+    'work tool call (read_file, run_bash, write_file, or another tool from the list) that ACTUALLY ' +
+    'performs the task, or a fenced submit_answer if the task is genuinely complete. ' +
+    'No send_message. No acknowledgement. DO THE WORK.';
+
+const NO_WORK_MSG =
+    '### NO WORK DONE (hard, user rule 08-19)\n' +
+    'Your final answer was submitted WITHOUT performing a single tool call. This is a tool-calling ' +
+    'harness — you act through tools, you do not talk about acting. Perform at least ONE real work ' +
+    'tool call (read_file, run_bash, write_file, etc.) that carries the task forward, then submit ' +
+    'the ACTUAL result via submit_answer. If a tool failed, call it correctly — do not summarize ' +
+    'your inability to call it.';
 
 const EMPTY_ANSWER_MSG =
     '### EMPTY ANSWER (08-16)\n' +
