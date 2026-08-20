@@ -225,6 +225,10 @@ ALLOWED_COMMANDS = {
     "grep", "cat", "test", "[", "ls", "head", "tail", "wc", "find",
     "diff", "stat", "cut", "tr", "sort", "uniq", "basename", "dirname",
     "date", "file", "sed", "awk", "printf", "readlink",
+    # 08-20: lint/type-check verification tools used by the master plan
+    # (parser normalizes mypy --strict -> --follow-imports=skip). mypy/ruff/black
+    # inspect source, they do not execute it; same trust class as pytest/grep.
+    "mypy", "ruff", "black",
 }
 
 class PlanNotApprovedError(Exception):
