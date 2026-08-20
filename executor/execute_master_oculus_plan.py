@@ -533,6 +533,12 @@ def parse_master_plan(plan_path: str) -> list[dict]:
         target_files = []
         if tf_match:
             target_files = [line.strip().lstrip('-').strip() for line in tf_match.group(1).splitlines() if line.strip()]
+        if not target_files:
+            # 08-20 (webchat expert rewrites): compact "Files: ['a.py', 'b.py']"
+            # list form — keep rollback/commit targets populated.
+            tf_list = re.search(r'Files:\s*\[(.*?)\]', block)
+            if tf_list:
+                target_files = [p.strip().strip("'\"") for p in tf_list.group(1).split(',') if p.strip()]
 
         deps = re.search(r'\*\*DEPENDENCIES:\*\*\s*\[(.*?)\]', block)
         line_ranges = re.search(r'\*\*LINE_RANGES:\*\*\s*\[(.*?)\]', block)
@@ -540,7 +546,11 @@ def parse_master_plan(plan_path: str) -> list[dict]:
         ops_match = re.search(r'\*\*CODE_OPERATIONS:\*\*\n(.*?)(?=\n\*\*VERIFICATION:\*\*|\Z)', block, re.DOTALL)
         code_ops_text = ops_match.group(1).strip() if ops_match else ""
 
-        ver_match = re.search(r'\*\*VERIFICATION:\*\*\n(.*?)(?=\n\*\*COMMIT_MESSAGE:\*\*|\Z)', block, re.DOTALL)
+        # 08-20 (step 833/834/835): the webchat expert's own plan rewrites use
+        # a compact label ("VERIFICATION COMMANDS THAT MUST ALL PASS:") and bare
+        # "COMMIT_MESSAGE:" — recognize both so its blocks parse like the
+        # canonical **VERIFICATION:** format instead of hard-failing rounds.
+        ver_match = re.search(r'(?:\*\*VERIFICATION:\*\*|VERIFICATION COMMANDS THAT MUST ALL PASS:)\n(.*?)(?=\n(?:\*\*COMMIT_MESSAGE:\*\*|COMMIT_MESSAGE:)|\Z)', block, re.DOTALL)
         ver_commands = []
         if ver_match:
             ver_text = ver_match.group(1)
@@ -582,9 +592,9 @@ def parse_master_plan(plan_path: str) -> list[dict]:
                             ver_commands.append(cmd)
 
 
-        cm = re.search(r'\*\*COMMIT_MESSAGE:\*\*\s*"(.*?)"', block)
-        rb = re.search(r'\*\*ROLLBACK_COMMAND:\*\*\s*(.+)', block)
-        notes = re.search(r'\*\*NOTES:\*\*\s*(.+)', block)
+        cm = re.search(r'(?:\*\*COMMIT_MESSAGE:\*\*|COMMIT_MESSAGE:)\s*"(.*?)"', block)
+        rb = re.search(r'(?:\*\*ROLLBACK_COMMAND:\*\*|ROLLBACK_COMMAND:)\s*(.+)', block)
+        notes = re.search(r'(?:\*\*NOTES:\*\*|NOTES:)\s*(.+)', block)
 
         step_obj = {
             "step_index": step_idx,
@@ -757,7 +767,13 @@ async def call_official_deepseek(session: aiohttp.ClientSession,
         except Exception as e:
             log_exec(f"    [{role_name}] claude subprocess error: {e}; falling back to DeepSeek.")
 
-    model = DEEPSEEK_MODEL_PRO if use_pro else DEEPSEEK_MODEL_FLASH
+    # 2026-08-20 (user directive, enforced): NEVER call the paid API with the
+    # pro model. use_pro callers (plan-fix, pro tiers) are silently downgraded
+    # to flash — this is a hard gate, not a preference. Pro-on-paid burned
+    # $19.43 on 08-19 and the rule is "v4 flash only, always".
+    model = DEEPSEEK_MODEL_FLASH
+    if use_pro:
+        log_exec(f"    [PRO-GUARD] use_pro={use_pro} requested by {role_name} — downgraded to {DEEPSEEK_MODEL_FLASH} (paid API is flash-only)")
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -957,7 +973,7 @@ CRITICAL REQUIREMENTS:
                 continue
             ok, vout = run_isolated_shell_command(vcmd, env_id=f"ds_step_{step_idx}_chk_{i}")
             if not ok:
-                if "grep" in vcmd and not vout:
+                if ("git grep" in vcmd or "git ls-files" in vcmd) and not vout:
                     pass
                 elif "SyntaxError" in vout:
                     pass
@@ -978,7 +994,9 @@ CRITICAL REQUIREMENTS:
             # marker-commit and push it; any other commit failure is a real
             # failure and the worktree stays preserved for the next round.
             if not ok_commit:
-                if "nothing to commit" in commit_out.lower() or "working tree clean" in commit_out.lower():
+                if ("nothing to commit" in commit_out.lower() or "working tree clean" in commit_out.lower()
+                        or "changes not staged" in commit_out.lower()
+                        or "nothing added to commit" in commit_out.lower()):
                     log_exec(f"    [ds_verify] step {step_idx} passed verification with NO file changes — empty-diff marker commit.")
                     run_isolated_shell_command(
                         f'git commit --allow-empty -m "[STEP {step_idx}/{total_steps}] (DeepSeek Expert) '
@@ -1230,7 +1248,7 @@ Reply with a short plain-text summary (plus the plan_edit JSON block if the step
             continue
         ok, vout = run_isolated_shell_command(vcmd, env_id=f"wc_step_{step_idx}_chk_{i}")
         if not ok:
-            if "grep" in vcmd and not vout:
+            if ("git grep" in vcmd or "git ls-files" in vcmd) and not vout:
                 continue
             # 08-20 (helpotron false-pass postmortem): "SyntaxError" and
             # "Security Violation" were previously treated as benign, which let
@@ -1313,7 +1331,9 @@ Reply with a short plain-text summary (plus the plan_edit JSON block if the step
         c_msg = f"[STEP {step_idx}/{total_steps}] (Webchat Expert) {step['objective'][:70]}"
         ok_c, c_out = run_isolated_shell_command(f'git commit -m "{c_msg}"', timeout=15)
         if not ok_c:
-            if "nothing to commit" in c_out.lower() or "working tree clean" in c_out.lower():
+            if ("nothing to commit" in c_out.lower() or "working tree clean" in c_out.lower()
+                    or "changes not staged" in c_out.lower()
+                    or "nothing added to commit" in c_out.lower()):
                 # 08-20 (audit BUG-11): verification-only step — verification
                 # passed but produced NO file changes. That is a legitimate
                 # completion (audit/docs steps), not a commit failure. Leave a
@@ -1558,7 +1578,7 @@ STRICT GUIDELINES — violating ANY is rejected:
     resp = ""
     for attempt in range(3):
         resp = await call_official_deepseek(session, usr_prompt, sys_prompt,
-                                            use_pro=True, role_name="DEEPSEEK_PRO")
+                                            use_pro=False, role_name="DEEPSEEK_FLASH")  # pro-guard 08-20: flash only
         if resp and not resp.startswith("ERROR:"):
             break
         await asyncio.sleep(2)
@@ -2006,7 +2026,13 @@ Rules:
         "outside repository",  # git pathspec escaping the work tree — plan-verification path bug, not an impl failure
         "no tests ran", "Unauthorized emergency liquidation", "Emergency liquidation triggered",
         "PermissionError", "Security Violation", "EmergencyCloseService",
-        "Traceback (most recent call last)", "SKIPPED", "skipped", "could not import",
+        # NOTE 2026-08-20: "Traceback (most recent call last)" was REMOVED from
+        # this list — it is the blanket catch-all that swallowed every python -c
+        # "assert ..." failure as a DIAGNOSTIC NOTE (phantom-pass, e.g. STEP 848:
+        # `assert not Path('oculus/portfolio.py').exists()` threw AssertionError
+        # with the file present and the step was declared PASSED). Specific
+        # tolerated noise patterns above remain; generic tracebacks now FAIL.
+        "SKIPPED", "skipped", "could not import",
         "library stubs not installed", "import-untyped", "cannot find implementation or library stub",
         "import-not-found", "flutter: not found", "command not found", "not found",
     "Invalid decimal literal",  # mypy invoked on a .dart file (mypy parses Python) — skip like other Dart steps
@@ -2020,7 +2046,12 @@ Rules:
 
         ok, vout = run_isolated_shell_command(vcmd, env_id=f"step_{step_idx}_chk_{i}")
         if not ok:
-            if "grep" in vcmd and not vout:
+            if "AssertionError" in vout or "assert " in vcmd and "AssertionError" in vout:
+                # 2026-08-20: an assertion failure is the check doing its job —
+                # never swallow it. (STEP 848 phantom-pass root cause.)
+                all_verifications_ok = False
+                log_exec(f"    Plan Check #{i}: `{vcmd[:60]}` -> FAIL (assertion failed): {vout[:150]}")
+            elif ("git grep" in vcmd or "git ls-files" in vcmd) and not vout:
                 log_exec(f"    Plan Check #{i}: `{vcmd[:60]}` -> DIAGNOSTIC NOTE (Empty grep output indicates zero errors)")
             elif "SyntaxError" in vout:
                 log_exec(f"    Plan Check #{i}: `{vcmd[:60]}` -> DIAGNOSTIC NOTE (Syntax note): {vout[:150]}")
@@ -2267,7 +2298,7 @@ def step_already_verified(step: dict) -> bool:
             continue
         ok, vout = run_isolated_shell_command(vcmd, env_id=f"precheck_{step.get('step_index')}_{i}")
         if not ok:
-            if "grep" in vcmd and not vout:
+            if ("git grep" in vcmd or "git ls-files" in vcmd) and not vout:
                 continue
             # 08-20: SyntaxError / Security Violation are REAL failures (see the
             # webchat_verify note) — a broken or whitelist-rejected verification
@@ -2588,9 +2619,11 @@ async def main():
                 ds_ok = wc_ok
                 ds_msg = wc_msg
                 for tier in ESCAPE_TIERS:
-                    use_pro = tier["model"] == DEEPSEEK_MODEL_PRO
-                    tier_label = "DEEPSEEK_PRO" if use_pro else "DEEPSEEK_FLASH"
-                    tier_name = "DeepSeek V4 Pro" if use_pro else "DeepSeek V4 Flash"
+                    # pro-guard 08-20 (user directive): paid API is flash-only;
+                    # pro tiers are remapped to flash instead of burning $.
+                    use_pro = False
+                    tier_label = "DEEPSEEK_FLASH"
+                    tier_name = "DeepSeek V4 Flash"
                     tier_retries = tier["attempts"]
                     log_exec(f"[ESCALATION] {tier_name} taking over Step {s_idx} (up to {tier_retries} attempts)...")
                     for t_attempt in range(1, tier_retries + 1):
