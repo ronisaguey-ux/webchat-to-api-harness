@@ -1612,14 +1612,21 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
     # mandatory on the shell=True path. Tightening further rejected the
     # plan's own `python3 -c "...; ..."` checks, so step 808 could never
     # verify (a step is never skipped).
-    use_shell = any(op in cmd for op in ["|", ">", "&&"])
-    if use_shell and not is_safe_command(cmd):
-        return False, f"Security Violation: Command '{cmd}' failed whitelist validation."
-
     try:
         args = shlex.split(cmd)
     except Exception as e:
         return False, f"Security Violation: Command parsing error: {e}"
+
+    # 08-20 (step 828): operator detection on TOKENS, not the raw string.
+    # A metachar INSIDE a quoted grep pattern ("git checkout -- <file>")
+    # is inert under shell=False (argv exec — no redirection/globbing),
+    # so it must not route the command to the shell path. Only a standalone
+    # token that IS a shell operator (unquoted `|`, `>`, `&&`, `;` ...)
+    # reaches shell=True, where is_safe_command's strict rejection stays.
+    _SHELL_OPS = ("|", ">", "<", "&&", "||", ";", "&", "$", "`")
+    use_shell = any(a in _SHELL_OPS for a in args)
+    if use_shell and not is_safe_command(cmd):
+        return False, f"Security Violation: Command '{cmd}' failed whitelist validation."
 
     if not args or args[0].lstrip("./") not in ALLOWED_COMMANDS:
         return False, f"Security Violation: '{args[0] if args else cmd}' not allowed."
@@ -1651,7 +1658,8 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
         env["OCULUS_ALLOW_EXTERNAL"] = "1"
         env["PYTHONPATH"] = os.path.dirname(PIPELINE_WORK_DIR) + ":" + PIPELINE_WORK_DIR + ":" + env.get("PYTHONPATH", "")
 
-        use_shell = any(op in cmd for op in ["|", ">", "&&"])
+        # use_shell computed above from shlex TOKENS (step 828) — quoted
+        # metachars in patterns stay on the shell=False path.
         # Stream stdout to a file on disk instead of buffering it in RAM.
         # This bounds per-command memory to the small diagnostic tail read below,
         # preventing pytest/mypy firehoses from blowing the process heap (OOM).
