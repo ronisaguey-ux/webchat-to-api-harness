@@ -1041,6 +1041,13 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             } else {
                 workCallsMade += 1; // 08-19: count for the no-work-submit gate below
                 result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
+                // 08-19 DIAG: log the tool result content the model will see
+                // (head + tail) — the gemini lane once looped re-reading the
+                // same file instead of executing, and this reveals whether the
+                // result actually carried the content the model needed.
+                const rs = JSON.stringify(result ?? null);
+                console.log(`  ↳ result[${rs.length}] head: ${rs.slice(0, 400).replace(/\n/g, '\\n')}`);
+                if (rs.length > 800) console.log(`  ↳ result[${rs.length}] tail: ${rs.slice(-300).replace(/\n/g, '\\n')}`);
             }
             // 08-16 (user): stream a readable receipt to the client — the exact
             // command / file / output, not a bare "🔧 toolname" — so anyone
