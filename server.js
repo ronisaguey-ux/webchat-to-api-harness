@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const express = require('express');
 const cors = require('cors');
@@ -520,9 +521,17 @@ async function proxyTo(req, res, upstreamBase, path, body) {
 }
 
 // ── Optional bearer-token auth (recommended when exposing beyond localhost) ──
+// 08-20 (audit BUG-14): `!==` string comparison short-circuits on the first
+// mismatched byte — a timing side channel for token guessing on a shared host.
+// timingSafeEqual runs in constant time (length mismatch returns early; the
+// 401 path leaks only the length, which the scheme already exposes).
 if (config.apiToken) {
+    const expectedAuth = Buffer.from(`Bearer ${config.apiToken}`);
     app.use((req, res, next) => {
-        if (req.headers.authorization !== `Bearer ${config.apiToken}`) {
+        const provided = req.headers.authorization;
+        const providedBuf = typeof provided === 'string' ? Buffer.from(provided) : null;
+        const ok = providedBuf && providedBuf.length === expectedAuth.length && crypto.timingSafeEqual(providedBuf, expectedAuth);
+        if (!ok) {
             return res.status(401).json({ error: 'unauthorized' });
         }
         next();
@@ -1004,6 +1013,35 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 onProgress?.({ type: 'text', text: autoNarration });
             }
 
+            // 08-20 (audit BUG-15): MULTI-CALL BATCH. The model may emit
+            // several tool calls in one message (read a.py, b.py, c.py
+            // before editing). Previously only toolCalls[0] ran and the rest
+            // were silently dropped — the model re-issued them next turn:
+            // 3 round trips at 30-90s each for what one batch answers.
+            // Execute ALL work calls (sequential — local tools are fast and
+            // write_file/run_bash pairs must not race; the saving is the
+            // round trip, not the tools), then send ONE follow-up with every
+            // receipt. send_message is narration, submits end the turn —
+            // both keep the single-call flow below.
+            const _submitNames = [SUBMIT_TOOL, 'submit_message', 'task_complete', 'done'];
+            const batchCalls = parsed.toolCalls.filter((c) => c.toolName !== 'send_message' && !_submitNames.includes(c.toolName));
+            if (batchCalls.length > 1) {
+                const receipts = [];
+                for (const bc of batchCalls) {
+                    malformedRounds = 0; formatErrorRounds = 0; proseRounds = 0;
+                    narrationLoopRounds = 0; // work happened — clear the narration-loop guard
+                    onProgress?.({ type: 'tool', name: bc.toolName, args: bc.args });
+                    lastToolInfo = { tool: bc.toolName, args: bc.args };
+                    if (activeHandoffCtx) activeHandoffCtx.lastToolInfo = lastToolInfo;
+                    const br = await executeTool(bc.toolName, bc.args, { threadId: config.webchatUrl || null });
+                    workCallsMade += 1;
+                    onProgress?.({ type: 'text', text: formatToolResultView(bc, br, 6000, { omitHeader: true }) });
+                    receipts.push(formatToolResultView(bc, br, 150000, { forModel: true }));
+                }
+                response = await countedSend(receipts.join('\n\n') + '\n\n' + TOOL_INSTRUCTIONS, toolDefs);
+                continue;
+            }
+
             // 08-13 EVENING (user rule "force it"): a work tool call with NO
             // prose and NO send_message means the model skipped narration —
             // nudge it ONCE per request to send send_message first. (Bounded:
@@ -1127,28 +1165,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 // 08-19 (user, de-lobotomize): forModel=true — this receipt goes
                 // into the agent's context, so it MUST carry the real tool output.
                 (call.toolName === 'send_message' ? '' : formatToolResultView(call, result, 150000, { forModel: true }) + '\n\n') +
-                (config.allowPlainText
-                    ? 'You MUST send ONE plain-text 💬 line before your next tool call (your thinking + what the ' +
-                      'tool is about to do and why — delivered to the user verbatim; user rule 08-13), then your ' +
-                      'NEXT tool call JSON, fenced. ' +
-                      'When the entire task is done AND verified, reply with a fenced submit_answer carrying your final summary ' +
-                      'message. Keep progress lines to one sentence — the work is the tool calls. ' +
-                      'Verify with run_bash: syntax checks, import tests, dependency checks, and the project tests. ' +
-                      'Do not claim completion for work you have not verified actually runs. ' +
-                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — page through with maxLength + offset until truncated is false. ' +
-                      'The next step: fenced {"tool":"<name>","params":{...}}.'
-                    : 'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
-                      'Reply with exactly ONE tool call per message, fenced as ```json ... ```. To speak to the user, ' +
-                      'call send_message with your one-line 💬 (what you are thinking and about to do) — that is how ' +
-                      'your progress reaches the user; never write plain text outside the JSON fence. ' +
-                      'Respond with exactly ONE of these two, and nothing else: ' +
-                      '(a) your NEXT tool call JSON (send_message or a work tool), fenced as ```json ... ```; ' +
-                      '(b) submit_answer, fenced, IF AND ONLY IF the entire task is done and verified. ' +
-                      'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
-                      'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
-                      'verified actually runs. ' +
-                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — page through with maxLength + offset until truncated is false. ' +
-                      'The next step: fenced {"tool":"<name>","params":{...}}.');
+                TOOL_INSTRUCTIONS;
             response = await countedSend(followUp, toolDefs);
             continue;
         }
@@ -1334,6 +1351,32 @@ const FORMAT_ERROR_MSG =
     'If the task is complete, use a fenced {"tool":"submit_answer","params":{"text":"your final answer"}}. ' +
     'If you wrote an implementation as prose, that is NOT the work: re-emit it as write_file tool calls instead. ' +
     'No prose. No markdown. No questions. No plans. Nothing else.';
+
+// 08-20 (audit BUG-15): the turn-continuation instruction appended to every
+// tool receipt. Extracted to a const because multi-call batches append it
+// once after N receipts instead of once per call.
+const TOOL_INSTRUCTIONS = (config?.allowPlainText
+    ? 'You MUST send ONE plain-text 💬 line before your next tool call (your thinking + what the ' +
+      'tool is about to do and why — delivered to the user verbatim; user rule 08-13), then your ' +
+      'NEXT tool call JSON, fenced. ' +
+      'When the entire task is done AND verified, reply with a fenced submit_answer carrying your final summary ' +
+      'message. Keep progress lines to one sentence — the work is the tool calls. ' +
+      'Verify with run_bash: syntax checks, import tests, dependency checks, and the project tests. ' +
+      'Do not claim completion for work you have not verified actually runs. ' +
+      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — page through with maxLength + offset until truncated is false. ' +
+      'The next step: fenced {"tool":"<name>","params":{...}}.'
+    : 'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
+      'Reply with exactly ONE tool call per message, fenced as ```json ... ```. To speak to the user, ' +
+      'call send_message with your one-line 💬 (what you are thinking and about to do) — that is how ' +
+      'your progress reaches the user; never write plain text outside the JSON fence. ' +
+      'Respond with exactly ONE of these two, and nothing else: ' +
+      '(a) your NEXT tool call JSON (send_message or a work tool), fenced as ```json ... ```; ' +
+      '(b) submit_answer, fenced, IF AND ONLY IF the entire task is done and verified. ' +
+      'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
+      'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
+      'verified actually runs. ' +
+      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — page through with maxLength + offset until truncated is false. ' +
+      'The next step: fenced {"tool":"<name>","params":{...}}.');
 
 // Progress-report yap: DeepSeek pauses after tool work and writes a status
 // update ("I added X, next I will Y") instead of the next tool call. The
@@ -2077,14 +2120,28 @@ async function main() {
 // ──────────────────────────────────────────────────────
 // CLEANUP
 // ──────────────────────────────────────────────────────
-for (const sig of ['SIGINT', 'SIGTERM']) {
-    process.on(sig, async () => {
-        console.log(`\n🔴 ${sig} — shutting down...`);
-        // Bounded: closeBrowser() can hang on a STALE CDP connection (Chrome
-        // died — puppeteer waits up to protocolTimeout). Never wedge shutdown.
-        await Promise.race([closeBrowser(), new Promise((r) => setTimeout(r, 5000))]);
-        process.exit(0);
-    });
+async function gracefulShutdown(reason, code) {
+    console.log(`\n🔴 ${reason} — shutting down...`);
+    // Bounded: closeBrowser() can hang on a STALE CDP connection (Chrome
+    // died — puppeteer waits up to protocolTimeout). Never wedge shutdown.
+    await Promise.race([closeBrowser(), new Promise((r) => setTimeout(r, 5000))]);
+    process.exit(code);
 }
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => gracefulShutdown(sig, 0));
+}
+// 08-20 (audit BUG-12): an uncaught exception previously exited WITHOUT
+// closing the browser — the detached Chrome kept running (zombie, RAM leak
+// until the OOM-killer). Same bounded close, then exit 1 so supervisors see
+// a real crash.
+process.on('uncaughtException', (err) => {
+    console.error('💥 uncaughtException:', err);
+    gracefulShutdown('uncaughtException', 1);
+});
+process.on('unhandledRejection', (err) => {
+    console.error('💥 unhandledRejection:', err);
+    gracefulShutdown('unhandledRejection', 1);
+});
 
 main();

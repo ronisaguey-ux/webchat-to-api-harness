@@ -27,12 +27,29 @@ const DEFAULT_GIT_REPO = USER_MODE ? 'helpotron' : 'oculus';
 // cwd (webchat-api). Absolute paths stay verbatim.
 const USER_WORKSPACE = '/home/roni/Roni_Workspace/helpotron';
 
+// 08-20 (audit BUG-04/CRIT-02): path-traversal hardening. Relative paths
+// must resolve INSIDE the workspace root (`../../etc/passwd` style escapes
+// are refused). Absolute paths stay verbatim — the harness legitimately
+// reads audits_plans/state files — but sensitive system dirs (secrets,
+// credentials, kernel internals) are off-limits for the webchat.
+const SENSITIVE_ABS_PREFIXES = [
+    '/etc/', '/root/', '/home/roni/.ssh', '/home/roni/.claude/',
+    '/proc/', '/sys/', '/dev/', '/boot/', '/run/', '/var/lib/', '/var/cache/',
+];
 function resolvePath(p) {
     if (typeof p !== 'string' || p === '') return p;
-    if (path.isAbsolute(p)) return p;
-    if (USER_MODE) return path.join(USER_WORKSPACE, p);
-    if (!GIT_ROOT) return p;
-    return path.join(GIT_ROOT, p);
+    const root = path.resolve(USER_MODE ? USER_WORKSPACE : (GIT_ROOT || process.cwd()));
+    const abs = path.isAbsolute(p) ? p : path.resolve(root, p);
+    if (!path.isAbsolute(p)) {
+        const rel = path.relative(root, abs);
+        if (rel.startsWith('..') || path.isAbsolute(rel)) {
+            throw new Error(`Access Denied: path escapes the workspace root: ${p}`);
+        }
+    }
+    if (SENSITIVE_ABS_PREFIXES.some((s) => abs.startsWith(s))) {
+        throw new Error(`Access Denied: sensitive path outside the workspace: ${p}`);
+    }
+    return abs;
 }
 // Rewrite the expert's learned "cd /home/roni/Roni_Workspace" (repo root) to
 // the git root. "cd .../oculus" is left untouched.
@@ -61,6 +78,82 @@ function runCmd(argv, timeoutMs = 8000) {
         child.on('error', (e) => { clearTimeout(t); resolve({ success: false, stdout, stderr: e.message }); });
         child.on('close', (code) => { clearTimeout(t); resolve({ success: code === 0, stdout, stderr }); });
     });
+}
+
+// ──────────────────────────────────────────────────────
+// SECURITY: run_bash whitelist + secret redaction
+// ──────────────────────────────────────────────────────
+// 08-20 (audit BUG-03/CRIT-02): shell-injection hardening for run_bash.
+// The old deny-list alone was bypassable (`pyt""est; evil`, `curl | bash`).
+// Now every compound-command segment's first binary must be allowlisted,
+// bare pipes and code-exec flags are refused, and plan/state files are
+// write-protected. The executor's own verification commands run through
+// Python's run_isolated_shell_command (NOT this path), so this can be strict
+// without breaking the pipeline.
+const ALLOWED_BINARIES = new Set([
+    'cd', 'python3', 'python', 'pytest', 'pip', 'pip3', 'uv', 'git', 'gh',
+    'ls', 'cat', 'grep', 'sed', 'awk', 'head', 'tail', 'wc', 'sort', 'uniq',
+    'cut', 'tr', 'find', 'diff', 'tee', 'basename', 'dirname', 'date', 'stat',
+    'mkdir', 'rm', 'cp', 'mv', 'touch', 'chmod', 'ln', 'rmdir',
+    'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'timeout',
+    'curl', 'wget', 'nohup', 'bash', 'sh', 'env', 'export', 'source',
+    'ps', 'df', 'du', 'free', 'jq', 'xargs',
+]);
+// Code-exec flags that would nullify the whitelist (arbitrary code from a
+// whitelisted interpreter): python3 -c, bash -c/-s, node -e/-p, perl -e...
+const CODE_EXEC_FLAGS = new Set(['-c', '-e', '-p', '-r', '-s']);
+const CODE_EXEC_BINARIES = new Set(['python3', 'python', 'bash', 'sh', 'node', 'perl', 'ruby', 'php']);
+// 08-20 (audit BUG-08 surface): the webchat must never rewrite the master
+// plan or execution-state files (integrity of the whole pipeline).
+const PROTECTED_ARTIFACT_RE = /(?:master_plan|execution_state|helotron_execution_state|audit_state|workflow_state|cross_eval_state)[.\w-]*\.(json|md)/i;
+
+function assertCommandSafe(cmdStr) {
+    // Returns null when safe, else an error string.
+    const cmd = String(cmdStr || '').trim();
+    if (!cmd) return 'empty command';
+    // Hard bans: command substitution / backticks / bare pipes. (`||` stays —
+    // each side is independently whitelisted below.)
+    if (/\$\(/.test(cmd)) return 'command substitution $() is forbidden';
+    if (/`/.test(cmd)) return 'backticks are forbidden';
+    if (/(?<!\|)\|(?!\|)/.test(cmd)) return 'bare pipe chains are forbidden (use >> /tmp/out.txt + read_file to page output)';
+    // Protected artifacts: any redirect/tee into the plan or state files.
+    if (/(?:>|tee\s+)[^;\n]*(?:master_plan|_state\.json)/i.test(cmd)) {
+        return 'writing to the master plan / execution state is forbidden';
+    }
+    const segments = cmd.split(/;|\n|\r|&&|\|\|/);
+    for (let seg of segments) {
+        seg = seg.trim();
+        if (!seg) continue;
+        // Strip env-assignment prefixes (FOO=bar cmd) — harmless once the
+        // command itself is whitelisted.
+        let toks = seg.split(/\s+/).filter(Boolean);
+        while (toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0])) toks.shift();
+        if (!toks.length) continue;
+        const bin = toks[0];
+        if (!ALLOWED_BINARIES.has(bin)) {
+            return `forbidden binary: ${bin} (allowed: ${[...ALLOWED_BINARIES].sort().join(', ')})`;
+        }
+        if (CODE_EXEC_BINARIES.has(bin) && toks.slice(1).some((t) => CODE_EXEC_FLAGS.has(t))) {
+            const flag = toks.slice(1).find((t) => CODE_EXEC_FLAGS.has(t));
+            return `code-exec flag ${flag} is forbidden on ${bin} (use a script file instead)`;
+        }
+        if (bin === 'find') {
+            const m = seg.match(/-exec\s+([^\s;]+)/);
+            if (m && !ALLOWED_BINARIES.has(m[1])) {
+                return `find -exec target not whitelisted: ${m[1]}`;
+            }
+        }
+    }
+    return null;
+}
+
+// 08-20 (audit SEC-05): secrets that round-trip through run_bash (a model
+// echoing a token, cat'ing a file with one) must never reach the bash_tool
+// log or the model's context in cleartext.
+const SECRET_REDACT_RE = /(ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AAG[A-Za-z0-9_-]{25,}|Bearer\s+[A-Za-z0-9._-]{16,})/g;
+function redactSecrets(s) {
+    if (typeof s !== 'string') return s;
+    return s.replace(SECRET_REDACT_RE, '[REDACTED]');
 }
 
 // ──────────────────────────────────────────────────────
@@ -194,6 +287,15 @@ const TOOL_DEFINITIONS = [
                         error: "run_bash DENIED: command matches dangerous pattern: " + denied,
                     });
                 }
+                // 08-20 (audit BUG-03/CRIT-02): per-segment binary whitelist —
+                // the deny-list above alone was bypassable. See assertCommandSafe.
+                const segErr = assertCommandSafe(cmd);
+                if (segErr) {
+                    return resolve({
+                        success: false,
+                        error: "run_bash DENIED: " + segErr,
+                    });
+                }
                 const toks = cmd.split(" ").filter(Boolean);
                 const gi = toks.indexOf("git");
                 const pi = toks.indexOf("push");
@@ -211,7 +313,7 @@ const TOOL_DEFINITIONS = [
                 try {
                     fs.appendFileSync(
                         "/home/roni/Roni_Workspace/webchat-api/bash_tool_log.jsonl",
-                        JSON.stringify({ ts: new Date().toISOString(), cmd: origCmd, executed: cmd, gitRoot: GIT_ROOT }) + os.EOL
+                        JSON.stringify({ ts: new Date().toISOString(), cmd: redactSecrets(origCmd), executed: redactSecrets(cmd), gitRoot: GIT_ROOT }) + os.EOL
                     );
                 } catch (e) { /* logging must never block execution */ }
 // spawn + stdio→temp files instead of execFile + pipes: execFile
@@ -256,6 +358,9 @@ const TOOL_DEFINITIONS = [
                     if (stderr.length > config.execMaxBuffer) stderr = stderr.slice(-config.execMaxBuffer);
                     try { fs.unlinkSync(outFile); } catch (e) { /* already gone */ }
                     try { fs.unlinkSync(errFile); } catch (e) { /* already gone */ }
+                    // 08-20 (audit SEC-05): strip secrets before the model sees output.
+                    stdout = redactSecrets(stdout);
+                    stderr = redactSecrets(stderr);
                     resolve({ success: true, ...extra, stdout, stderr: stderr || '' });
                 };
                 child.on('error', (err) => finish({ success: false, error: err.message }));
@@ -595,7 +700,9 @@ const TOOL_DEFINITIONS = [
             if (!text.toLowerCase().startsWith('webchat:')) {
                 text = `webchat: ${text}`;
             }
-            const sendScript = '/home/roni/Roni_workspace/oculus/scripts/telegram-monitor/bin/send-telegram.sh';
+            // 08-20: corrected telegram_monitor dir (audit SEC-03 surface — the
+            // tool silently returned "failed" with the old hyphen path).
+            const sendScript = '/home/roni/Roni_workspace/oculus/scripts/telegram_monitor/telegram-monitor/bin/send-telegram.sh';
             const envFile = `${os.homedir()}/.config/oculus/orchestrator.env`;
             const cmd = `set -a; [ -f "${envFile}" ] && source "${envFile}"; set +a; bash "${sendScript}" "${text.replace(/"/g, '\\"')}"`;
             return new Promise((resolve) => {
