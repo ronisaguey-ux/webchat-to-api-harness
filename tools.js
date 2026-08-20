@@ -70,7 +70,7 @@ const TOOL_DEFINITIONS = [
     {
         name: 'read_file',
         category: 'file',
-        description: 'Read contents of a file. Hard ceiling: results are ALWAYS capped at 200K chars (truncated:true + totalLength), so a huge file can never balloon the chat — pass maxLength to control the window read.',
+        description: 'Read contents of a file. Hard ceiling: results are ALWAYS capped at 200K chars (truncated:true + totalLength), so a huge file can never balloon the chat — pass maxLength to control the window read and offset to page through the rest.',
         parameters: {
             type: 'object',
             properties: {
@@ -80,6 +80,11 @@ const TOOL_DEFINITIONS = [
                 // overflow spiral). Re-read WITHOUT maxLength before rewriting a
                 // file so the rewrite never starts from a partial view.
                 maxLength: { type: 'integer', description: 'Optional — read only the first N characters; the result flags truncation' },
+                // 08-19 (user): paging. A truncated result tells the agent the
+                // file is bigger than the window; the agent calls read_file
+                // again with offset=<chars shown so far> (+ maxLength) to see
+                // the next window instead of re-reading the head forever.
+                offset: { type: 'integer', description: 'Optional — start reading at this character index (pairs with maxLength to page through a large file); truncated:true stays set while more content remains after this window' },
             },
             required: ['path'],
         },
@@ -93,12 +98,19 @@ const TOOL_DEFINITIONS = [
             // Hard ceiling regardless of args: a file this big must NEVER
             // round-trip through the tab, and explicit maxLength is clamped too.
             const limit = Math.min(args.maxLength || MAX_READ_FILE_CHARS, MAX_READ_FILE_CHARS);
-            if (content.length > limit) {
+            // 08-19 (user): offset paging. The window is [offset, offset+limit);
+            // truncated:true only while MORE content remains after it, so the
+            // final window reads clean (truncated:false) and the agent knows
+            // it has the whole file.
+            const offset = Math.max(0, Math.min(args.offset || 0, Math.max(content.length - 1, 0)));
+            if (content.length > limit || offset > 0) {
+                const end = Math.min(offset + limit, content.length);
                 return {
                     success: true,
-                    truncated: true,
+                    truncated: end < content.length,
                     totalLength: content.length,
-                    content: content.slice(0, limit),
+                    offset,
+                    content: content.slice(offset, end),
                 };
             }
             return { success: true, content };
