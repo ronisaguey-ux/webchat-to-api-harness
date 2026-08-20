@@ -229,6 +229,10 @@ ALLOWED_COMMANDS = {
     # (parser normalizes mypy --strict -> --follow-imports=skip). mypy/ruff/black
     # inspect source, they do not execute it; same trust class as pytest/grep.
     "mypy", "ruff", "black",
+    # 08-20 (step 60): plan checks invoke the orchestrator venv explicitly
+    # (`.venv-orch/bin/python -c ...`). Same interpreter as sys.executable —
+    # normalized below, so only the literal prefix needs to be allowed.
+    "venv-orch/bin/python",
     # 08-20 (step 829 + ~30 flutter steps): flutter/dart verification commands.
     # On this box /home/roni/bin/flutter is a CI simulation stub (analyze/test
     # exit 0), so these checks are deterministic. `cd X && flutter ...` chains
@@ -1713,6 +1717,8 @@ def run_isolated_shell_command(cmd: str, env_id: str = "isolated", timeout: int 
                 seg_args = list(seg)
                 if seg_args[0] in ("python", "./python"):
                     seg_args[0] = "python3"
+                if seg_args[0].lstrip("./") == "venv-orch/bin/python":
+                    seg_args[0] = sys.executable
                 if seg_args[0] == "python3":
                     seg_args[0] = sys.executable
                 if seg_args[0] == "pytest":
