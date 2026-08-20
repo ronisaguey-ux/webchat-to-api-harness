@@ -738,7 +738,11 @@ _CLAUDE_402_BLOCKED = False
 # returns ERROR so the step fails -> escalation exhausts -> HALT parks.
 _PAID_USAGE_FILE = os.path.join(AUDITS_PLANS_DIR, "deepseek_paid_usage.json")
 _PAID_CAP = int(os.getenv("DEEPSEEK_PAID_TOKEN_CAP", "4000000"))
-_paid_usage = {"completed": None, "tokens": 0}
+_PAID_HOURLY_CAP = float(os.getenv("DEEPSEEK_PAID_HOURLY_CAP", "2.0"))
+_PAID_DAILY_CAP = float(os.getenv("DEEPSEEK_PAID_DAILY_CAP", "10.0"))
+_paid_usage = {"completed": None, "tokens": 0,
+               "hour_bucket": "", "hour_usd": 0.0,
+               "day_bucket": "", "day_usd": 0.0}
 
 
 def _load_paid_usage():
@@ -776,6 +780,40 @@ def _paid_usage_add(n: int):
 def _paid_usage_total() -> int:
     _paid_usage_cycle_check()
     return _paid_usage.get("tokens", 0)
+
+
+def _paid_usage_record(usage: dict) -> tuple:
+    """Record tokens + estimated USD for a paid call (audit 6.6 / rule 7).
+
+    Flash flat pricing: hit $0.0028/1M, miss $0.14/1M, output $0.28/1M.
+    Hourly ($2) and daily ($10) buckets persist so the circuit breakers
+    survive executor restarts."""
+    global _paid_usage
+    _paid_usage_cycle_check()
+    now = datetime.now()
+    hour, day = now.strftime("%Y-%m-%dT%H"), now.strftime("%Y-%m-%d")
+    if _paid_usage.get("hour_bucket") != hour:
+        _paid_usage["hour_bucket"], _paid_usage["hour_usd"] = hour, 0.0
+    if _paid_usage.get("day_bucket") != day:
+        _paid_usage["day_bucket"], _paid_usage["day_usd"] = day, 0.0
+    prompt = usage.get("prompt_tokens") or 0
+    completion = usage.get("completion_tokens") or 0
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    if not cached:
+        cached = usage.get("prompt_cache_hit_tokens") or 0  # native-API field name
+    hit, miss = max(0, min(cached, prompt)), max(0, prompt - cached)
+    usd = (hit * 0.0028 + miss * 0.14 + completion * 0.28) / 1_000_000
+    _paid_usage["tokens"] = _paid_usage.get("tokens", 0) + prompt + completion
+    _paid_usage["hour_usd"] += usd
+    _paid_usage["day_usd"] += usd
+    try:
+        tmp = _PAID_USAGE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_paid_usage, f)
+        os.replace(tmp, _PAID_USAGE_FILE)
+    except Exception:
+        pass
+    return _paid_usage["hour_usd"], _paid_usage["day_usd"]
 
 
 _load_paid_usage()
@@ -867,12 +905,19 @@ async def call_official_deepseek(session: aiohttp.ClientSession,
                     content = (msg.get('content') or '').strip()
                     # 08-20 (audit 6.6): paid-API spend accounting + hardstop.
                     usage = data.get("usage") or {}
-                    _paid_usage_add((usage.get("prompt_tokens") or 0)
-                                    + (usage.get("completion_tokens") or 0))
+                    hour_usd, day_usd = _paid_usage_record(usage)
                     if _paid_usage_total() > _PAID_CAP:
                         log_exec(f"    [HARDSTOP] paid cycle cap {_PAID_CAP} "
                                  f"exceeded ({_paid_usage_total()} tokens) — failing step to HALT")
                         return "ERROR: DEEPSEEK PAID-CYCLE HARDSTOP (token cap exceeded) — parking"
+                    if hour_usd > _PAID_HOURLY_CAP:
+                        log_exec(f"    [HARDSTOP] paid hourly cap ${_PAID_HOURLY_CAP:.2f} "
+                                 f"exceeded (${hour_usd:.2f} this hour) — failing step to HALT")
+                        return f"ERROR: DEEPSEEK PAID-HOURLY HARDSTOP (${hour_usd:.2f} this hour) — parking"
+                    if day_usd > _PAID_DAILY_CAP:
+                        log_exec(f"    [HARDSTOP] paid daily cap ${_PAID_DAILY_CAP:.2f} "
+                                 f"exceeded (${day_usd:.2f} today) — failing step to HALT")
+                        return f"ERROR: DEEPSEEK PAID-DAILY HARDSTOP (${day_usd:.2f} today) — parking"
                     if not content:
                         # deepseek-reasoner can return 200 with EMPTY content when
                         # all output tokens were consumed by reasoning. Treat as a
