@@ -89,6 +89,12 @@ const cfg = {
     // Session persistence
     cookieFile: process.env.COOKIE_FILE || '.cookies.json',
 
+    // Browser engine (08-19): puppeteer's bundled chrome-headless-shell (121)
+    // freezes its renderer on the 2026 gemini SPA mid-exchange → stale probe →
+    // relaunch loop. Point CHROME_PATH at the system Chrome (151, headless=new)
+    // — the same engine the 9224 driver has run for days without a hang.
+    chromePath: process.env.CHROME_PATH || null,
+
     // Selectors (comma-separated, first match wins). Override via env when
     // a webchat UI changes.
     selectors: {

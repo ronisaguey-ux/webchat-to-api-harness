@@ -65,6 +65,15 @@ async function initBrowser({ reconnect = false } = {}) {
         // process; close() kills it so the relaunch below doesn't stack a
         // second chrome (~2GB with renderers). In CDP mode we only attached
         // to the user's chrome — detach, never close.
+        // 08-19 (gemini lane): sendPrompt refreshes BEFORE EVERY round, so
+        // this used to tear the whole browser down per round — re-login,
+        // re-cookies, fresh tab, ~10-20s wasted each, tab state lost. A
+        // HEALTHY own browser survives the round loop untouched; only a
+        // dead page/socket gets rebuilt.
+        if (!config.cdpWsUrl && browser.isConnected() && page && !page.isClosed()) {
+            console.log('🟢 Own browser healthy — reusing across rounds.');
+            return;
+        }
         try {
             if (config.cdpWsUrl) await browser.disconnect();
             else await browser.close();
@@ -114,7 +123,10 @@ async function initBrowser({ reconnect = false } = {}) {
 
     console.log('🚀 Launching browser...');
     browser = await puppeteer.launch({
-        headless: config.headless,
+        // 08-19: system Chrome (151) only supports new headless; puppeteer's
+        // bundled 121 shell freezes on modern SPAs. CHROME_PATH → new headless.
+        headless: config.chromePath ? 'new' : config.headless,
+        executablePath: config.chromePath || undefined,
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
         defaultViewport: { width: 1280, height: 800 },
     });
