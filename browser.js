@@ -60,10 +60,20 @@ async function initBrowser({ reconnect = false } = {}) {
     if (reconnect && browser) {
         // A long-lived CDP session can go stale (evaluates hang while fresh
         // sessions work). Detach and attach again — cheap (~50ms).
-        try { await browser.disconnect(); } catch {}
+        // 2026-08-19 (OOM fix): in LAUNCH mode (no cdpWsUrl) the browser is
+        // OURS — disconnect() only detaches and LEAKS the whole chrome
+        // process; close() kills it so the relaunch below doesn't stack a
+        // second chrome (~2GB with renderers). In CDP mode we only attached
+        // to the user's chrome — detach, never close.
+        try {
+            if (config.cdpWsUrl) await browser.disconnect();
+            else await browser.close();
+        } catch {}
         browser = null;
         page = null;
-        console.log('🔌 Reconnecting CDP session (stale session refresh).');
+        console.log(config.cdpWsUrl
+            ? '🔌 Reconnecting CDP session (stale session refresh).'
+            : '🧹 Closed own browser (stale) — relaunching fresh.');
     }
     if (browser && browser.isConnected()) {
         console.log('🟢 Browser already connected.');

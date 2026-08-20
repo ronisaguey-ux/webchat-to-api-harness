@@ -620,16 +620,19 @@ const CONV_PREAMBLE =
     'Never guess context from earlier work; when in doubt, act on the user\'s most recent instruction.';
 
 const CONV_FORMAT =
-    '### RESPONSE INSTRUCTIONS (STRICT)\n' +
-    '1. GREETINGS & CONVERSATION: If the user says hello, asks a conversational question, or gives a non-tool message (e.g. "yo", "yo u there", "how are you"), reply directly in friendly, concise plain text. Do NOT execute any tools for greetings.\n' +
-    '2. TOOL ACTIONS (MANDATORY NARRATION BEFORE TOOL):\n' +
-    '   When the user asks for a task that requires tools (reading files, executing bash commands, searching, editing):\n' +
-    '   You MUST start your response with one clear 💬 explanation line describing what you are about to do and why, followed immediately by your tool call in a code fence:\n' +
+    '### RESPONSE INSTRUCTIONS (RELAXED)\n' +
+    '1. TOOLS ARE OPTIONAL — THE DEFAULT IS PLAIN TEXT. You are the user\'s personal assistant in a chat. ' +
+    '   For greetings, chit-chat, questions, summaries, and any reply that does not need the machine, answer ' +
+    '   directly in plain text. NO tool calls. NO code fences. Do not "inspect the workspace" unprompted, do not ' +
+    '   list directories, do not run status commands — if the user did not ask for a task, no tools.\n' +
+    '2. USE TOOLS ONLY WHEN THE USER ASKS FOR A TASK: reading files, running bash, editing code, searching, ' +
+    '   executing a plan. Then start your response with one clear 💬 line describing what you are about to do, ' +
+    '   followed immediately by your tool call in a code fence:\n' +
     '   <One clear sentence explaining the tool action you are about to take>\n' +
     '   ```json\n' +
     '   {"tool":"<name>","params":{...}}\n' +
     '   ```\n' +
-    '3. COMPLETION: When the task is complete and verified, deliver your final summary in plain text or via submit_answer.\n';
+    '3. COMPLETION: When the task is complete and verified, deliver your final summary in plain text.\n';
 
 // ── Always-tool mode (user directive 08-12) ─────────────────────────────
 // The webchat model must NEVER reply in plain text: every response is a tool
@@ -1149,7 +1152,9 @@ const MALFORMED_MSG =
     'quotes or newlines must be escaped, not triple-quoted. ' +
     'If a command argument is long or quote-heavy (python3 -c "..." with embedded quotes), do NOT inline it: ' +
     'write a temporary script file with write_file (e.g. /tmp/step.py), then run it via run_bash. One tool call per reply:\n' +
-    '```json\n{"tool":"<name>","params":{...}}\n```';
+    '```json\n{"tool":"<name>","params":{...}}\n```' +
+    '\nDO NOT answer the user\'s request in plain text. The request requires tool work — if you do not know where the ' +
+    'work lives, run list_dir on the absolute path from the user\'s message first. Resubmit your tool call NOW.';
 
 const FORMAT_ERROR_MSG =
     '### FORMAT ERROR\n' +
@@ -1581,7 +1586,11 @@ app.post('/v1/chat/completions', async (req, res) => {
                 ? userMessage.content
                 : JSON.stringify(userMessage?.content ?? '');
 
-        const toolDefs = buildExecutableToolDefs();
+        // Same greeting short-circuit as /v1/messages (user mode only).
+        const isPureGreeting =
+            config.allowPlainText &&
+            /^\s*(?:hi+|hello|hey+|yo+|sup|howdy|good\s*(?:morning|afternoon|evening)|whats? up|how(?:'s| is| are)\s+(?:it going|you))[\s!.,?~]*$/i.test(prompt);
+        const toolDefs = isPureGreeting ? [] : buildExecutableToolDefs();
 
         const text = await enqueue(() =>
             handleRequest(systemMessage?.content || '', prompt, toolDefs, undefined, undefined,
@@ -1696,7 +1705,15 @@ app.post('/v1/messages', async (req, res) => {
                   .join('\n')
             : userMessage?.content || '';
 
-        const toolDefs = buildExecutableToolDefs();
+        // 08-19 GREETING SHORT-CIRCUIT (user: "i said hello and its doing allat"):
+        // in user/conversation mode a pure greeting must NEVER trigger tool
+        // work — the model reached for list_dir on a plain "hello". Inject NO
+        // tool defs → it can only reply conversationally; no tool calls, no
+        // malformed-call corrections, no workspace probing.
+        const isPureGreeting =
+            config.allowPlainText &&
+            /^\s*(?:hi+|hello|hey+|yo+|sup|howdy|good\s*(?:morning|afternoon|evening)|whats? up|how(?:'s| is| are)\s+(?:it going|you))[\s!.,?~]*$/i.test(prompt);
+        const toolDefs = isPureGreeting ? [] : buildExecutableToolDefs();
 
         const modelName = model || config.modelName;
 

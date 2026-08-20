@@ -21,10 +21,17 @@ const GIT_ROOT = process.env.GIT_ROOT || '';
 // Autonomous/executor lanes (no ALLOW_PLAIN_TEXT) keep the full harness toolset.
 const USER_MODE = process.env.ALLOW_PLAIN_TEXT === 'true';
 const DEFAULT_GIT_REPO = USER_MODE ? 'helpotron' : 'oculus';
+// 08-19 USER-SESSION CWD (the gemini session listed the webchat-api dir and
+// got lost instead of executing the helpotron plan): user-mode tools resolve
+// relative paths + run_bash cwd against the USER's workspace, not the server's
+// cwd (webchat-api). Absolute paths stay verbatim.
+const USER_WORKSPACE = '/home/roni/Roni_Workspace/helpotron';
 
 function resolvePath(p) {
-    if (!GIT_ROOT || typeof p !== 'string' || p === '') return p;
+    if (typeof p !== 'string' || p === '') return p;
     if (path.isAbsolute(p)) return p;
+    if (USER_MODE) return path.join(USER_WORKSPACE, p);
+    if (!GIT_ROOT) return p;
     return path.join(GIT_ROOT, p);
 }
 // Rewrite the expert's learned "cd /home/roni/Roni_Workspace" (repo root) to
@@ -216,7 +223,7 @@ const TOOL_DEFINITIONS = [
                 const child = spawn('/bin/bash', ['-s'], {
                     detached: true,
                     stdio: ['pipe', outFd, errFd],
-                    ...(GIT_ROOT ? { cwd: GIT_ROOT } : {}),
+                    ...(GIT_ROOT ? { cwd: GIT_ROOT } : USER_MODE ? { cwd: USER_WORKSPACE } : {}),
                 });
                 child.stdin.write(cmd);
                 child.stdin.end();
@@ -715,9 +722,23 @@ function parseToolCalls(response) {
             const esc = candidate.replace(/"([A-Za-z_]\w*)"\s*:\s*"""([\s\S]*?)"""/g, (m, key, val) => `"${key}":${JSON.stringify(val)}`);
             if (esc !== candidate) obj = tryParse(esc);
         }
-        if (obj && typeof obj === 'object' && obj.tool && obj.params) {
-            if (firstCallStart === -1) firstCallStart = start;
-            result.toolCalls.push({ toolName: String(obj.tool), args: obj.params });
+        // 08-19 (degradation fix): accept FLAT args in addition to the taught
+        // {"tool","params"} wrapper. Gemini follows each tool's JSON schema
+        // (parameters.properties.*) over the format example and emits
+        // {"tool":"send_message","text":"..."} — the old `&& obj.params` gate
+        // rejected that as malformed, sent a correction, and the model
+        // re-emitted the SAME schema-driven shape forever (correction loop up
+        // to the 3-round bail; it was round 16 before the bail existed). A
+        // bare {"tool":"x"} with no args at all stays rejected (ambiguous).
+        if (obj && typeof obj === 'object' && typeof obj.tool === 'string') {
+            const flatArgs = { ...obj };
+            delete flatArgs.tool;
+            delete flatArgs.params;
+            const args = obj.params ?? flatArgs;
+            if (Object.keys(args).length > 0 || obj.params) {
+                if (firstCallStart === -1) firstCallStart = start;
+                result.toolCalls.push({ toolName: obj.tool, args });
+            }
         }
         if (end === -1) break; // consumed the whole tail
         start = text.indexOf('{', start + 1);
