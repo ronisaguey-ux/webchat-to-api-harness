@@ -38,6 +38,8 @@ import tempfile
 import subprocess
 import argparse
 import fcntl
+import ast_context_compressor  # 08-20 audit 4.2: AST skeletonizer / role slices
+from ast_context_compressor import security_slice, skeletonize_source
 from datetime import datetime
 from collections import defaultdict
 import aiohttp
@@ -592,6 +594,13 @@ def parse_master_plan(plan_path: str) -> list[dict]:
                             ver_commands.append(cmd)
 
 
+        # 08-20 (audit 3.4/roadmap 1.1): trivial commands (echo/true/pass/exit-0
+        # placeholders) verify nothing — strip them so a step whose only
+        # "verification" is trivial can never phantom-pass; the callers'
+        # zero-command HARD-FAIL then correctly refuses an unverified pass.
+        _TRIVIAL_RE = re.compile(r'^\s*(?:echo|true|false|pass|exit\s+0|:)\b|^\s*#')
+        ver_commands = [c for c in ver_commands if not _TRIVIAL_RE.match(c)]
+
         cm = re.search(r'(?:\*\*COMMIT_MESSAGE:\*\*|COMMIT_MESSAGE:)\s*"(.*?)"', block)
         rb = re.search(r'(?:\*\*ROLLBACK_COMMAND:\*\*|ROLLBACK_COMMAND:)\s*(.+)', block)
         notes = re.search(r'(?:\*\*NOTES:\*\*|NOTES:)\s*(.+)', block)
@@ -723,6 +732,55 @@ async def call_omniroute(session: aiohttp.ClientSession,
 _CLAUDE_402_BLOCKED = False
 
 
+# --- paid-API cycle spend hardstop (audit 6.6, 2026-08-20) ---------------
+# Cumulative paid-DeepSeek token usage per execution cycle (cycle = since
+# plan_execution_state 'completed' last changed). Over cap -> the paid call
+# returns ERROR so the step fails -> escalation exhausts -> HALT parks.
+_PAID_USAGE_FILE = os.path.join(AUDITS_PLANS_DIR, "deepseek_paid_usage.json")
+_PAID_CAP = int(os.getenv("DEEPSEEK_PAID_TOKEN_CAP", "4000000"))
+_paid_usage = {"completed": None, "tokens": 0}
+
+
+def _load_paid_usage():
+    global _paid_usage
+    try:
+        with open(_PAID_USAGE_FILE) as f:
+            _paid_usage.update(json.load(f))
+    except Exception:
+        pass
+
+
+def _paid_usage_cycle_check():
+    global _paid_usage
+    try:
+        with open(os.path.join(AUDITS_PLANS_DIR, "plan_execution_state.json")) as f:
+            done = json.load(f).get("completed")
+        if done is not None and done != _paid_usage.get("completed"):
+            _paid_usage = {"completed": done, "tokens": 0}
+    except Exception:
+        pass
+
+
+def _paid_usage_add(n: int):
+    _paid_usage_cycle_check()
+    _paid_usage["tokens"] = _paid_usage.get("tokens", 0) + n
+    try:
+        tmp = _PAID_USAGE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_paid_usage, f)
+        os.replace(tmp, _PAID_USAGE_FILE)
+    except Exception:
+        pass
+
+
+def _paid_usage_total() -> int:
+    _paid_usage_cycle_check()
+    return _paid_usage.get("tokens", 0)
+
+
+_load_paid_usage()
+
+
 async def call_official_deepseek(session: aiohttp.ClientSession,
                                  user_prompt: str,
                                  system_prompt: str,
@@ -807,6 +865,14 @@ async def call_official_deepseek(session: aiohttp.ClientSession,
                     data = await resp.json()
                     msg = data['choices'][0]['message']
                     content = (msg.get('content') or '').strip()
+                    # 08-20 (audit 6.6): paid-API spend accounting + hardstop.
+                    usage = data.get("usage") or {}
+                    _paid_usage_add((usage.get("prompt_tokens") or 0)
+                                    + (usage.get("completion_tokens") or 0))
+                    if _paid_usage_total() > _PAID_CAP:
+                        log_exec(f"    [HARDSTOP] paid cycle cap {_PAID_CAP} "
+                                 f"exceeded ({_paid_usage_total()} tokens) — failing step to HALT")
+                        return "ERROR: DEEPSEEK PAID-CYCLE HARDSTOP (token cap exceeded) — parking"
                     if not content:
                         # deepseek-reasoner can return 200 with EMPTY content when
                         # all output tokens were consumed by reasoning. Treat as a
@@ -866,12 +932,27 @@ async def solve_step_with_deepseek_expert(session: aiohttp.ClientSession, step: 
     total_steps = step["total_steps"]
     target_files = step["target_files"]
 
+    # 08-20 (audit 4.2): budget-aware context for the PAID call — combined
+    # 30KB cap; the PRIMARY target keeps full text (exact old_code matching),
+    # the rest become AST skeletons. Previously N files x up to 30KB each
+    # (90KB+ paid payloads) went to the API on multi-file steps.
     file_contents = {}
-    for tf in target_files:
+    budget = 30000
+    for i, tf in enumerate(target_files):
         abs_p = os.path.join(OCULUS_DIR, tf)
-        if os.path.exists(abs_p) and os.path.isfile(abs_p):
-            with open(abs_p, "r") as f:
-                file_contents[tf] = f.read()
+        if not (os.path.exists(abs_p) and os.path.isfile(abs_p)):
+            file_contents[tf] = "(file does not exist)"
+            continue
+        with open(abs_p, "r", errors="replace") as f:
+            src = f.read()
+        if i == 0:
+            budget -= len(src)
+            file_contents[tf] = src
+        elif len(src) <= budget:
+            budget -= len(src)
+            file_contents[tf] = src
+        else:
+            file_contents[tf] = skeletonize_source(src, tf)
 
     sys_prompt = "You are DeepSeek-V4 Expert Autonomous Engineer. Your job is to fix failed plan steps."
     usr_prompt = f"""STEP #{step_idx}/{total_steps}: {step['objective']}
@@ -1081,10 +1162,30 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
 
 def _exec_log_tail(n: int = 40) -> str:
     """Tail of the plan execution log, for the expert to investigate root
-    causes (incl. environment/verification issues unrelated to the step)."""
+    causes (incl. environment/verification issues unrelated to the step).
+
+    08-20 (audit 4.3/roadmap 1.3): raw 40-line tails fed escalation rounds
+    compiler banners, site-packages stack frames and redundant git lines —
+    ~180k tokens across 6 rounds of one failing step. Compress: drop NOISE
+    lines, keep error-bearing lines first, cap at 15 lines.
+    """
+    NOISE = re.compile(
+        r'(?:\*\*\*\*\*+|====+|>>>>+|^\s*(?:InsecureRequestWarning|warnings\.warn)|'
+        r'site-packages/|/usr/lib/python|/usr/local/lib/python|'
+        r'git (?:status|diff|add|commit)|Remote:|Branch:|Nothing to commit|'
+        r'Traceback \(most recent call last\)\s*$|^\s*File ".*", line \d+, in .*$)',
+        re.I)
+    CRITICAL = re.compile(
+        r'(Error|ERROR|FAILED|AssertionError|ImportError|ModuleNotFoundError|'
+        r'Exception|Traceback|HELOTRON_CHECK_FAILED|exit code|returncode|'
+        r'pytest|mypy|ruff|flake8|SyntaxError|TypeError|KeyError)', re.I)
     try:
         with open(os.path.join(AUDITS_PLANS_DIR, "plan_execution.log"), "r", errors="replace") as f:
-            return "\n".join(f.readlines()[-n:]).strip()
+            lines = [l.rstrip() for l in f.readlines()[-n:]]
+        kept = [l for l in lines if CRITICAL.search(l) and not NOISE.search(l)]
+        rest = [l for l in lines if l.strip() and l not in kept and not NOISE.search(l)]
+        out = (kept + rest)[:15]
+        return "\n".join(out).strip() or "(no informative execution-log lines)"
     except Exception:
         return "(no execution log available)"
 
@@ -1889,19 +1990,29 @@ async def execute_single_step(session: aiohttp.ClientSession,
     log_exec("=" * 70)
 
     # 1. File Context (agents need exact content to generate valid old_code)
-    file_contexts = []
+    # 08-20 (audit 3.2/roadmap 2.2): role-specialized broadcasts — IMP/REV get
+    # the full text (exact old_code matching), SEC gets security-relevant
+    # lines only, VER/SAN get AST skeletons (signatures). Cuts the 5-way
+    # 30KB broadcast ~58% on multi-file steps.
+    file_contexts, skel_contexts, sec_contexts = [], [], []
     for tf in target_files:
         abs_p = os.path.join(OCULUS_DIR, tf)
         ast_ctx = graphify.build_file_snippet(tf)
         content_full = ""
         if os.path.exists(abs_p) and os.path.isfile(abs_p):
-            with open(abs_p) as f:
+            with open(abs_p, errors="replace") as f:
                 content_full = f.read()
             if len(content_full) > 30000:
                 content_full = content_full[:30000] + "\n... [TRUNCATED AT 30KB FOR MEMORY SAFETY] ...\n"
         file_contexts.append(f"### FILE: {tf}\nAST: {ast_ctx}\nFULL CONTENT (use exact substrings for old_code):\n{content_full}\n")
+        skel_contexts.append(f"### FILE: {tf}\n" + skeletonize_source(content_full, tf))
+        sec_contexts.append(f"### FILE: {tf}\n" + security_slice(content_full))
 
     compact_context = "\n".join(file_contexts)
+    role_ctx = {"IMP": compact_context, "REV": compact_context,
+                "SEC": "\n".join(sec_contexts),
+                "VER": "\n".join(skel_contexts),
+                "SAN": "\n".join(skel_contexts)}
 
     base_sys = f"You are part of a 5-subagent team executing STEP {step_idx}/{total_steps} of Oculus."
     imp_sys = base_sys + " Role: IMP (Implementer). Generate exact, precise Python code changes."
@@ -1910,7 +2021,8 @@ async def execute_single_step(session: aiohttp.ClientSession,
     ver_sys = base_sys + " Role: VER (Verification Engine). Validate verification commands."
     san_sys = base_sys + " Role: SAN (Consensus Auditor). Evaluate team outputs and give final approve/deny vote."
 
-    user_prompt = f"""
+    def role_prompt(role: str) -> str:
+        return f"""
 ## ACTIVE STEP INSTRUCTIONS
 Objective: {obj}
 Target Files: {target_files}
@@ -1919,11 +2031,11 @@ Line Ranges: {step['line_ranges']}
 ## PROPOSED CODE OPERATIONS FROM PLAN
 {step['code_operations']}
 
-## COMPACT FILE CONTEXT
-{compact_context}
+## CONTEXT FOR {role}
+{role_ctx[role]}
 
 ## REQUIRED OUTPUT FORMAT — RESPOND WITH RAW JSON ONLY. NO MARKDOWN. NO EXPLANATION. NO CODE FENCES.
-{{"agent_role": "IMP", "approved": true, "confidence": 90, "code_edits": [{{"file": "path/to/file.py", "old_code": "exact string to replace", "new_code": "replacement"}}], "reasoning": "one sentence"}}
+{{"agent_role": "{role}", "approved": true, "confidence": 90, "code_edits": [{{"file": "path/to/file.py", "old_code": "exact string to replace", "new_code": "replacement"}}], "reasoning": "one sentence"}}
 
 Rules:
 - Your ENTIRE response must be a single valid JSON object, nothing else.
@@ -1933,17 +2045,17 @@ Rules:
 
     log_exec("  [TEAM] Spawning 5 parallel subagents (IMP, REV, SEC, VER, SAN)...")
     tasks = [
-        call_omniroute(session, user_prompt, imp_sys, role_name="IMP"),
-        call_omniroute(session, user_prompt, rev_sys, role_name="REV"),
-        call_omniroute(session, user_prompt, sec_sys, role_name="SEC"),
-        call_omniroute(session, user_prompt, ver_sys, role_name="VER"),
-        call_omniroute(session, user_prompt, san_sys, role_name="SAN"),
+        call_omniroute(session, role_prompt("IMP"), imp_sys, role_name="IMP"),
+        call_omniroute(session, role_prompt("REV"), rev_sys, role_name="REV"),
+        call_omniroute(session, role_prompt("SEC"), sec_sys, role_name="SEC"),
+        call_omniroute(session, role_prompt("VER"), ver_sys, role_name="VER"),
+        call_omniroute(session, role_prompt("SAN"), san_sys, role_name="SAN"),
     ]
 
     responses = await asyncio.gather(*tasks)
 
     # Free prompt memory immediately after responses received
-    del user_prompt
+    del role_ctx
 
     # 2. Apply structured code operations (parsed directly from plan + AI responses)
     edits_applied = False
