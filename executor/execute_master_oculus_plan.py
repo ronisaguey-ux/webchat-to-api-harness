@@ -224,13 +224,17 @@ import shlex
 ALLOWED_COMMANDS = {
     "pytest", "python", "git", "pip", "python3", "venv/bin/python",
     # read-only inspection (verification commands)
-    "grep", "cat", "test", "[", "ls", "head", "tail", "wc", "find",
+    "grep", "pgrep", "cat", "test", "[", "ls", "head", "tail", "wc", "find",
     "diff", "stat", "cut", "tr", "sort", "uniq", "basename", "dirname",
     "date", "file", "sed", "awk", "printf", "readlink",
     # 08-20: lint/type-check verification tools used by the master plan
     # (parser normalizes mypy --strict -> --follow-imports=skip). mypy/ruff/black
     # inspect source, they do not execute it; same trust class as pytest/grep.
     "mypy", "ruff", "black",
+    # 08-21 (plan-verify fixes): analyzers the master plan invokes directly
+    # with fixed argv (no shell interpolation). make runs the repo's own
+    # `verify` target; import-linter/lint-imports are read-only source checks.
+    "make", "import-linter", "lint-imports",
     # 08-20 (step 71/1413): `chmod 644 test.key && python ...` chains — file
     # permission change, not execution; same trust class as read-only tools.
     "chmod",
