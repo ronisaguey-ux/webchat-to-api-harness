@@ -226,9 +226,11 @@ async def _solve_step_with_feedback(session, step) -> tuple[bool, str]:
         low = (msg or "").lower()
         if any(sig in low for sig in ("rate_limit", "too frequent", "webchat unavailable",
                                       "server disconnected", "429")):
-            backoff = min(600, 45 * (2 ** (r - 1)))
-            log_exec(f"    [BATCH-fallback] rate-limit signature — backing off {backoff}s (round {r}).")
-            await asyncio.sleep(backoff)
+            # 08-21 (user): NO exponential ladder — once rate-limited, retry
+            # exactly every 5 minutes (flat). Rapid retries reset DeepSeek's
+            # frequency window; 5 min gives it room to clear.
+            log_exec(f"    [BATCH-fallback] rate-limit signature — retrying in 300s (flat 5-min cadence, round {r}).")
+            await asyncio.sleep(300)
             continue
         log_exec(f"    [BATCH-fallback] per-step round {r} for Step {step['step_index']} failed "
                  f"({msg[:160]}). Feeding failure back...")
