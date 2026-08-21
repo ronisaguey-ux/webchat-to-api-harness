@@ -63,7 +63,7 @@ from execute_master_oculus_plan import (  # noqa: E402
     datetime,
 )
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))  # 08-21 (user): batch 4 -> 8 — cuts webchat round-trips ~2x
 BACKSTOP_ROUNDS = max(6, WEBCHAT_ESCAPE_ATTEMPTS * 3)
 
 # Flock fh must stay alive for the WHOLE run: if the returned file handle is
