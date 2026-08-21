@@ -145,6 +145,7 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 | `CDP_WS_URL` | *(from `chat.js`)* | attach to an already-running browser via its DevTools ws URL; wins over `chat.js` `cdpWsUrl` |
 | `MODEL_NAME` | `deepseek webchat` | model id advertised by `/v1/models`; gateway routes accept `deepseek-v4-pro` / `deepseek-v4-flash` |
 | `HEADLESS` | `false` | visible browser for login |
+| `CLOAKBROWSER` | *(off)* | `1` swaps puppeteer for CloakBrowser (stealth Chromium v146, github.com/CloakHQ/CloakBrowser) — source-level fingerprints pass Google's session-rotation challenge that vanilla puppeteer trips (fake UA + ephemeral profile + saved cookies). Used by the gemini lane (08-21, VERIFIED PONG). Requires `cloakbrowser` + `playwright-core` npm deps; env-gated, all other lanes unaffected. |
 | `TIMEOUT` | `60000` | max wait for a response (ms) |
 | `TOOL_CONTEXT_WINDOW` | `8000` | cap on the tools section of the prompt (chars) |
 | `MAX_TOOL_ROUNDS` | `4` | max tool-execution rounds per request |
