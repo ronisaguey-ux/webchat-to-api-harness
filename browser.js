@@ -330,7 +330,22 @@ async function sendPrompt(prompt, toolDefinitions) {
             await sleep(1000);
         }
         if (await isForeignBusy()) {
-            throw new Error('webchat tab still generating from a previous request — retry after it finishes');
+            // 08-21 (wedge self-heal): a generation stuck for 60s is wedged,
+            // not slow — the SSE stream died leaving the tab's "generating"
+            // state. Reload the page once (clears the stuck React state), wait
+            // for idle, and only then fail. Without this the caller retries
+            // into the same wedged tab forever (~65s per throw).
+            console.log('🔄 foreign tab still generating after 60s — reloading to clear the wedge');
+            try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch (e) {
+                console.log('⚠ reload failed:', String(e.message).slice(0, 60));
+            }
+            for (let w = 0; w < 30; w++) {
+                if (!(await isForeignBusy())) break;
+                await sleep(1000);
+            }
+            if (await isForeignBusy()) {
+                throw new Error('webchat tab still generating from a previous request — retry after it finishes');
+            }
         }
     }
 
@@ -424,10 +439,13 @@ async function ensureToggles() {
             const flipped = [];
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
+                // 08-21 (user rule): instant = NO DeepThink. Click OFF when
+                // pressed; Search stays ON (mode detector + live search).
                 if (label !== 'DeepThink' && label !== 'Search') continue;
-                if (el.getAttribute('aria-pressed') === 'true') continue;
+                const wantOn = label === 'Search';
+                if (el.getAttribute('aria-pressed') === String(wantOn)) continue;
                 el.click();
-                flipped.push(label);
+                flipped.push(label + (wantOn ? ' ON' : ' OFF'));
             }
             return flipped;
         });
@@ -475,7 +493,7 @@ async function selectInstantMode() {
             }
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
-                if (label === 'DeepThink' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('DeepThink ON'); }
+                if (label === 'DeepThink' && el.getAttribute('aria-pressed') === 'true') { el.click(); out.push('DeepThink OFF'); }
                 if (label === 'Search' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('Search ON'); }
             }
             return out;
