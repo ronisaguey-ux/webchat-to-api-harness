@@ -9,6 +9,7 @@ const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS || '900000', 10);
 
 let browser = null;
 let page = null;
+let context = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -122,6 +123,43 @@ async function initBrowser({ reconnect = false } = {}) {
     }
 
     console.log('🚀 Launching browser...');
+    if (process.env.CLOAKBROWSER === '1') {
+        // CloakBrowser (08-21): stealth Chromium v146 — 73 source-level
+        // fingerprint patches. Vanilla puppeteer's fake UA (Chrome/120 on the
+        // real 151 binary) + ephemeral profile + saved cookies = Google session
+        // rotation challenge → wedge. Cloak passes with the SAME cookies
+        // (probe scripts/cloak_probe.js VERIFIED: SPA loaded, hasInput).
+        const { launch } = await import('cloakbrowser');
+        browser = await launch({
+            headless: true,
+            humanize: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        });
+        context = await browser.newContext();
+        page = await context.newPage();
+        // playwright → puppeteer API shims for the call sites below
+        page.setUserAgent = async () => {};                       // cloak owns its UA
+        page.setCookie = async (...cookies) => context.addCookies(
+            cookies.map((c) => ({
+                name: c.name, value: c.value, domain: c.domain, path: c.path,
+                expires: c.expires, httpOnly: c.httpOnly, secure: c.secure,
+                sameSite: c.sameSite,
+            })).filter((c) => c.name && c.domain));
+        page.cookies = async () => context.cookies();
+        page.createCDPSession = async () => context.newCDPSession(page);
+        // puppeteer's evaluate takes spread args (fn, a, b); playwright takes
+        // exactly one (fn, arg). Repack multi-arg calls into a single spread —
+        // covers all 17 multi-arg sites without touching them.
+        const origEvaluate = page.evaluate.bind(page);
+        page.evaluate = async (fn, ...args) =>
+            args.length <= 1
+                ? origEvaluate(fn, args[0])
+                // closures don't survive serialization — rebuild the page
+                // function self-contained from fn's source
+                : origEvaluate(new Function('packed', `return (${fn.toString()})(...packed);`), args);
+        console.log('✅ CloakBrowser ready.');
+        return;
+    }
     browser = await puppeteer.launch({
         // 08-19: system Chrome (151) only supports new headless; puppeteer's
         // bundled 121 shell freezes on modern SPAs. CHROME_PATH → new headless.

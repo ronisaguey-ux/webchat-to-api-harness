@@ -95,6 +95,11 @@ const cfg = {
     // — the same engine the 9224 driver has run for days without a hang.
     chromePath: process.env.CHROME_PATH || null,
 
+    // Stealth driver (08-21): CLOAKBROWSER=1 swaps puppeteer for CloakBrowser
+    // (playwright-compatible stealth Chromium) when the saved cookies trigger
+    // Google's session-rotation challenge on vanilla puppeteer.
+    cloakBrowser: process.env.CLOAKBROWSER === '1',
+
     // Selectors (comma-separated, first match wins). Override via env when
     // a webchat UI changes.
     selectors: {
