@@ -1219,10 +1219,13 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
     if rl_seen:
         # 08-21 (user directive): deepseek rate-limited -> OmniRoute kicks in for
         # THIS call (free fallback via the gateway's WEBCHAT_ROUTES omniroute slot,
-        # model rewritten to auto/best-coding). OmniRoute's own errors are NOT
-        # swapped again (no recursion); the caller's flat 300s cadence paces
-        # retries while both lanes are down, and the next call tries deepseek
-        # first so it self-heals the moment the cooldown clears.
+        # model rewritten to auto/best-coding). Gated to the oculus lane (8080):
+        # helpotron stays gemini-only (user lane rule — lanes never crossed).
+        # OmniRoute's own errors are NOT swapped again (no recursion); the caller's
+        # flat 300s cadence paces retries while both lanes are down, and the next
+        # call tries deepseek first so it self-heals when the cooldown clears.
+        if ":8080" not in WEBCHAT_API_BASE:
+            return f"ERROR: {rl_detail}"
         swap = dict(payload, model="omniroute")
         try:
             async with session.post(url, json=swap,
