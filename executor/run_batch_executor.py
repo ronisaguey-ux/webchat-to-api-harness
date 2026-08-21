@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import aiohttp
 
@@ -81,6 +82,9 @@ def acquire_lock():
         log_exec(f"[FATAL] Another executor holds {lock_path} — batch mode exits.")
         sys.exit(3)
     return fh
+
+
+_last_both_lanes_notify = 0.0  # throttle: at most one BOTH_LANES_DOWN escalation / 15 min
 
 
 def _notify_main(text: str) -> None:
@@ -216,6 +220,7 @@ async def _solve_batch(session, batch) -> str:
 async def _solve_step_with_feedback(session, step) -> tuple[bool, str]:
     """Per-step webchat fallback with failure feedback loop (mirrors the main
     executor's webchat escalation tier: rate-limit backoff + backstop)."""
+    global _last_both_lanes_notify
     ctx = ("OCULUS execution log (tail — investigate prior failures, incl. "
            "environment/verification causes):\n" + _exec_log_tail(40))
     for r in range(1, BACKSTOP_ROUNDS + 1):
@@ -229,6 +234,11 @@ async def _solve_step_with_feedback(session, step) -> tuple[bool, str]:
             # 08-21 (user): NO exponential ladder — once rate-limited, retry
             # exactly every 5 minutes (flat). Rapid retries reset DeepSeek's
             # frequency window; 5 min gives it room to clear.
+            if "BOTH_LANES_DOWN" in (msg or "") and time.monotonic() - _last_both_lanes_notify > 900:
+                _last_both_lanes_notify = time.monotonic()
+                _notify_main(f"[oculus lanes] BOTH LANES DOWN (deepseek RL + OmniRoute failing) on "
+                             f"step {step.get('step_index')}: {msg[:140]} — pacing every 5 min "
+                             f"until deepseek clears; hands-on escalation armed.")
             log_exec(f"    [BATCH-fallback] rate-limit signature — retrying in 300s (flat 5-min cadence, round {r}).")
             await asyncio.sleep(300)
             continue

@@ -1173,6 +1173,7 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
         # everything else. Never narrate in execution.
         "autonomous": True,
     }
+    rl_seen, rl_detail = False, ""
     for attempt in range(3):
         try:
             async with session.post(url, json=payload,
@@ -1193,9 +1194,9 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
                         # NEW message and RESET the cooldown window (observed
                         # 08-21: 3 retries 2s apart extended the block for 25+ min
                         # while the user's own message passed in the quiet gap).
-                        # Surface immediately — the caller's exponential ladder
-                        # (45s->600s) is what must pace the retry.
-                        return f"ERROR: {body[:160]}"
+                        # 08-21 (user lane model): do NOT pace here — swap lanes.
+                        rl_seen, rl_detail = True, body[:160]
+                        break
         except asyncio.TimeoutError:
             # 08-20 (audit BUG-07): str(asyncio.TimeoutError()) == "" — the old
             # generic except logged a blank line and silently abandoned the
@@ -1215,6 +1216,40 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
         except Exception as e:
             log_exec(f"    [WEBCHAT] call attempt {attempt+1} error ({type(e).__name__}): {e}")
         await asyncio.sleep(2)
+    if rl_seen:
+        # 08-21 (user directive): deepseek rate-limited -> OmniRoute kicks in for
+        # THIS call (free fallback via the gateway's WEBCHAT_ROUTES omniroute slot,
+        # model rewritten to auto/best-coding). OmniRoute's own errors are NOT
+        # swapped again (no recursion); the caller's flat 300s cadence paces
+        # retries while both lanes are down, and the next call tries deepseek
+        # first so it self-heals the moment the cooldown clears.
+        swap = dict(payload, model="omniroute")
+        try:
+            async with session.post(url, json=swap,
+                                    headers={"Content-Type": "application/json"},
+                                    timeout=aiohttp.ClientTimeout(total=WEBCHAT_TIMEOUT)) as resp:
+                body = await resp.text()
+                if resp.status == 200:
+                    try:
+                        data = json.loads(body)
+                        content = (data["choices"][0]["message"].get("content") or "").strip()
+                        if content:
+                            log_exec("    [LANE] deepseek rate-limited -> OmniRoute carried the call "
+                                     "(next call tries deepseek first).")
+                            return content
+                    except Exception:
+                        pass
+                log_exec(f"    [LANE] BOTH LANES DOWN: deepseek RL ({rl_detail[:80]}) + "
+                         f"OmniRoute HTTP {resp.status}: {body[:120]}")
+                return f"ERROR: BOTH_LANES_DOWN; {rl_detail[:80]} / omniroute {resp.status}: {body[:160]}"
+        except asyncio.TimeoutError:
+            log_exec(f"    [LANE] BOTH LANES DOWN: deepseek RL ({rl_detail[:80]}) + "
+                     f"OmniRoute TIMEOUT after {WEBCHAT_TIMEOUT}s.")
+            return "ERROR: BOTH_LANES_DOWN; deepseek RL + omniroute timeout"
+        except Exception as e:
+            log_exec(f"    [LANE] BOTH LANES DOWN: deepseek RL ({rl_detail[:80]}) + "
+                     f"OmniRoute error ({type(e).__name__}): {e}")
+            return "ERROR: BOTH_LANES_DOWN; deepseek RL + omniroute error"
     return "ERROR: webchat unavailable"
 
 
