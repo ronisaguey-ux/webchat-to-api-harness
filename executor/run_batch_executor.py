@@ -66,6 +66,11 @@ from execute_master_oculus_plan import (  # noqa: E402
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4"))
 BACKSTOP_ROUNDS = max(6, WEBCHAT_ESCAPE_ATTEMPTS * 3)
 
+# Flock fh must stay alive for the WHOLE run: if the returned file handle is
+# dropped, CPython GC closes the fd and the kernel releases the flock — a second
+# executor can then grab the lock and double-write state (seen live 2026-08-21).
+_LOCK_FH = None
+
 
 def acquire_lock():
     lock_path = EXECUTION_STATE_FILE + ".lock"
@@ -243,10 +248,17 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--dry-run", action="store_true", help="Scan + report only (no LLM, no commits).")
+    # Accepted for compatibility when spawned by the orchestrator (it always
+    # appends these; batch mode always resumes from the state file and never
+    # skips a step, so they are no-ops here).
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--no-precheck", action="store_true")
+    ap.add_argument("--continue-on-failure", action="store_true")
     args = ap.parse_args()
 
+    global _LOCK_FH
     if not args.dry_run:
-        acquire_lock()  # held for the whole run; main executor exits FATAL on contention
+        _LOCK_FH = acquire_lock()  # keep fh alive — GC dropping it would release the flock
     log_exec(f"[BATCH] Batch mode starting (batch-size={args.batch_size}, dry-run={args.dry_run})")
     log_exec(f"[BATCH] Plan: {MASTER_PLAN_FILE}")
 
