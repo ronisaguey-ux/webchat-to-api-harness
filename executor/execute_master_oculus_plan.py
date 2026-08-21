@@ -1187,6 +1187,15 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
                 else:
                     body = await resp.text()
                     log_exec(f"    [WEBCHAT] gateway HTTP {resp.status}: {body[:120]}")
+                    low = body.lower()
+                    if any(sig in low for sig in ("too frequent", "rate_limit", "rate limit")):
+                        # DeepSeek frequency cooldown: rapid retries each send a
+                        # NEW message and RESET the cooldown window (observed
+                        # 08-21: 3 retries 2s apart extended the block for 25+ min
+                        # while the user's own message passed in the quiet gap).
+                        # Surface immediately — the caller's exponential ladder
+                        # (45s->600s) is what must pace the retry.
+                        return f"ERROR: {body[:160]}"
         except asyncio.TimeoutError:
             # 08-20 (audit BUG-07): str(asyncio.TimeoutError()) == "" — the old
             # generic except logged a blank line and silently abandoned the
