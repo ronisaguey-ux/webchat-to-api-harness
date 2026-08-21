@@ -229,8 +229,16 @@ async def _solve_step_with_feedback(session, step) -> tuple[bool, str]:
         if ok:
             return True, msg
         low = (msg or "").lower()
-        if any(sig in low for sig in ("rate_limit", "too frequent", "webchat unavailable",
-                                      "server disconnected", "429")):
+        # 08-21 fix: call-layer failures ALWAYS start with "ERROR:" (call_webchat
+        # prefixes every gateway/transport error). Without this gate, a step whose
+        # OWN verification output mentions rate limiting (e.g. step 179's
+        # test_api_rate_limiting.py, or any step asserting HTTP 429) gets
+        # misclassified as a lane cooldown and real failures never feed back —
+        # observed 10:35-13:30: step 179 cycling flat-300s while pytest
+        # genuinely failed 5-6 tests.
+        if (msg or "").startswith("ERROR:") and any(sig in low for sig in (
+                "rate_limit", "too frequent", "webchat unavailable",
+                "server disconnected", "429")):
             # 08-21 (user): NO exponential ladder — once rate-limited, retry
             # exactly every 5 minutes (flat). Rapid retries reset DeepSeek's
             # frequency window; 5 min gives it room to clear.
