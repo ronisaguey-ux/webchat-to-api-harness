@@ -613,7 +613,12 @@ const WEBCHAT_PREAMBLE =
     '- When you have enough information to act, act. Do not re-read files you have already read, ' +
     're-derive facts you already established, or narrate options you will not pursue.\n' +
     '- If you catch yourself about to submit after trivial work while a large task remains undone, you ' +
-    'have failed the task — keep working until it is genuinely complete.\n';
+    'have failed the task — keep working until it is genuinely complete.\n' +
+    '- NEVER CODE LAZILY (user rule 08-22): implement FULL working code — complete features, real ' +
+    'logic, real behavior. Never leave placeholders, stubs, \'# Description:\' comment markers, TODO ' +
+    'notes, or "Automated placeholder" text in the files you touch; a task pasted as a comment instead ' +
+    'of implemented is a FAILED task (phantom-pass). If you cannot implement the task, report exactly ' +
+    'what blocks it — never fake completion.\n';
 
 // ── Tool-call size cap (user rule 08-13) ────────────────────────────────
 // The chat renderer truncates very long messages, which corrupts fenced JSON
