@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "columns": [
+    {"name": "timestamp", "type": "datetime"},
+    {"name": "open", "type": "float"},
+    {"name": "high", "type": "float"},
+    {"name": "low", "type": "float"},
+    {"name": "close", "type": "float"},
+    {"name": "volume", "type": "int"}
+  ]
+}
