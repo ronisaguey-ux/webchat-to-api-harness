@@ -111,6 +111,9 @@ async def main() -> None:
     ap.add_argument("--repo", default="/home/roni/Roni_Workspace/helpotron")
     ap.add_argument("--findings", required=True)
     ap.add_argument("--out", default=f"/home/roni/Roni_Workspace/audits_plans/cross_eval_{time.strftime('%m-%d')}.json")
+    ap.add_argument("--lanes", default="gemini,deepseek",
+                    help="comma-separated lanes to evaluate with (default both; "
+                         "single lane = degraded-mode fallback, same as audit)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -118,7 +121,10 @@ async def main() -> None:
         audit = json.load(f)
     findings = audit["findings"]
     batches = _finding_batches(findings)
-    log(f"Cross-eval: {len(findings)} findings, dual lanes")
+    lanes = [l.strip() for l in args.lanes.split(",") if l.strip() in LANES]
+    if not lanes:
+        sys.exit(f"FATAL: no valid lanes in {args.lanes!r} (have {list(LANES)})")
+    log(f"Cross-eval: {len(findings)} findings, lanes={','.join(lanes)}")
 
     if args.dry_run:
         log("DRY-RUN: batches ready")
@@ -130,9 +136,9 @@ async def main() -> None:
 
     async with __import__("aiohttp").ClientSession() as session:
         for i, finding in enumerate(findings):
-            bids = {lane["name"]: {"verdict": None} for lane in LANES.values()}
+            bids = {lane["name"]: {"verdict": None} for lane in [LANES[l] for l in lanes]}
             verdicts: List[Dict[str, Any]] = []
-            for lane in LANES.values():
+            for lane in [LANES[l] for l in lanes]:
                 try:
                     ev = await _evaluate(session, args.repo, finding, lane)
                 except Exception as e:  # noqa: BLE001
@@ -143,11 +149,11 @@ async def main() -> None:
                 results["evaluations"].append({**finding, "eval": ev})
 
             vg = [v["verdict"] for v in verdicts]
-            confirmed = vg.count("confirmed")
-            dismissed = vg.count("dismissed")
-            if confirmed == 2:
+            # unanimous verdict across the active lanes; mixed (or single-lane
+            # dissenting) votes land in needs_review
+            if vg and all(v == "confirmed" for v in vg):
                 final = "confirmed"
-            elif dismissed == 2:
+            elif vg and all(v == "dismissed" for v in vg):
                 final = "dismissed"
             else:
                 final = "needs_review"
