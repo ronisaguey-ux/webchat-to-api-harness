@@ -1387,6 +1387,11 @@ async function waitForResponse(before, typedText) {
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
     let emptySince = 0; // how long the newest message element has been empty
+    // 08-23 WEDGE FIX (investigator report): phantom-stop detector state.
+    let busySilentSince = 0;      // busy-without-progress start, ms since epoch (0=armed)
+    let lastProgressLen = 0;      // text+answer length at last poll (progress baseline)
+    let lastSpinLog = 0;          // last [still waiting] spin-log timestamp
+    let phantomRecovered = false; // fresh-chat recovery already fired for this request
     while (Date.now() < deadline) {
         // 08-13: stream tee FIRST — the DOM may never render the answer in
         // this environment. found=true means loadend fired, so the body is
@@ -1534,26 +1539,46 @@ async function waitForResponse(before, typedText) {
         } else {
             emptySince = 0;
         }
-        // Activity-reset: ANY thread movement (DeepSeek cogitating, streaming,
-        // or working through earlier queued messages) extends the deadline —
-        // a response arriving at 190s must not die on a 180s timer. The 1.5s
-        // poll cadence means this only fires on real changes, never the steady
-        // state that the stability check above accepts.
-        if (state.mode === 'vl' && lastText !== null && state.text !== lastText) {
+        // 08-23 WEDGE FIX (investigator report #1+#3): deadline extension now
+        // requires REAL progress (text/answer movement). The old bare-busy
+        // extension let a phantom STOP (SSE dead with the stop button up)
+        // extend the wait to the 6x hard cap with zero output — the silent
+        // wedge. Genuine generation is still covered: DeepThink streams
+        // reasoning text (progress ticks), and silent-but-real cogitations are
+        // given an 8-min grace before recovery below.
+        const progressLen = (state.text ? state.text.length : 0) + (state.answer ? state.answer.length : 0);
+        const progressedNow = (state.mode === 'vl' && lastText !== null && state.text !== lastText)
+            || progressLen !== lastProgressLen;
+        if (progressedNow) {
+            busySilentSince = 0;
             deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
+        } else if (busy) {
+            // Phantom-stop detector (08-23): busy with zero progress. Stream a
+            // [still waiting] spin line every 60s; after 8 min, open a FRESH
+            // chat once (a server-side pending generation on the dead thread
+            // is what keeps the account's one-in-flight rule locked — a new
+            // thread escapes it); 60s after that, fail fast so the caller can
+            // retry instead of spinning to the 6x hard cap.
+            if (busySilentSince === 0) busySilentSince = Date.now();
+            if (Date.now() - lastSpinLog > 60000) {
+                lastSpinLog = Date.now();
+                console.log(`[still waiting] busy text-len=${progressLen} silent=${Math.round((Date.now() - busySilentSince) / 1000)}s`);
+            }
+            if (!phantomRecovered && Date.now() - busySilentSince > 8 * 60000) {
+                console.log('phantom STOP: busy without progress for 8 min — opening a fresh chat');
+                phantomRecovered = true;
+                busySilentSince = Date.now();
+                try {
+                    await openNewChat();
+                } catch (e) {
+                    console.log('fresh-chat recovery failed, falling back to reload:', String(e.message).slice(0, 60));
+                    try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch (e2) { console.log('reload failed:', String(e2.message).slice(0, 60)); }
+                }
+            } else if (phantomRecovered && Date.now() - busySilentSince > 60000) {
+                throw new Error('Webchat tab still generating without progress after fresh-chat recovery — retry after it finishes');
+            }
         }
-        // Silent-generation signal (08-12 23:55): with DeepThink off the model
-        // cogitates SILENTLY — no text movement for minutes while the send
-        // button shows STOP (a generation is running). The text-activity reset
-        // above misses that, so long cogitations died on the 180s deadline
-        // with a complete answer arriving seconds later. STOP state extends
-        // the deadline exactly like text activity does. 08-13: extended to
-        // count-mode sites — a running generation there means the newest row
-        // is still streaming, so the deadline must not expire into a stale
-        // rescue (gemini's 20197-char request rescued a 22-char stale row).
-        if (busy) {
-            deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
-        }
+        lastProgressLen = progressLen;
         lastText = state.text;
         lastLen = state.text.length;
         if (state.mode === 'vl') lastAnswerLen = state.answer ? state.answer.length : -1;
