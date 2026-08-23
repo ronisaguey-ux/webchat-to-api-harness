@@ -37,16 +37,31 @@ from swarm.swarm_common import (  # noqa: E402
     LANES, call_with_takeover, extract_json_block, log, run_verification,
 )
 
+# 08-23 v2: the first run's 9 coarse dimensions self-capped at ~10 findings
+# each and one dimension (data_integrity) failed entirely -> 77 findings for a
+# 301-file repo. Split into 20 fine-grained dimensions so every surface gets
+# its own focused pass; each still self-caps but the unit is smaller.
 DIMENSIONS = [
-    ("auth_security", "Authentication, authorization, IDOR, secrets in code, injection, CORS, rate limiting"),
-    ("data_integrity", "Database models, migrations, cascade deletes, uniqueness, orphaned rows, race conditions"),
-    ("cost_and_llm", "LLM API usage, cost tracking, model allowlist compliance, effort-tier routing, credit charging"),
-    ("frontend_ux", "React component correctness, state management, dead UI paths, broken navigation, a11y gaps"),
-    ("api_correctness", "Route handlers, status codes, error handling, request validation, response shapes"),
-    ("background_jobs", "Async tasks, agent sessions, SSE streams, websockets, timeouts, resource leaks"),
-    ("compliance", "Privacy policy, terms, GDPR/FERPA markers, data retention, PII handling"),
-    ("test_coverage", "Test files, stale tests, tests that lie (vacuous passes), missing coverage of new surfaces"),
-    ("code_quality", "Dead code, stub/placeholder patterns, TODO/FIXME markers, duplicated logic, style drift"),
+    ("auth_login", "Authentication flow, session management, token storage, password handling, MFA, account takeover"),
+    ("auth_authorization", "Authorization checks, role/permission enforcement, IDOR, object-level access control"),
+    ("injection_secrets", "SQL/command/LLM injection, hardcoded secrets, API keys in code, insecure deserialization"),
+    ("network_web", "CORS, CSRF, rate limiting, security headers, open redirects, SSRF"),
+    ("data_models", "Database models, relationships, cascade deletes, uniqueness constraints, migrations"),
+    ("data_races", "Race conditions, orphaned rows, transaction boundaries, optimistic locking, stale reads"),
+    ("llm_cost", "LLM API usage, cost tracking, model allowlist compliance, effort-tier routing, credit charging"),
+    ("billing_wallet", "Credit wallet, billing logic, ledger integrity, negative balances, double-charge, refunds"),
+    ("api_handlers", "Route handlers, status codes, request validation, response shapes, middleware"),
+    ("api_errors", "Error handling, silent failures, swallowed exceptions, error message leakage, 500s"),
+    ("frontend_routing", "React routing, navigation, dead UI paths, route guards, broken links"),
+    ("frontend_state", "State management, hooks correctness, useEffect deps, memory leaks, stale closures"),
+    ("frontend_a11y_ui", "Accessibility, keyboard nav, ARIA, focus management, broken UI states, layout bugs"),
+    ("bg_agents", "Async tasks, agent sessions, background workers, job queues, resource cleanup"),
+    ("streaming_realtime", "SSE streams, websockets, connection lifecycle, timeout handling, resource leaks"),
+    ("privacy_compliance", "Privacy policy, terms, GDPR/FERPA markers, PII handling, data retention, deletion"),
+    ("test_integrity", "Vacuous tests, stale tests, assertions that lie, fake mocks, false-positive CI"),
+    ("test_coverage", "Missing coverage of new surfaces, untested modules, untested error paths"),
+    ("dead_code_stubs", "Dead code, unused exports, unreachable branches, stub/placeholder patterns, TODO/FIXME"),
+    ("performance_scale", "N+1 queries, unbounded loops, cache correctness, payload bloat, bundle size"),
 ]
 
 SYSTEM_PROMPT = (
