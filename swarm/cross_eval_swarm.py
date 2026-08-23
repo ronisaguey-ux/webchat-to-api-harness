@@ -160,6 +160,11 @@ async def main() -> None:
                 "reasons": [v["reason"] for v in verdicts],
                 "lanes": bids,
             }
+            # crash-resilience (08-23 lesson from audit_swarm): persist after
+            # EVERY finding so an interrupted run keeps everything so far —
+            # a mid-run kill used to discard the whole evaluation.
+            with open(args.out, "w") as f:
+                json.dump(results, f, indent=2)
             if (i + 1) % 5 == 0 or i == len(findings) - 1:
                 log(f"  {i + 1}/{len(findings)} evaluated ({final})")
 
