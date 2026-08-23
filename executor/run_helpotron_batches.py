@@ -264,7 +264,16 @@ def _sys_prompt() -> str:
         "command is failing — a round that ends in a summary without passing verifications "
         "counts as FAILED. Only after every verification command for the batch passes may "
         "you reply with a plain-text summary: per remediation step, what you changed and "
-        "whether its verification passed."
+        "whether its verification passed.\n"
+        "ANTI-GRAFT DISCIPLINE (08-23, non-negotiable): a verification command that passes "
+        "while the feature does not work is a FAILED VERIFICATION, not a pass. A bare grep "
+        "only proves a string exists — it never proves a feature works. If a verification "
+        "is (or is only) a string grep, STRENGTHEN it: run the code path (import+call the "
+        "function with real inputs, curl the endpoint, run the build/tests) and report "
+        "success only when the BEHAVIOR is proven. NEVER paste a verification-target string "
+        "into a file to make a grep pass — that is fake completion; the batch will be "
+        "re-run until the behavior actually works. You may ADD runtime verifications but "
+        "never delete or weaken the plan's commands."
     )
 
 
