@@ -60,7 +60,7 @@ except Exception:
 # ─── CONFIGURATION: ENVIRONMENT PATHS ──────────────────────────────────────
 OCULUS_DIR = os.getenv("OCULUS_DIR", "/home/roni/Roni_workspace/oculus")
 AUDITS_PLANS_DIR = os.getenv("AUDITS_PLANS_DIR", "/home/roni/Roni_workspace/audits_plans")
-MASTER_PLAN_FILE = os.getenv("MASTER_PLAN_FILE", f"{AUDITS_PLANS_DIR}/master_oculus_plan_8_3.md")
+MASTER_PLAN_FILE = os.getenv("MASTER_PLAN_FILE", f"{AUDITS_PLANS_DIR}/master_oculus_plan_8_14.md")
 EXECUTION_STATE_FILE = os.getenv("EXECUTION_STATE_FILE", f"{AUDITS_PLANS_DIR}/plan_execution_state.json")
 EXECUTION_LOG_FILE = os.getenv("EXECUTION_LOG_FILE", f"{AUDITS_PLANS_DIR}/plan_execution.log")
 EXECUTION_JSON_LOG_FILE = os.getenv("EXECUTION_JSON_LOG_FILE", f"{AUDITS_PLANS_DIR}/plan_execution_logs.jsonl")
@@ -290,6 +290,36 @@ def is_safe_command(cmd) -> bool:
         if any(m in a for m in (";", "&&", "|", ">", "$", "`")):
             return False
     return True
+
+
+def is_suite_cmd(command: str) -> bool:
+    """True if the command runs a verification/test suite requiring a hard exit-code verdict.
+
+    Suite commands (pytest/mypy/ruff/black/verify_suite/verify_regression/
+    py_compile/import/pip install) must not pass on substring tolerance — a
+    non-zero exit code is a hard FAIL. Substring tolerances below apply only
+    to non-suite ancillary checks (grep-style probes).
+    """
+    suite_patterns = [
+        r'^pytest\s+',
+        r'^python3\s+-m\s+pytest\s*',
+        r'^pytest$',
+        r'^python3\s+scripts/verify_suite\.py',
+        r'^verify_suite',
+        r'^python3\s+scripts/verify_regression\.py',
+        r'^verify_regression',
+        r'^lint-imports$',
+        r'^mypy\s+',
+        r'^ruff\s+',
+        r'^black\s+--check\s+',
+        r'py_compile',
+        r'\bpip install\b',
+        r'^python3?\s+-c\s+["\']?import ',
+    ]
+    for pattern in suite_patterns:
+        if re.match(pattern, command.strip()):
+            return True
+    return False
 
 
 # ─── DISK JSON & TEXT LOGGING HELPERS ───────────────────────────────────────
@@ -1103,9 +1133,12 @@ CRITICAL REQUIREMENTS:
                 continue
             ok, vout = run_isolated_shell_command(vcmd, env_id=f"ds_step_{step_idx}_chk_{i}")
             if not ok:
-                if ("git grep" in vcmd or "git ls-files" in vcmd) and not vout:
-                    pass
-                elif "SyntaxError" in vout:
+                # Hard exit-code verdict for suite commands: substring tolerances
+                # only apply to non-suite ancillary checks, never to pytest/import/compile.
+                if is_suite_cmd(vcmd) and not ("Security Violation" in vout or "Unauthorized emergency liquidation" in vout):
+                    all_verifications_ok = False
+                    log_exec(f"    [ds_verify] Check #{i}: `{vcmd[:60]}` -> HARD FAIL: {vout[:150]}")
+                elif ("git grep" in vcmd or "git ls-files" in vcmd or "grep" in vcmd) and not vout:
                     pass
                 elif "Security Violation" in vout or any(pat.lower() in vout.lower() for pat in diag_patterns):
                     pass
