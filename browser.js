@@ -879,7 +879,28 @@ async function verifySendCleared() {
     if (bard) {
         throw new Error(`webchat send failed — gemini backend rejected the send (BardErrorInfo ${bard} = rate-limit/abuse block). Wait out the cooldown; do NOT reload-hammer it.`);
     }
-    throw new Error('webchat send failed — prompt stranded in composer (React out of sync). Reload the tab and resend.');
+    // 08-23: auto-heal instead of only instructing — the tab's React state is
+    // gone, so reload it INLINE; the client's retry (attempt 2/2) then lands on
+    // a fresh tab instead of a second guaranteed failure. Bard-backend
+    // rejections (BardErrorInfo branch above) still bypass this deliberately —
+    // waiting out the cooldown is the fix there, not a reload.
+    console.log('🧹 stranded composer detected — reloading tab for inline self-heal');
+    try {
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await sleep(3000); // let the UI settle after reload
+        const inputAvail = await page.evaluate((sels) => {
+            for (const sel of sels) {
+                if (document.querySelector(sel)) return true;
+            }
+            return false;
+        }, config.selectors.input);
+        console.log(inputAvail
+            ? '🧹 tab reloaded — composer input present, ready for client retry'
+            : '🧹 tab reloaded but composer input not found — client retry may still fail');
+    } catch (e) {
+        console.log('🧹 inline reload failed:', String(e.message).slice(0, 60));
+    }
+    throw new Error('webchat send failed — prompt stranded in composer (React out of sync). Tab reloaded; retry the send.');
 }
 
 // ── Chat snapshot (build-agnostic) ─────────────────────────────
