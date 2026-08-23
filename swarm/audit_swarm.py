@@ -118,10 +118,17 @@ async def _solve(session, repo: str, inventory: List[str], lane: Dict[str, str],
                  out: Dict[str, Any]) -> None:
     async def solver(s, batch: Dict[str, Any]) -> str:
         prompt = _build_prompt(repo, batch["dimension"], batch["scope"], inventory)
-        raw = await call_with_takeover(s, lane, prompt, SYSTEM_PROMPT, max_tokens=4000)
-        parsed = extract_json_block(raw)
+        parsed = None
+        for attempt in range(3):
+            raw = await call_with_takeover(s, lane, prompt, SYSTEM_PROMPT, max_tokens=4000)
+            parsed = extract_json_block(raw)
+            if parsed is not None:
+                break
+            log(f"    [{lane['name']}] {batch['batch_id']} non-JSON reply "
+                f"(attempt {attempt + 1}/3): {raw[:160]!r} — retrying with fresh thread")
         if parsed is None:
-            return "ERROR: non-JSON audit reply"
+            log(f"    [{lane['name']}] {batch['batch_id']} FAILED: non-JSON after 3 attempts")
+            return "ERROR: non-JSON audit reply after 3 attempts"
         findings = parsed.get("findings") or []
         kept = []
         for f in findings:
@@ -149,16 +156,70 @@ async def _solve(session, repo: str, inventory: List[str], lane: Dict[str, str],
     return solver
 
 
+LOCK_FILE = "/tmp/audit_swarm.lock"
+
+
+def _acquire_lock() -> None:
+    """Singleton guard: refuse to start if another audit run is alive.
+    Prevents concurrent runs hammering the same lanes (observed 08-23:
+    a survivor from 05:20 + a 06:28 relaunch ran side-by-side)."""
+    import errno
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+        try:
+            with open(LOCK_FILE) as f:
+                pid = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            pid = 0
+        if pid and os.path.exists(f"/proc/{pid}"):
+            sys.exit(f"FATAL: another audit_swarm is running (pid {pid}) — aborting")
+        os.unlink(LOCK_FILE)  # stale lock from a dead run
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+
+
+def _release_lock() -> None:
+    try:
+        with open(LOCK_FILE) as f:
+            pid = int(f.read().strip() or 0)
+        if pid == os.getpid():
+            os.unlink(LOCK_FILE)
+    except (OSError, ValueError):
+        pass
+
+
 async def main() -> None:
+    _acquire_lock()
+    try:
+        await _run()
+    finally:
+        _release_lock()
+
+
+async def _run() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="/home/roni/Roni_Workspace/helpotron")
     ap.add_argument("--out", default=f"/home/roni/Roni_Workspace/audits_plans/audit_findings_{time.strftime('%m-%d')}.json")
+    ap.add_argument("--dims", default="", help="comma-separated dimension names to audit (subset re-run)")
+    ap.add_argument("--lanes", default="gemini,deepseek",
+                    help="comma-separated lanes to use (default both; single lane = all batches on it)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     inventory = _file_inventory(args.repo)
     log(f"Inventory: {len(inventory)} files in {args.repo}")
     batches = _dimension_batches(args.repo, inventory)
+    if args.dims:
+        wanted = {d.strip() for d in args.dims.split(",") if d.strip()}
+        batches = [b for b in batches if b["dimension"] in wanted]
+        log(f"Dimension subset: {len(batches)} batches ({sorted(wanted)})")
+    lanes = [l.strip() for l in args.lanes.split(",") if l.strip() in LANES]
+    if not lanes:
+        sys.exit(f"FATAL: no valid lanes in {args.lanes!r} (have {list(LANES)})")
     out = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "repo": args.repo,
            "lanes_used": ["gemini", "deepseek"], "findings": []}
 
@@ -166,12 +227,18 @@ async def main() -> None:
         log(f"DRY-RUN: {len(batches)} audit batches ready")
         return
 
-    # Parallel dual-lane workers over a shared queue (round-robin by index)
-    results = await asyncio.gather(*[
-        _worker(i % 2, batch_list := batches[i::2], args.repo, inventory,
-                out, LANES["gemini" if i % 2 == 0 else "deepseek"])
-        for i in range(2)
-    ])
+    # Workers over a shared queue: round-robin when dual-lane, all batches
+    # on the single lane otherwise (deepseek-only is the reliable fallback
+    # when the gemini tab cannot sustain large prompts)
+    if len(lanes) == 1:
+        results = await asyncio.gather(_worker(0, batches, args.repo, inventory,
+                                               out, LANES[lanes[0]], out_path=args.out))
+    else:
+        results = await asyncio.gather(*[
+            _worker(i % 2, batch_list := batches[i::2], args.repo, inventory,
+                    out, LANES["gemini" if i % 2 == 0 else "deepseek"], out_path=args.out)
+            for i in range(2)
+        ])
     del results
 
     with open(args.out, "w") as f:
@@ -180,12 +247,20 @@ async def main() -> None:
 
 
 async def _worker(start_idx: int, batches: List[Dict[str, Any]], repo: str,
-                  inventory: List[str], out: Dict[str, Any], lane: Dict[str, str]) -> None:
+                  inventory: List[str], out: Dict[str, Any], lane: Dict[str, str],
+                  out_path: str = "") -> None:
     async with __import__("aiohttp").ClientSession() as session:
         solver = await _solve(session, repo, inventory, lane, out)
         for batch in batches:
             try:
-                await solver(session, batch)
+                result = await solver(session, batch)
+                if isinstance(result, str) and result.startswith("ERROR:"):
+                    log(f"[{lane['name']}] {batch['batch_id']} failed: {result}")
+                if out_path:
+                    # crash-resilience: persist findings after every batch so
+                    # an interrupted run keeps everything completed so far
+                    with open(out_path, "w") as f:
+                        json.dump(out, f, indent=2)
             except Exception as e:  # noqa: BLE001
                 log(f"[{lane['name']}] {batch['batch_id']} failed: {str(e)[:140]}")
 
