@@ -168,22 +168,29 @@ async def call_with_takeover(session: aiohttp.ClientSession, lane: Dict[str, str
     """Primary-lane call with OmniRoute takeover.
 
     Rate-limited (or failed) -> OmniRoute takes over, retried every
-    SWARM_TAKEOVER_RETRY seconds until success. After a success the primary
-    lane is used again on the next call (swap back)."""
+    SWARM_TAKEOVER_RETRY seconds until success. Each retry cycle re-probes
+    the primary lane first — the moment it recovers, service resumes there
+    (swap back is real, not aspirational)."""
     try:
         return await call_lane(session, lane, user_prompt, system_prompt, max_tokens)
     except SwarmRateLimited:
         log(f"    [{lane['name']}] RATE-LIMITED -> OmniRoute takeover (retry every "
             f"{TAKEOVER_RETRY_SECONDS}s until success)")
-        return await _omniroute_with_retry(session, user_prompt, system_prompt, max_tokens)
+        return await _omniroute_with_retry(session, lane, user_prompt, system_prompt, max_tokens)
     except SwarmLaneError as e:
         log(f"    [{lane['name']}] lane failure ({str(e)[:100]}) -> OmniRoute takeover")
-        return await _omniroute_with_retry(session, user_prompt, system_prompt, max_tokens)
+        return await _omniroute_with_retry(session, lane, user_prompt, system_prompt, max_tokens)
 
 
-async def _omniroute_with_retry(session: aiohttp.ClientSession, user_prompt: str,
-                                system_prompt: str, max_tokens: int) -> str:
+async def _omniroute_with_retry(session: aiohttp.ClientSession, lane: Dict[str, str],
+                                user_prompt: str, system_prompt: str, max_tokens: int) -> str:
     while True:
+        # swap-back: probe the primary lane once per cycle; a recovered lane
+        # ends the takeover immediately
+        try:
+            return await call_lane(session, lane, user_prompt, system_prompt, max_tokens)
+        except (SwarmRateLimited, SwarmLaneError) as e:
+            log(f"    [{lane['name']}] still down ({str(e)[:80]}) — OmniRoute attempt")
         try:
             return await call_omniroute(session, user_prompt, system_prompt)
         except SwarmLaneError as e:
