@@ -178,6 +178,20 @@ def shrink_guard(batch: dict) -> "str | None":
 async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
                        system_prompt: str) -> str:
     """OpenAI-compatible call to the gemini webchat gateway (8085)."""
+    # Fresh thread per call: gemini threads accumulate an in-tab "API error"
+    # banner after long generations, which the gateway treats as a permanent
+    # failure (08-22: BATCH-02 wedged 3x). The prompt is self-contained, so a
+    # newchat loses nothing and prevents the wedge.
+    try:
+        async with session.post(WEBCHAT_API_BASE.rstrip('/') + "/newchat",
+                                json={}, headers={"Content-Type": "application/json"},
+                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 200:
+                log_exec("    [WEBCHAT] fresh thread started (newchat)")
+            else:
+                log_exec(f"    [WEBCHAT] newchat returned HTTP {resp.status} — continuing on current thread")
+    except Exception as e:  # noqa: BLE001
+        log_exec(f"    [WEBCHAT] newchat failed ({str(e)[:80]}) — continuing on current thread")
     url = f"{WEBCHAT_API_BASE.rstrip('/')}/chat/completions"
     payload = {
         "model": "anymodel",
@@ -240,8 +254,17 @@ def _sys_prompt() -> str:
         "Use the helpotron venv for python checks: `~/.venv/bin/python` is on your PATH as "
         "`python3` (the repo venv). Do not pip-install new packages unless the batch asks for "
         "it (the venv is frozen).\n"
-        "Reply with a plain-text summary: per remediation step, what you changed and whether "
-        "its verification passed."
+        "CRITICAL EXECUTION RULE: you are an IMPLEMENTER, not an analyst. Running a "
+        "verification command or reading files is NOT implementing — you MUST change the "
+        "actual source files with write_file/edit_file (create new files with write_file "
+        "when the verification needs a module that does not exist yet). If a verification "
+        "still fails after your investigation, that means your implementation is not done: "
+        "keep reading code, keep editing files, keep re-running the verification until it "
+        "genuinely passes. NEVER reply with your final summary while any verification "
+        "command is failing — a round that ends in a summary without passing verifications "
+        "counts as FAILED. Only after every verification command for the batch passes may "
+        "you reply with a plain-text summary: per remediation step, what you changed and "
+        "whether its verification passed."
     )
 
 
@@ -314,7 +337,13 @@ async def _solve_batch_with_feedback(session: aiohttp.ClientSession, batch: dict
             f"for a different code shape). Adapt the implementation so the command's INTENT "
             f"passes. The verification commands are .verify/ script files — run them EXACTLY "
             f"as written with run_bash (`python3 .verify/batch_XX_verify.py`); never "
-            f"substitute different endpoints or rewrite the scripts. Re-run every "
+            f"substitute different endpoints or rewrite the scripts.\n"
+            f"IMPORTANT — YOU MUST IMPLEMENT, NOT JUST DIAGNOSE: running the verification "
+            f"script is NOT a fix. Find the source module behind the failing check, read it "
+            f"with read_file, then write the fix with write_file/edit_file (create missing "
+            f"modules with write_file). Then re-run the verification. If it still fails, "
+            f"repeat: read -> edit -> verify. Do NOT send a final message while verification "
+            f"is failing — a diagnosis-only reply counts as FAILED. Re-run every "
             f"verification command yourself until they all genuinely pass, then report "
             f"DONE.\n\n"
             f"The batch to fix:\n" + _batch_spec(batch)
@@ -386,7 +415,9 @@ async def main() -> None:
         acquire_lock()
 
     plan = json.load(open(PLAN_FILE))
-    batches = plan["batches"]
+    # 08-22: the 8_22 master plan emits "remediation_batches" (audit-to-plan
+    # schema); the 8_21 plan used "batches". Accept both.
+    batches = plan.get("batches") or plan.get("remediation_batches") or []
     state = load_state()
     completed = set(state.get("completed_batches", []))
     failed = set(state.get("failed_batches", []))

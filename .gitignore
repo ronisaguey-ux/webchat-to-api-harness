@@ -4,3 +4,7 @@ node_modules/
 *.log
 chat.js
 bash_tool_log.jsonl
+
+__pycache__/
+*.pyc
+.env.bak_costsave

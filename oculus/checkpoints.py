@@ -2,6 +2,10 @@ import pickle
 import io
 from typing import Any, Dict
 
+class CheckpointCorruptionError(Exception):
+    """Raised when a checkpoint file is corrupted or malicious."""
+    pass
+
 class _RestrictedUnpickler(pickle.Unpickler):
     """
     Restricted unpickler that only allows safe built-in types.
@@ -28,9 +32,14 @@ def load_checkpoint(file_path: str) -> Dict[str, Any]:
     """
     Load a checkpoint file using restricted unpickling.
     Returns the data dictionary.
+    Raises CheckpointCorruptionError on corrupt or malicious checkpoints.
     """
     with open(file_path, 'rb') as f:
-        return _RestrictedUnpickler(f).load()
+        data = f.read()
+    try:
+        return _RestrictedUnpickler(io.BytesIO(data)).load()
+    except (pickle.UnpicklingError, EOFError, AttributeError, ImportError, IndexError) as exc:
+        raise CheckpointCorruptionError(f"refusing to load corrupted checkpoint: {exc}") from exc
 
 def save_checkpoint(data: Dict[str, Any], file_path: str) -> None:
     """Save checkpoint data using standard pickle (no restrictions)."""
