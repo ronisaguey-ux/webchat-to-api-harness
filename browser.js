@@ -20,6 +20,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // takeThreadSwap() and pins respawns, the same way a context-handoff pins its
 // new thread.
 let swappingToInstant = false;
+// 08-28: the FORCE_EXPERT swap (added 08-25) opened a fresh EXPERT chat but was
+// never wired into the pin-capture below — only swappingToInstant armed it. So
+// takeThreadSwap() always returned null for expert swaps, config.tabUrlSubstring
+// kept pointing at the OLD instant thread, and EVERY send re-swapped: 666 swaps
+// / 0 pins / 82 leaked tabs in 6h. Mirror flag so expert swaps pin too.
+let swappingToExpert = false;
 let threadSwapSeen = null;
 // 08-17 TEE-START RACE FIX: waitForResponse filters tee entries to "this
 // request" by seq > teeStart. Capturing teeStart at waitForResponse entry is
@@ -29,6 +35,20 @@ let threadSwapSeen = null;
 // the send; the completion then always pushes seq > teeStart. Set by
 // sendMessage, consumed one-shot by waitForResponse.
 let requestTeeStart = null;
+// 08-24 (webchat transport audit): gemini generation-error banner-heal latch —
+// true after one in-request heal reload so the same banner can't reload-hammer.
+// This was previously UNDECLARED: the first read on the gemini lane threw a
+// silent ReferenceError (request died with a confusing 500), and once the
+// implicit global existed it NEVER reset, so every later real banner skipped
+// the inline heal and the client retry landed on the same dirty tab.
+// Reset in openNewChat(): a fresh chat is a clean slate.
+let generationErrHealed = false;
+// 08-24 (investigator 1, transport audit): gemini phantom-stop stability
+// counter — counts consecutive waitForResponse polls where the newest row's
+// text is byte-identical. Streaming rows grow every poll, so a counter >= 6
+// (~9s) endorses a committed reply even while the ghost "Stop response"
+// control keeps isForeignBusy() true (see the accept gate in waitForResponse).
+let geminiStablePolls = 0;
 function takeThreadSwap() {
     const t = threadSwapSeen;
     threadSwapSeen = null;
@@ -129,14 +149,22 @@ async function initBrowser({ reconnect = false } = {}) {
         // real 151 binary) + ephemeral profile + saved cookies = Google session
         // rotation challenge → wedge. Cloak passes with the SAME cookies
         // (probe scripts/cloak_probe.js VERIFIED: SPA loaded, hasInput).
-        const { launch } = await import('cloakbrowser');
-        browser = await launch({
+        // 08-24 audit fix (P1): cloak launch() IGNORES userDataDir (it is a
+        // non-persistent launch) — the pinned login profile was never used.
+        // launchPersistentContext honors it AND arrives with a page open;
+        // never create a second incognito context on top.
+        const { launchPersistentContext } = await import('cloakbrowser');
+        context = await launchPersistentContext({
             headless: true,
             humanize: true,
+            // Pinned profile when WEBCHAT_PROFILE is set; else a fresh
+            // ephemeral dir (launchPersistentContext REQUIRES a string path).
+            userDataDir: process.env.WEBCHAT_PROFILE
+                || require('fs').mkdtempSync(require('os').tmpdir() + '/cloak-lane-'),
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
         });
-        context = await browser.newContext();
-        page = await context.newPage();
+        browser = context.browser();
+        page = context.pages()[0] || await context.newPage();
         // playwright → puppeteer API shims for the call sites below
         page.setUserAgent = async () => {};                       // cloak owns its UA
         page.setCookie = async (...cookies) => context.addCookies(
@@ -181,7 +209,18 @@ async function initBrowser({ reconnect = false } = {}) {
 function loadCookies() {
     try {
         const cookies = JSON.parse(fs.readFileSync(config.cookieFile, 'utf-8'));
-        return Array.isArray(cookies) ? cookies : [];
+        if (!Array.isArray(cookies)) return [];
+        // 08-28 fix (Chrome 151 CDP): context.cookies() returns partitionKey /
+        // sourcePort / sourceScheme on saved cookies; re-setting them makes CDP
+        // Network.setCookie/deleteCookies fail with "partitionKey - CBOR: map
+        // start expected" protocol errors. Drop the storage-partition fields.
+        return cookies.map((c) => {
+            const o = { ...c };
+            delete o.partitionKey;
+            delete o.sourcePort;
+            delete o.sourceScheme;
+            return o;
+        });
     } catch {
         return [];
     }
@@ -191,7 +230,18 @@ async function saveCookies() {
     try {
         if (!page) return;
         const cookies = await page.cookies();
-        fs.writeFileSync(config.cookieFile, JSON.stringify(cookies, null, 2));
+        // 08-24 audit fix (P3): save ONLY this lane's domain slice (the old
+        // union save let the gemini lane re-cement the deepseek lane's dead
+        // session) and write atomically (a kill mid-write truncated the file,
+        // silently killing every login).
+        const host = new URL(config.webchatUrl).host;
+        const mine = cookies.filter((c) => {
+            const d = (c.domain || '').replace(/^\./, '');
+            return host.endsWith(d) || d.endsWith(host.split('.').slice(-2).join('.'));
+        });
+        const tmp = config.cookieFile + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(mine, null, 2));
+        fs.renameSync(tmp, config.cookieFile);
     } catch (e) {
         console.warn('⚠️  Cookie save failed:', e.message);
     }
@@ -283,11 +333,14 @@ async function connectToWebchat(webchatUrl) {
         console.log(`🍪 Loaded ${cookies.length} cookies.`);
     }
 
-    if (!page.url() || page.url() === 'about:blank') {
-        console.log(`🌐 Opening webchat: ${webchatUrl}`);
+    const cur = (page.url() || '').toString();
+    if (!cur || cur === 'about:blank' || !cur.startsWith(new URL(webchatUrl).origin)) {
+        // 08-24 audit fix (P4): a tab parked on a login/interstitial page
+        // must be re-navigated, or we burn the full 300s on the wrong page.
+        console.log(`🌐 On ${cur || 'about:blank'} — navigating to webchat`);
         await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } else {
-        console.log(`🟢 Already on page: ${page.url()}`);
+        console.log(`🟢 Already on page: ${cur}`);
     }
 
     await waitForChatInput(page);
@@ -295,18 +348,35 @@ async function connectToWebchat(webchatUrl) {
     return page;
 }
 
-// Login gate: the chat input's presence means the session is logged in
+// Login gate: the chat input's presence means the session is logged in.
+// 08-24 audit fix (P5): nav-destroyed polls no longer crash the loop,
+// interstitials trigger one reload, and any challenge cookies issued by the
+// site are saved even on the timeout path.
 async function waitForChatInput() {
     const deadline = Date.now() + config.loginWaitMs;
+    let reloaded = false;
     while (Date.now() < deadline) {
-        const el = await firstMatch(config.selectors.input);
+        let el = null;
+        try {
+            el = await firstMatch(config.selectors.input);
+        } catch {
+            await sleep(3000); // navigation destroyed the execution context — keep polling
+            continue;
+        }
         if (el) {
             console.log('✅ Chat input found — logged in.');
             return;
         }
+        const u = page.url() || '';
+        if (!reloaded && /accounts\.google\.com|ServiceLogin|sorry|recaptcha|signin|passport/i.test(u)) {
+            console.log('⚠️ login interstitial — reloading once');
+            try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch {}
+            reloaded = true;
+        }
         console.log('🟡 Waiting for login — log into the browser window if prompted...');
         await sleep(3000);
     }
+    await saveCookies(); // persist any challenge/rotation cookies just issued
     throw new Error(
         `Login wait timed out after ${config.loginWaitMs / 1000}s — no chat input found. ` +
         'Log in manually, then POST /connect.'
@@ -341,14 +411,36 @@ async function sendPrompt(prompt, toolDefinitions) {
     // becomes its first message. INSTANT_SWAP_EXPERT=1 gates this to the
     // instances that want it (8080 — the telegram responder's thread must
     // never be silently swapped).
+    // 08-28 MUTUAL EXCLUSION: this branch and the FORCE_EXPERT branch below are
+    // mirror-opposites (EXPERT->fresh INSTANT vs INSTANT->fresh EXPERT). The
+    // 8080 unit sets BOTH flags, so once the expert pin starts persisting
+    // (fixed today) these two would ping-pong the thread on every send — a
+    // worse leak than the one being fixed. FORCE_EXPERT wins when both are set.
+    // Not fixed by flipping the unit env: 8080 is SHARED (audit engine +
+    // telegram_auto_responder + lane_watcher + cross_eval), so the env is not
+    // the engine's to own.
     if (
         process.env.INSTANT_SWAP_EXPERT === '1' &&
+        process.env.FORCE_EXPERT !== '1' &&
         new URL(config.webchatUrl).host.includes('deepseek') &&
         !(await isInstantThread())
     ) {
         console.log('🧪 pinned thread is EXPERT — swapping to a fresh INSTANT chat');
         swappingToInstant = true;
         await openNewChat();
+    }
+    // 08-25 (owner, NUCLEAR sweep): FORCE_EXPERT=1 — mirror-swap an INSTANT
+    // pinned thread to a fresh EXPERT chat (expert = DeepThink chip only, no
+    // Search). Same env-gated pattern as above; other gateways unaffected.
+    if (
+        process.env.FORCE_EXPERT === '1' &&
+        new URL(config.webchatUrl).host.includes('deepseek') &&
+        (await isInstantThread())
+    ) {
+        console.log('🧪 pinned thread is INSTANT — swapping to a fresh EXPERT chat (FORCE_EXPERT=1)');
+        swappingToExpert = true;   // 08-28: arm the pin capture (see below)
+        await openNewChat();
+        await selectExpertMode();
     }
     // 08-17: force DeepThink + Search ON for the deepseek tab (instant mode
     // has both chips). No-op for foreign webchats (no such chips) and never
@@ -403,19 +495,32 @@ async function sendPrompt(prompt, toolDefinitions) {
     const before = await snapshotChat();
     await sendMessage(input, fullPrompt);
 
+    // 08-28 PIN CAPTURE MOVED PRE-WAIT: a fresh thread gets its /s/ id the
+    // moment the first message is sent, but this capture used to sit AFTER
+    // waitForResponse — so a slow/timed-out generation (the deepseek audit
+    // lane times out at 600s) threw before the id was ever recorded, the pin
+    // stayed on the old thread, and the next send swapped again. Capture as
+    // soon as the id exists; the URL updates asynchronously, so poll briefly.
+    if (swappingToInstant || swappingToExpert) {
+        swappingToInstant = false;
+        swappingToExpert = false;
+        for (let i = 0; i < 20; i++) {          // ≤10s, well under any send budget
+            const u = page.url();
+            const m = u.match(/\/a\/chat\/s\/([0-9a-f-]+)/);
+            if (m && m[1]) { threadSwapSeen = { url: u, id: m[1] }; break; }
+            await sleep(500);
+        }
+        if (!threadSwapSeen) {
+            console.warn('⚠ swap pin capture: no /s/ id after 10s — pin unchanged, next send may re-swap');
+        }
+    }
+
     console.log('⏳ Waiting for response...');
     const text = await waitForResponse(before, fullPrompt);
     console.log(`📥 Response received (${text.length} chars)`);
 
-    // 08-17 INSTANT-SWAP PIN: the first send on a fresh thread is what creates
-    // it — capture the new /s/ id so server.js can pin respawns (mirrors the
-    // handoff flow). Only when this send performed an instant swap.
-    if (swappingToInstant) {
-        swappingToInstant = false;
-        const u = page.url();
-        const m = u.match(/\/a\/chat\/s\/([0-9a-f-]+)/);
-        if (m && m[1]) threadSwapSeen = { url: u, id: m[1] };
-    }
+    // 08-17 INSTANT-SWAP PIN: capture now happens immediately after
+    // sendMessage (above) so a timeout in waitForResponse cannot lose it.
 
     // 08-16 (user): the visible tab must show each tool call ONCE, clean —
     // collapse the model's raw tool-call reply to its 💬 line so only the
@@ -473,20 +578,29 @@ async function collapseBigReplies() {
 // the chips). Foreign webchats have no such chips — harmless no-op.
 async function ensureToggles() {
     try {
-        const clicked = await page.evaluate(() => {
+        const expertDeepThink = process.env.EXPERT_DEEPTHINK === '1';
+        const clicked = await page.evaluate((expertDeepThink) => {
             const flipped = [];
-            for (const el of document.querySelectorAll('.ds-toggle-button')) {
+            const btns = [...document.querySelectorAll('.ds-toggle-button')];
+            // 08-25 (owner, NUCLEAR): mode-native toggle logic. Thread mode
+            // detector: an INSTANT composer has the Search chip; an EXPERT
+            // one does not (DeepThink only). wantOn per thread mode —
+            // instant: Search ON + DeepThink OFF (08-21 rule); expert:
+            // DeepThink ON (+EXPERT_DEEPTHINK=1 also forces it on instant).
+            const searchPresent = btns.some(
+                (el) => (el.textContent || '').trim() === 'Search');
+            for (const el of btns) {
                 const label = (el.textContent || '').trim();
-                // 08-21 (user rule): instant = NO DeepThink. Click OFF when
-                // pressed; Search stays ON (mode detector + live search).
                 if (label !== 'DeepThink' && label !== 'Search') continue;
-                const wantOn = label === 'Search';
+                const wantOn = label === 'Search'
+                    ? true
+                    : (label === 'DeepThink' && (!searchPresent || expertDeepThink));
                 if (el.getAttribute('aria-pressed') === String(wantOn)) continue;
                 el.click();
                 flipped.push(label + (wantOn ? ' ON' : ' OFF'));
             }
             return flipped;
-        });
+        }, expertDeepThink);
         if (clicked && clicked.length) console.log('🧠 toggles enabled: ' + clicked.join(', '));
     } catch (e) {
         console.log('⚠ toggle ensure failed:', String(e.message).slice(0, 60));
@@ -549,6 +663,47 @@ async function selectInstantMode() {
         }
     } catch (e) {
         console.log('⚠ selectInstantMode failed:', String(e.message).slice(0, 60));
+    }
+}
+
+// 08-25 (owner, NUCLEAR): mirror of selectInstantMode — click the EXPERT mode
+// radio on the fresh-chat composer and DeepThink ON (expert has no Search
+// chip). Mode is locked at thread creation, so this only works on a new chat.
+async function selectExpertMode() {
+    try {
+        if (await isInstantThread()) {
+            console.log('⚠ expert select: composer still shows a Search chip (mode tabs missed?)');
+        }
+        const flipped = await page.evaluate(() => {
+            const out = [];
+            const radios = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')];
+            const expert = radios.find((r) => /expert/i.test(r.textContent || ''));
+            if (!expert) {
+                out.push('NO_MODE_TABS');
+            } else {
+                const isSel = expert.getAttribute('aria-checked') === 'true'
+                    || (expert.className || '').includes('_31a22b0');
+                if (!isSel) { expert.click(); out.push('Expert tab'); }
+            }
+            for (const el of document.querySelectorAll('.ds-toggle-button')) {
+                const label = (el.textContent || '').trim();
+                if (label === 'DeepThink' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('DeepThink ON'); }
+            }
+            return out;
+        });
+        await sleep(900);
+        const searchPresent = await page.evaluate(() =>
+            [...document.querySelectorAll('.ds-toggle-button')].some(
+                (el) => (el.textContent || '').trim() === 'Search'));
+        if (searchPresent) {
+            console.log('⚠ expert select FAILED — Search chip still present (thread is INSTANT, not expert)');
+        } else {
+            console.log(flipped && flipped.length
+                ? '🧠 new chat set to EXPERT mode (' + flipped.join(', ') + ') — Search absent, verified'
+                : '🧠 already expert (no Search chip)');
+        }
+    } catch (e) {
+        console.log('⚠ selectExpertMode failed:', String(e.message).slice(0, 60));
     }
 }
 
@@ -832,11 +987,11 @@ async function sendMessage(input, text) {
                     }, config.selectors.send);
                     if (!pos) throw new Error('send button vanished before click');
                     await page.mouse.click(pos.x, pos.y);
-                    return verifySendCleared();
+                    if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text.length);
                 }
                 await page.keyboard.press('Enter');
             }
-            return verifySendCleared();
+            if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text.length);
         } catch (e) {
             const stale = /not clickable|not an Element|detached|context destroyed/i.test(e.message);
             if (!stale || attempt >= 2) throw e;
@@ -855,8 +1010,20 @@ async function sendMessage(input, text) {
 // from "never sent", and ground to the hard cap (25 min) for a message that
 // isn't coming. Poll for the composer to clear; fail fast with a clear error
 // if it doesn't — the client retries and the tab stays usable.
-async function verifySendCleared() {
-    for (let i = 0; i < 10; i++) {
+async function verifySendCleared(promptLen = 0) {
+    // 08-24 (transport audit): patience scales with prompt size. Bulk
+    // insertText of a 60k-char chunk takes the SPA measurably longer to
+    // commit; a premature "stranded" verdict fires the heal reload, which
+    // DESTROYS an in-flight submission — observed downstream as the gemini
+    // "generation stopped" banner on the client's retry. Small prompts keep
+    // the proven fast-fail (genuine React desyncs need the reload anyway).
+    // 08-24 (investigator 1): 30 polls was tight for the audit engine's
+    // 60k-char chunk sends on a busy renderer — a premature "stranded"
+    // verdict fires the heal reload, which destroys an in-flight submission
+    // (seen downstream as the gemini "generation stopped" banner). 45 keeps
+    // the fail-fast spirit with margin for a slow React commit.
+    const polls = promptLen > 20000 ? 45 : 10;
+    for (let i = 0; i < polls; i++) {
         await sleep(1000);
         const empty = await page.evaluate((sels) => {
             for (const sel of sels) {
@@ -1403,7 +1570,7 @@ async function waitForResponse(before, typedText) {
     let deadline = Date.now() + config.timeout;
     // Absolute cap so a pathological never-ending stream can't hang the client
     // forever — activity may extend the deadline, but not past this.
-    const hardCap = deadline + config.timeout * 5;
+    const hardCap = deadline + config.timeout; // 08-24 (latency audit): was timeout×5 — a 15-min timeout bought 90 min of phantom polling; one extra timeout is the sane ceiling
     let lastLen = -1; // forces at least two polls before accepting
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
@@ -1458,7 +1625,36 @@ async function waitForResponse(before, typedText) {
         // the hard cap (timeout×5, 25 min on the 300s gemini timeout) for a
         // reply that never arrives. Fail fast with a clear marker instead —
         // the client retries and the tab stays usable.
-        if (isGeminiWebchat() && /API Error|response stopped arriving|went wrong with this response|response was not generated|wasn'?t generated|Something went wrong/i.test(state.body || '')) {
+        // 08-24 USER-ROW GUARD (hoisted above the banner scan): until the model
+        // answers, the newest rendered row IS our own prompt — and audit
+        // digests routinely contain literal strings like "API Error" /
+        // "Something went wrong", so the banner regex below self-matched the
+        // just-typed 60k chunk → spurious heal reload (destroying the typed
+        // prompt) + "generation stopped" 500 within seconds of every big send.
+        const USER_ROW_CLS = '_9663006';
+        // 08-13: newer rows hash to _81e7b5e (probed live) — the hash-only
+        // check missed them, and the last row after a send is often the
+        // gateway's own tool-preamble USER row, which the DOM path could
+        // accept as the answer. Guard on hash OR the preamble prefix.
+        // 08-24 echo probe: rendered markdown strips "###"/fences, so match a
+        // long prose line from OUR OWN typed text verbatim — survives any
+        // renderer transform and is site-agnostic.
+        const echoProbe = (() => {
+            for (const l of String(typedText || '').split('\n')) {
+                if (l.trim().length > 60) return l.trim().slice(0, 120);
+            }
+            return null;
+        })();
+        const rowText = (state.answer || '') + ' ' + (state.text || '');
+        const userRow = (state.lastCls || '').split(/\s+/).includes(USER_ROW_CLS)
+            || (state.lastCls || '').split(/\s+/).includes('_81e7b5e')
+            || /^You have access to the tools below/.test(state.answer || '')
+            || (!!echoProbe && rowText.includes(echoProbe));
+        if (isGeminiWebchat() && !generationErrHealed && !userRow && /API Error|response stopped arriving|went wrong with this response|response was not generated|wasn'?t generated|Something went wrong/i.test(rowText)) {
+            generationErrHealed = true;
+            console.log('🔄 gemini generation-error banner seen (newest assistant row) — reloading tab once, then throw so the client retries clean');
+            try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch {}
+            await sleep(2000);
             throw new Error('Gemini API error detected in tab (generation stopped) — resend the prompt');
         }
         // User-row guard (08-12): the typedText contains-check is NOT enough —
@@ -1471,14 +1667,7 @@ async function waitForResponse(before, typedText) {
         // the real answer sat undelivered in the tab). Rows are role-hashed:
         // user rows = class _9663006, assistant rows = _4f9bf79 (probed 08-12,
         // stable across builds). Never accept a user-class row.
-        const USER_ROW_CLS = '_9663006';
-        // 08-13: newer rows hash to _81e7b5e (probed live) — the hash-only
-        // check missed them, and the last row after a send is often the
-        // gateway's own tool-preamble USER row, which the DOM path could
-        // accept as the answer. Guard on hash OR the preamble prefix.
-        const userRow = (state.lastCls || '').split(/\s+/).includes(USER_ROW_CLS)
-            || (state.lastCls || '').split(/\s+/).includes('_81e7b5e')
-            || /^You have access to the tools below/.test(state.answer || '');
+        // userRow/USER_ROW_CLS hoisted above the gemini banner scan (08-24).
         // Growth via ROW COUNT (08-13): the text-inequality check alone never
         // trips when the new answer renders IDENTICAL to the previous one —
         // every response on the personal thread (6187afed) then burned the
@@ -1543,7 +1732,31 @@ async function waitForResponse(before, typedText) {
                     && /"tool"\s*:\s*"/.test(ctext)
                     && (/\{\s*"tool"/.test(ctext) || /submit_answer|"params"/.test(ctext))
                     && /\}\s*$/.test(ctext);
-                if (!toolDone) { await sleep(1500); continue; }
+                if (!toolDone) {
+                    // 08-24 (investigator 1, transport audit): plain-text gemini
+                    // replies hit the SAME phantom-stop trap the toolDone branch
+                    // was built for — the SPA commits the answer to the DOM but
+                    // leaves an unclickable "Stop response" control up for
+                    // minutes, so isForeignBusy() stays true and the gate only
+                    // opens when the ghost finally clears. Observed as the 1348s
+                    // (161 chars) and 594s (4849 chars) gemini stalls in the
+                    // 08-24 audit log — a committed answer burned the whole
+                    // deadline (+progress extensions) instead of ~10s. A
+                    // non-truncated row unchanged across 6 consecutive polls
+                    // (~9s) is a committed reply, not a mid-stream fragment
+                    // (streaming grows the row every poll); accept it while
+                    // busy. Gemini only — other sites' stop controls are
+                    // trusted.
+                    if (
+                        isGemini && geminiStablePolls >= 6 &&
+                        ctext.length > 0 && !looksLikeTruncatedAnswer(ctext)
+                    ) {
+                        console.log(`🤖 gemini answer stable ${geminiStablePolls} polls while stop control up — accepting committed reply`);
+                        return ctext;
+                    }
+                    await sleep(1500);
+                    continue;
+                }
             }
             return state.text;
         }
@@ -1599,6 +1812,12 @@ async function waitForResponse(before, typedText) {
                 throw new Error('Webchat tab still generating without progress after fresh-chat recovery — retry after it finishes');
             }
         }
+        // 08-24 (investigator 1): gemini phantom-stop stability counter —
+        // consecutive polls where the newest row's text is unchanged, reset on
+        // any movement so a streaming row never trips the stable-accept above.
+        if (isGeminiWebchat()) {
+            geminiStablePolls = (state.text && state.text === lastText) ? geminiStablePolls + 1 : 0;
+        }
         lastProgressLen = progressLen;
         lastText = state.text;
         lastLen = state.text.length;
@@ -1613,6 +1832,9 @@ async function waitForResponse(before, typedText) {
     // (long cogitations on big tasks), keep waiting — bounded by the hard cap —
     // instead of throwing. A throw here is exactly what made webchat tasks
     // "stop mid task": the client saw an error while the tab was mid-thought.
+    // 08-24 (investigator 1): gemini phantom-stop stability also tracked here
+    // (the main loop's counter is shared) — see the busyNow branch below.
+    let geminiRescuePrev = '';
     while (Date.now() < hardCap) {
         try {
             const tee = await readStreamedAnswer(teeStart);
@@ -1624,9 +1846,36 @@ async function waitForResponse(before, typedText) {
             // 08-13: never rescue while a generation is still running — the
             // newest row may be a stale previous answer or a stream fragment
             // (observed: the 20197-char gemini request rescued a 22-char row).
-            const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+            // 08-24 (transport audit): was `state.mode` — `state` is
+            // block-scoped to the poll loop above, so this threw a silent
+            // ReferenceError (swallowed by the catch below) on EVERY rescue
+            // iteration: the DOM timeout-rescue never ran and every deadline
+            // expiry burned the whole hardCap before the "Timed out" throw.
+            // Use the FRESH snapshot (`last`), which is also more correct.
+            const busyNow = last.mode === 'vl' ? await isGenerating() : await isForeignBusy();
             if (busyNow) {
                 console.log('⏱ still generating past the deadline — extending (bounded by hard cap)');
+                // 08-24 (investigator 1): gemini phantom-stop rescue. The
+                // ghost "Stop response" control keeps busyNow true past the
+                // deadline even though the reply is committed in the DOM —
+                // the old code spun to the hard cap and THREW for an answer
+                // already there (the 1348s "OK" burned then rescued only
+                // when the ghost finally cleared). Same 6-poll stability
+                // rule as the main loop: a non-truncated answer unchanged
+                // across ~9s of rescue polls is committed — deliver it.
+                const ansNow = (last.answer || '').trim();
+                if (isGeminiWebchat() && ansNow.length > 0 && ansNow === geminiRescuePrev
+                    && geminiStablePolls >= 6 && !looksLikeTruncatedAnswer(ansNow)
+                    && !/^You have access to the tools below/.test(ansNow)) {
+                    console.log('⏱ gemini phantom stop — rescuing the committed answer from the DOM');
+                    return last.answer;
+                }
+                if (ansNow !== geminiRescuePrev) {
+                    geminiStablePolls = 0;
+                    geminiRescuePrev = ansNow;
+                } else {
+                    geminiStablePolls++;
+                }
                 await sleep(1500);
                 continue;
             }
@@ -1682,6 +1931,7 @@ async function openNewChat() {
     await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForChatInput();
     await sleep(2500); // let the SPA settle the composer
+    generationErrHealed = false; // fresh chat = clean slate; re-arm banner heal (08-24)
     // 08-17 (user rule): mode is locked at thread creation — select INSTANT
     // on the fresh new-chat composer BEFORE the first message creates the
     // thread (expert threads can never become instant afterwards).
@@ -1719,6 +1969,32 @@ async function sendFirstMessage(text) {
 async function openNewChatAndSeed(text) {
     await openNewChat();
     return sendFirstMessage(text);
+}
+
+// ──────────────────────────────────────────────────────
+// 4c. THREAD REOPEN (08-24, user): resume a captured chat thread
+// ──────────────────────────────────────────────────────
+// openNewChat navigates the pinned tab AWAY from the thread it was on — and
+// lanes serve MANY personas, so the persona's prior thread is never the tab's
+// thread on return. The conversation survives server-side; resuming it is an
+// explicit goto to the saved thread URL (origin + /s/<uuid> for deepseek,
+// /app/<id> for gemini). Same tab-pick prologue as openNewChat.
+async function reopenThread(threadUrl) {
+    await initBrowser({ reconnect: true });
+    if (!page && config.cdpWsUrl) {
+        const pages = await browser.pages();
+        page = config.tabUrlSubstring
+            ? pages.find((p) => p.url().includes(config.tabUrlSubstring))
+            : pages.find((p) => p.url().startsWith(new URL(config.webchatUrl).origin));
+        if (!page) page = await browser.newPage();
+    }
+    if (!page) page = await browser.newPage();
+    console.log(`🔁 Reopening thread: ${threadUrl}`);
+    await page.goto(threadUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitForChatInput();
+    await sleep(2500); // let the SPA settle the thread's composer
+    console.log(`🟢 Thread reopened: ${page.url()}`);
+    return page;
 }
 
 // ──────────────────────────────────────────────────────
@@ -1817,6 +2093,7 @@ module.exports = {
     openNewChat,
     sendFirstMessage,
     openNewChatAndSeed,
+    reopenThread,
     getReqBodyChars,
     getAndClearThinkBuf,
     resetTeeForHandoff,

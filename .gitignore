@@ -1,6 +1,11 @@
 node_modules/
 .env
 .cookies.json
+# 08-28: the per-gateway cookie jars (.cookies-deepseek.json, .cookies-gemini.json,
+# COOKIE_FILE=... in the units) did NOT match the exact ".cookies.json" pattern
+# above, so live session cookies sat untracked-but-unignored in a PUBLIC repo —
+# one `git add -A` from being published. Glob them all.
+.cookies-*.json
 *.log
 chat.js
 bash_tool_log.jsonl

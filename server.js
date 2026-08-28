@@ -16,7 +16,7 @@ const IS_GEMINI = (config.modelName || '').toLowerCase().startsWith('gemini');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
     buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
-    resetTeeForHandoff, takeThreadSwap, openNewChat,
+    resetTeeForHandoff, takeThreadSwap, openNewChat, reopenThread,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 const { MultiSignalGatewayGate } = require('./drift_v2');
@@ -386,21 +386,6 @@ async function countedSend(msg, defs) {
     try {
         const r = await sendPrompt(msg, defs);
         lastReqBodyChars = await getReqBodyChars();
-        // 08-14 EXPERT-SWAP PIN: the send swapped an instant thread for a
-        // fresh EXPERT one — pin the new thread for every respawn path (same
-        // as the context-handoff swap, including the supervisor restart).
-        const swap = takeThreadSwap();
-        if (swap && swap.id && swap.id !== config.tabUrlSubstring) {
-            const oldPin = config.tabUrlSubstring;
-            config.tabUrlSubstring = swap.id;
-            config.webchatUrl = swap.url;
-            try {
-                persistThreadSwap(oldPin, swap.id, swap.url);
-                console.log(`🔁 Expert swap pinned: ${oldPin} → ${swap.url}`);
-            } catch (e) {
-                console.warn('⚠️ expert-swap pin persist failed:', e.message);
-            }
-        }
         return r;
     } catch (e) {
         // 08-13 HARD-CAP SAFETY NET: the pre-send measurement can be blind
@@ -417,7 +402,14 @@ async function countedSend(msg, defs) {
             }
             throw e;
         }
-        if (sendRetriesLeft > 0 && /Timed out/.test(String(e.message))) {
+        // 08-24 (transport audit): never spend the retry on a DEAD client.
+        // When the caller's own HTTP timeout fires first, the client is gone
+        // but this resend still occupies the single webchat tab for another
+        // full generation window — observed as back-to-back "⏱ send timed
+        // out — resending" lines while every audit chunk request was already
+        // a client-side TimeoutError.
+        const clientGone = typeof activeHandoffCtx?.isAborted === 'function' && activeHandoffCtx.isAborted();
+        if (!clientGone && sendRetriesLeft > 0 && /Timed out/.test(String(e.message))) {
             sendRetriesLeft--;
             console.log('⏱ send timed out — resending with a RETRY banner');
             const r = await sendPrompt(
@@ -430,6 +422,32 @@ async function countedSend(msg, defs) {
         throw e;
     }
     } finally {
+        // 08-14 EXPERT-SWAP PIN: the send swapped an instant thread for a
+        // fresh EXPERT one — pin the new thread for every respawn path (same
+        // as the context-handoff swap, including the supervisor restart).
+        // 08-28 MOVED INTO finally: this used to run only after sendPrompt
+        // RESOLVED. The deepseek audit lane times out (600s) before resolving,
+        // so the pin never committed — config.tabUrlSubstring stayed on the old
+        // INSTANT thread and every subsequent send re-swapped, leaking a chat
+        // tab each time (666 swaps / 0 pins / 82 tabs in 6h). A swap that
+        // happened is a fact about the browser and must be recorded whether or
+        // not the generation succeeded.
+        try {
+            const swap = takeThreadSwap();
+            if (swap && swap.id && swap.id !== config.tabUrlSubstring) {
+                const oldPin = config.tabUrlSubstring;
+                config.tabUrlSubstring = swap.id;
+                config.webchatUrl = swap.url;
+                try {
+                    persistThreadSwap(oldPin, swap.id, swap.url);
+                    console.log(`🔁 Expert swap pinned: ${oldPin} → ${swap.url}`);
+                } catch (e) {
+                    console.warn('⚠️ expert-swap pin persist failed:', e.message);
+                }
+            }
+        } catch (e) {
+            console.warn('⚠️ expert-swap pin update failed:', e.message);
+        }
         releaseDeepSeekLock();
     }
 }
@@ -700,11 +718,16 @@ const AUTONOMOUS_FORMAT =
     'until every step is executed AND verified. If a step is blocked, complete every other step in full ' +
     'and state exactly what you left out and why — scaling the work down is the user\'s call, not yours. ' +
     'Submitting after trivial work while the task remains largely undone is failure; keep working.\n' +
-    'NO NARRATION (hard, user rule 08-19): you are a tool-calling machine. Do NOT use send_message, do NOT ' +
-    'announce or describe what you are about to do, do NOT add 💬 commentary or acknowledgements. Make the ' +
-    'tool call directly and silently.\n' +
+    'PURE WORK MODE (08-25 owner rule): no narration requirement, no send_message requirement — ' +
+    'just do the work. Make tool calls when you have them; keep going until done.\n' +
     'NEVER end with a tool call: after every tool result, keep working — next tool call — until the task is ' +
     'fully done and verified.\n' +
+    'VISION (08-25 owner rule): you CANNOT see images yourself. If a verification step needs a screenshot ' +
+    'interpreted (layout/broken element/visual result), call write_file with path /tmp/nuclear_vision_request.json ' +
+    'containing {"path":"<absolute screenshot path>","question":"<one-line question>"} and finish the turn with ' +
+    'submit_answer text "VISION_AWAIT — operator will reply below". The operator will Read the image and ' +
+    'reply with the description; you then resume and continue under the work standard. NEVER guess what a ' +
+    'screenshot shows; always request the interpretation.\n' +
     'Finish with submit_answer carrying your final summary message — that ends the turn:\n' +
     '```json\n{"tool":"submit_answer","params":{"text":"your final answer"}}\n```\n' +
     'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
@@ -1707,6 +1730,43 @@ app.post('/v1/newchat', async (req, res) => {
     try {
         const p = await openNewChat();
         res.json({ ok: true, url: p.url(), message: 'New chat started in the webchat tab' });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: String(e.message).slice(0, 300) });
+    }
+});
+
+// 08-24 (user): resume a CAPTURED thread — navigate the pinned tab back to a
+// saved chat URL so the next audit pass retains its context. /newchat always
+// navigates the tab to a fresh chat and lanes serve many personas, so "resume"
+// is an explicit goto; the client captures the thread URL via /connect after a
+// send and POSTs it back here (body: {url} or {id}).
+function buildThreadUrl(idOrUrl) {
+    const s = String(idOrUrl || '').trim();
+    if (!s) return '';
+    if (/^https?:\/\//.test(s)) return s;
+    try {
+        const host = new URL(config.webchatUrl).host;
+        const base = config.webchatUrl.replace(/\/+$/, '');
+        if (host.includes('deepseek')) return `${base}/a/chat/s/${s}`;
+        // gemini / other webchats: thread URLs are origin/app/<id> (or /app/c/<id>)
+        if (/^c\//.test(s)) return `${base}/app/${s}`;
+        return `${base}/${s}`;
+    } catch (e) {
+        return '';
+    }
+}
+
+app.post('/v1/thread', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const target = typeof body.url === 'string'
+            ? body.url.trim()
+            : buildThreadUrl(typeof body.id === 'string' ? body.id : '');
+        if (!target) {
+            return res.status(400).json({ ok: false, error: 'url or id required' });
+        }
+        const p = await reopenThread(target);
+        res.json({ ok: true, url: p.url(), message: 'Tab navigated to thread' });
     } catch (e) {
         res.status(500).json({ ok: false, error: String(e.message).slice(0, 300) });
     }
