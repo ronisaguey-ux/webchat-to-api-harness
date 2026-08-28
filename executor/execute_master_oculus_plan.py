@@ -1051,6 +1051,15 @@ CRITICAL REQUIREMENTS:
 - old_code must be an EXACT verbatim substring of the file content above (copy-paste exactly).
 - new_code must produce code that passes ALL verification commands listed above.
 - Pay special attention to mypy type annotations — use Optional[float] instead of float for nullable params.
+- ANTI-GRAFT DISCIPLINE (08-23, non-negotiable): a verification command that
+  passes while the feature does not work is a FAILED VERIFICATION, not a pass.
+  A bare grep only proves a string exists — it never proves a feature works.
+  If a verification is (or is only) a string grep, strengthen it: run the code
+  path (import+call the function with real inputs, curl the endpoint, run the
+  build/tests) and report success only when the BEHAVIOR is proven. NEVER
+  paste a verification-target string into a file to make a grep pass — that is
+  fake completion. You may ADD runtime verifications but never delete or
+  weaken the plan's commands.
 - Return ONLY a JSON object with no markdown, no explanation outside JSON.
 ```json
 {{
