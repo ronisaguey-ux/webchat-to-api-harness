@@ -92,13 +92,21 @@ async def _evaluate(session, repo: str, finding: Dict[str, Any],
     prompt = _eval_prompt(repo, finding)
     raw = await call_with_takeover(session, lane, prompt, EVAL_SYSTEM_PROMPT, max_tokens=2000)
     parsed = extract_json_block(raw)
+    fallback_sev = str(finding.get("severity") or "medium").lower()
     if parsed is None:
+        # fallback dicts MUST carry every key the aggregation reads
+        # (08-23: a missing "severity" here crashed the whole run with
+        # KeyError in the verdict max() lines)
         return {"lane": lane["name"], "verdict": "dismissed", "confidence": 0.0,
-                "reason": "non-JSON eval reply", "fix_quality": "none", "fix": ""}
+                "reason": "non-JSON eval reply", "fix_quality": "none", "fix": "",
+                "severity": fallback_sev}
+    sev = str(parsed.get("severity") or fallback_sev).lower()
+    if sev not in ("low", "medium", "high", "critical"):
+        sev = fallback_sev  # lanes return junk (uppercase, verbatim); never let it crash .index()
     return {
         "lane": lane["name"],
         "verdict": parsed.get("verdict", "dismissed"),
-        "severity": parsed.get("severity", finding.get("severity", "medium")),
+        "severity": sev,
         "confidence": float(parsed.get("confidence", 0.0) or 0.0),
         "reason": (parsed.get("reason") or "")[:1000],
         "fix_quality": parsed.get("fix_quality", "none"),
@@ -111,6 +119,9 @@ async def main() -> None:
     ap.add_argument("--repo", default="/home/roni/Roni_Workspace/helpotron")
     ap.add_argument("--findings", required=True)
     ap.add_argument("--out", default=f"/home/roni/Roni_Workspace/audits_plans/cross_eval_{time.strftime('%m-%d')}.json")
+    ap.add_argument("--lanes", default="gemini,deepseek",
+                    help="comma-separated lanes to evaluate with (default both; "
+                         "single lane = degraded-mode fallback, same as audit)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -118,7 +129,10 @@ async def main() -> None:
         audit = json.load(f)
     findings = audit["findings"]
     batches = _finding_batches(findings)
-    log(f"Cross-eval: {len(findings)} findings, dual lanes")
+    lanes = [l.strip() for l in args.lanes.split(",") if l.strip() in LANES]
+    if not lanes:
+        sys.exit(f"FATAL: no valid lanes in {args.lanes!r} (have {list(LANES)})")
+    log(f"Cross-eval: {len(findings)} findings, lanes={','.join(lanes)}")
 
     if args.dry_run:
         log("DRY-RUN: batches ready")
@@ -127,27 +141,43 @@ async def main() -> None:
     results: Dict[str, Any] = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                "repo": args.repo, "source": args.findings,
                                "evaluations": [], "verdicts": {}}
+    # resume from the crash-saved checkpoint: findings already in verdicts are
+    # skipped (08-23: a lane crash at finding 21 would otherwise redo 20 evals)
+    done = {}
+    try:
+        with open(args.out) as f:
+            prior = json.load(f)
+        done = {k: v for k, v in (prior.get("verdicts") or {}).items()
+                if isinstance(v, dict) and v.get("status") in ("confirmed", "dismissed", "needs_review")}
+        results["verdicts"] = dict(done)
+    except (OSError, json.JSONDecodeError):
+        pass
+    if done:
+        log(f"Cross-eval resume: {len(done)} findings already evaluated — skipping")
 
     async with __import__("aiohttp").ClientSession() as session:
         for i, finding in enumerate(findings):
-            bids = {lane["name"]: {"verdict": None} for lane in LANES.values()}
+            if finding["id"] in done:
+                continue
+            bids = {lane["name"]: {"verdict": None} for lane in [LANES[l] for l in lanes]}
             verdicts: List[Dict[str, Any]] = []
-            for lane in LANES.values():
+            for lane in [LANES[l] for l in lanes]:
                 try:
                     ev = await _evaluate(session, args.repo, finding, lane)
                 except Exception as e:  # noqa: BLE001
                     ev = {"lane": lane["name"], "verdict": "dismissed", "confidence": 0.0,
-                          "reason": f"eval error: {str(e)[:200]}", "fix_quality": "none", "fix": ""}
+                          "reason": f"eval error: {str(e)[:200]}", "fix_quality": "none",
+                          "fix": "", "severity": str(finding.get("severity") or "medium").lower()}
                 verdicts.append(ev)
                 bids[lane["name"]]["verdict"] = ev["verdict"]
                 results["evaluations"].append({**finding, "eval": ev})
 
             vg = [v["verdict"] for v in verdicts]
-            confirmed = vg.count("confirmed")
-            dismissed = vg.count("dismissed")
-            if confirmed == 2:
+            # unanimous verdict across the active lanes; mixed (or single-lane
+            # dissenting) votes land in needs_review
+            if vg and all(v == "confirmed" for v in vg):
                 final = "confirmed"
-            elif dismissed == 2:
+            elif vg and all(v == "dismissed" for v in vg):
                 final = "dismissed"
             else:
                 final = "needs_review"
@@ -160,6 +190,11 @@ async def main() -> None:
                 "reasons": [v["reason"] for v in verdicts],
                 "lanes": bids,
             }
+            # crash-resilience (08-23 lesson from audit_swarm): persist after
+            # EVERY finding so an interrupted run keeps everything so far —
+            # a mid-run kill used to discard the whole evaluation.
+            with open(args.out, "w") as f:
+                json.dump(results, f, indent=2)
             if (i + 1) % 5 == 0 or i == len(findings) - 1:
                 log(f"  {i + 1}/{len(findings)} evaluated ({final})")
 
