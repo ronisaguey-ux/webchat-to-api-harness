@@ -913,6 +913,15 @@ async function maybePauseForDrift(text, userPrompt) {
 }
 
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted, opts = {}) {
+    // 09-04 MIN_LANE_GAP: the DS webchat account rate-limits bursts
+    // ("Messages too frequent, rate_limit_reached") — pace sends when
+    // MIN_LANE_GAP_SECONDS is set (ds-gw drop-in). Global instance gate.
+    if (config.laneGapSeconds > 0) {
+        const gap = (Number(config.laneGapSeconds) || 0) * 1000;
+        const wait = (global.__lastLaneSend || 0) + gap - Date.now();
+        if (wait > 0) await sleep(wait);
+        global.__lastLaneSend = Date.now();
+    }
     // 08-19 (user): TWO MODES — autonomous (execution lane: bare tool calls,
     // no narration) vs user mode (interactive: 💬 narration before tool
     // calls). The executor signals autonomous per request; a process-level
@@ -924,7 +933,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
     // 08-19 (user): autonomous (execution lane) = bare tool calls, no
     // narration; user mode = 💬-protocol format with narration.
-    prompt += autonomous ? AUTONOMOUS_FORMAT : (config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT);
+    prompt += opts.formatText || (autonomous ? AUTONOMOUS_FORMAT : (config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT));
     prompt += continueDirective(userPrompt);
     prompt += greetingDirective(userPrompt);
     prompt += `### RESPONSE\n`;
@@ -1237,7 +1246,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // "continue").
         if (round < config.maxToolRounds - 1) {
             const yap = looksLikeYap(response);
-            if (++formatErrorRounds >= 4) {
+            if (++formatErrorRounds >= (config.maxFormatErrorRounds || 4)) {
                 // 08-16 (user): same degradation as the malformed bail — 4+
                 // plain-text replies in a row means the model is stuck, not
                 // "one more nudge away". Stop grinding to round 40.
@@ -1719,6 +1728,36 @@ app.get('/status', async (req, res) => {
     });
 });
 
+// 09-03 DIAG: dump the live tab text so the chat bubbles can be inspected
+// (why do worker-shaped requests read "Hello! I am ready..." let's SEE the DOM).
+app.get('/debug/dump', async (req, res) => {
+    try {
+        const p = getPage();
+        if (!p) return res.json({ ok: false, error: 'no page' });
+        const txt = await p.evaluate(() => {
+            const el = document.body;
+            return el ? el.innerText.slice(0, 6000) : '';
+        }).catch((e) => 'EVAL_ERR ' + e.message);
+        const shot = await p.screenshot({ encoding: 'base64', type: 'png' }).catch(() => '');
+        res.json({ ok: true, url: p.url(), text: txt, shot: shot ? shot.length : 0 });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: String(e.message).slice(0, 300) });
+    }
+});
+
+// 09-03 DIAG: run a JS snippet in the live tab (login rescue).
+app.post('/debug/eval', async (req, res) => {
+    try {
+        const p = getPage();
+        if (!p) return res.json({ ok: false, error: 'no page' });
+        const code = String((req.body || {}).code || '').slice(0, 20000);
+        const out = await p.evaluate(code).catch((e) => ({ __err: String(e.message).slice(0, 200) }));
+        res.json({ ok: true, out });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: String(e.message).slice(0, 300) });
+    }
+});
+
 app.get('/tools', (req, res) => {
     res.json(getToolDefinitions());
 });
@@ -1855,7 +1894,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 },
             });
         }
-        if (stream) console.log('⚠️  stream requested — responding non-streamed');
+        if (stream) console.log('🡆 streaming chat.completion chunk (SSE)');
 
         if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
             try {
@@ -1886,7 +1925,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 { autonomous: req.body?.autonomous === true || req.headers['x-autonomous'] === '1' })
         );
 
-        res.json({
+        const completion = {
             id: 'chatcmpl_' + Math.random().toString(36).slice(2, 12),
             object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
@@ -1899,13 +1938,226 @@ app.post('/v1/chat/completions', async (req, res) => {
                 },
             ],
             usage: { prompt_tokens: 0, completion_tokens: text.length, total_tokens: text.length },
-        });
+        };
+        // 09-03 SSE (pi/shannon always stream:true): emit one chat.completion.chunk
+        // (+ [DONE]) instead of a buffered JSON blob — pi's SSE decoder needs the
+        // `data:` framing or it classifies the turn as a provider rejection.
+        if (stream) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.write('data: ' + JSON.stringify({ ...completion, object: 'chat.completion.chunk', choices: [
+                { index: 0, delta: { role: 'assistant', content: text }, finish_reason: 'stop' }] }) + '\n\n');
+            res.write('data: [DONE]\n\n');
+            return res.end();
+        }
+        res.json(completion);
     } catch (error) {
         console.error('❌ Error:', error);
         // 08-13 EVENING: headersSent guard — a crashed-stream attempt here
         // threw ERR_HTTP_HEADERS_SENT and killed the process the same way.
         if (!res.headersSent && !res.writableEnded && !res.destroyed) {
             res.status(500).json({ error: { message: error.message, type: 'api_error' } });
+        }
+    }
+});
+
+// ── OpenAI Responses API (09-03: shannon/pi's "openai" provider speaks the
+// Responses dialect; its preflight probe 404'd on /v1/responses. Translate
+// Responses-dialect requests onto the same webchat flow as chat/completions
+// so free-lane runs (shannon, pi agents) need no dialect change upstream.) ──
+app.post('/v1/responses', async (req, res) => {
+    try {
+        const { model, input, instructions = '', stream, tools } = req.body || {};
+        const routedModel = String(model || '').replace(/^claude\//, '');
+        // Tool names offered by the caller (pi/shannon agents). Our lane model
+        // responds in TEXT, so we bridge the Responses-API tool-call contract:
+        // the model is told to end its reply with "CALL_TOOL: <name> <json>"
+        // and we emit a real function_call item for it on output.
+        const toolNames = Array.isArray(tools) ? tools.map((t) => (t && t.name) || '').filter(Boolean) : [];
+        const CALL_RE = /CALL_TOOL:\s*([A-Za-z0-9_.-]+)\s*(\{[\s\S]*\})\s*$/m;
+        const parseCall = (text) => {
+            // Brace-balanced scan: find the LAST CALL_TOOL line, take the first
+            // '{' after the name, walk to its matching '}' (any depth), then
+            // tolerate trailing fences/backticks/whitespace.
+            const idx = text.lastIndexOf('CALL_TOOL:');
+            if (idx === -1) return null;
+            const rest = text.slice(idx + 10).replace(/^[\s`]*/, '');
+            const name = (rest.match(/^([A-Za-z0-9_.-]+)\s*/) || [])[1];
+            if (!name || !toolNames.includes(name)) return null;
+            const start = rest.indexOf('{', name.length);
+            if (start === -1) return null;
+            let depth = 0, got = false;
+            const body = [];
+            for (let i = start; i < rest.length; i++) {
+                const ch = rest[i];
+                if (ch === '{') { depth++; got = true; }
+                else if (ch === '}') { depth--; if (depth === 0) { body.push(ch); break; } }
+                if (got) body.push(ch);
+            }
+            return { name, args: body.join('') };
+        };
+        const messages = [];
+        if (instructions) messages.push({ role: 'system', content: instructions });
+        const toText = (x) => (typeof x === 'string' ? x : x && x.text ? x.text : '');
+        const addInput = (item) => {
+            if (typeof item === 'string') messages.push({ role: 'user', content: item });
+            else if (Array.isArray(item)) messages.push({ role: 'user', content: item.map(toText).join('\n') });
+            else if (item && item.type === 'message' && item.content)
+                messages.push({
+                    role: item.role === 'assistant' ? 'assistant' : 'user',
+                    content: Array.isArray(item.content) ? item.content.map(toText).join('\n') : String(item.content),
+                });
+            else if (item && item.type === 'function_call_output' && item.output !== undefined)
+                messages.push({ role: 'user', content: `[tool result]\n${String(item.output)}` });
+        };
+        if (Array.isArray(input)) input.forEach(addInput);
+        else addInput(input);
+        const rst = async (req_) => {
+            const systemMessage = messages.find((m) => m.role === 'system');
+            // 09-04 HISTORY FIX: pi (shannon) sessions are MULTI-TURN — turn 2+
+            // carries only function_call_output + a short follow-up; the actual
+            // task lives in the EARLIER messages. Using only the last user
+            // message made the lane model reply "No concrete task was
+            // provided". Rebuild the prompt from ALL non-system messages.
+            const prompt = messages
+                .filter((m) => m.role !== 'system')
+                .map((m) => {
+                    const body = typeof m.content === 'string'
+                        ? m.content
+                        : JSON.stringify(m.content ?? '');
+                    return (m.role === 'assistant' ? 'ASSISTANT: ' : 'USER: ') + body;
+                })
+                .join('\n\n')
+                .slice(-120000);
+            if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
+                try { await ensureConnected(); } catch (e) {
+                    return { error: `Webchat not connected: ${e.message}` };
+                }
+            }
+            let systemText = systemMessage?.content || '';
+            // 09-03 TOOL BRIDGE: the pi agent loop needs model-side tool calls.
+            // The formatText override REPLACES the gateway's relaxed chat format
+            // (it is appended LAST, so any instruction in it wins over the
+            // systemText protocol — that is exactly why a system-only protocol
+            // was being ignored by the lane model before).
+            let formatText = undefined;
+            if (toolNames.length) {
+                const allow = toolNames.slice(0, 24).join(', ');
+                // 09-03 SCHEMA INJECTION: the lane model must construct valid
+                // CALL_TOOL arguments; names alone are not enough (vuln agents
+                // never emitted submit_exploitation_queue → output-validation
+                // failed 15/15). Compact per-tool description + param schema.
+                const schemaText = (config.toolSchemaSlice ? tools.slice(0, config.toolSchemaSlice) : tools).map((t) => {
+                    const nm = t.name || '';
+                    const desc = String(t.description || '').slice(0, 180);
+                    let params = '';
+                    const p = t.parameters || (t.input_schema) || {};
+                    try { params = JSON.stringify(p).slice(0, 320); } catch { params = '{}'; }
+                    return `- ${nm}${desc ? `: ${desc}` : ''} ${params ? `PARAMS ${params}` : ''}`;
+                }).join('\n');
+                systemText += (`\n\n### TOOL PROTOCOL\nAvailable tool calls: ${allow}.\n` + schemaText + '\n');
+                formatText =
+                    '### RESPONSE INSTRUCTIONS FOR THIS SESSION (OVERRIDE ALL OTHERS)\n' +
+                    'You are a pentest ANALYST agent. A harness owns the tools and executes them for you.\n' +
+                    'IF the assignment requires a tool call (e.g. submitting a queue), your reply MUST start\n' +
+                    'with the CALL_TOOL line as the VERY FIRST line:\n' +
+                    'CALL_TOOL: <name> <arguments-json-single-line-no-code-fence>\n' +
+                    'and optional short analysis text may follow AFTER that line.\n' +
+                    'NEVER answer a tool-requiring assignment without the CALL_TOOL line.\n' +
+                    'Only when a task explicitly needs no tool, answer in plain text (NO CALL_TOOL line).\n' +
+                    'Never emit code fences, markdown-ish wrappers, or the gateway json-tool block.';
+            }
+            const text = await enqueue(() =>
+                handleRequest(systemText, prompt, buildExecutableToolDefs(), undefined, undefined,
+                    { formatText })
+            );
+            // Paranoia guard: the lane strips leading whitespace; normalize \r.
+            return { text: String(text || '') };
+        };
+        const outputFor = (text) => {
+            const pc = parseCall(text);
+            if (pc) {
+                let args = pc.args;
+                try { JSON.parse(pc.args); }
+                catch { args = '{}'; }
+                console.log('[responses] function_call emitted:', pc.name, '(' + args.length + ' chars)');
+                return [{ type: 'function_call', id: 'fc_' + Math.random().toString(36).slice(2, 12),
+                    call_id: 'call_' + Math.random().toString(36).slice(2, 12),
+                    name: pc.name, arguments: args }];
+            }
+            // 09-03 JSON-TEXT FALLBACK: shannon's pi prompt forbids "output JSON
+            // as text", yet the lane model tends to deliver the queue inline —
+            // which pi then sees as prose (no submit → queue file missing →
+            // output validation fails). If a submit*_queue tool is offered and
+            // the tail of the reply looks like the structured queue object,
+            // upgrade it into a REAL function_call so the worker writes the file.
+            const submitTool = toolNames.find((n) => /queue/i.test(n));
+            if (text) {
+                console.log('[responses] msg-reply (no call): ' + String(text).replace(/\s+/g, ' ').slice(0, 240));
+                console.log('[responses] tail-text: ' + String(text).replace(/\s+/g, ' ').slice(-400));
+            }
+            if (submitTool && text) {
+                const tail = text.slice(-4000);
+                const m = tail.match(/\{[\s\S]*\}/);
+                if (m) {
+                    try {
+                        const obj = JSON.parse(m[0]);
+                        const keys = Object.keys(obj);
+                        const looksQueue = keys.some((k) => /find|exploit|vuln|queue|target|evidence|severity|confidence|description|vulnerability|id/i.test(k));
+                        if (looksQueue) {
+                            console.log('[responses] json-text queue fallback ->', submitTool);
+                            return [{ type: 'function_call', id: 'fc_' + Math.random().toString(36).slice(2, 12),
+                                call_id: 'call_' + Math.random().toString(36).slice(2, 12),
+                                name: submitTool, arguments: JSON.stringify(obj) }];
+                        }
+                    } catch { /* not JSON */ }
+                }
+            }
+            return [{ type: 'message', role: 'assistant', stop_reason: 'end_turn',
+                content: [{ type: 'output_text', text: (text || '').trim() }] }];
+        };
+        const wrap = (text) => ({
+            id: 'resp_' + Math.random().toString(36).slice(2, 12),
+            object: 'response',
+            created_at: Math.floor(Date.now() / 1000),
+            model: routedModel || model,
+            output: outputFor(text),
+            usage: { input_tokens: 0, output_tokens: (text || '').length, total_tokens: (text || '').length },
+        });
+        const result = await rst(req);
+        if (result.error) return res.status(503).json({ error: { type: 'api_error', message: result.error } });
+        if (stream) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.write('event: response.created\ndata: ' + JSON.stringify({ type: 'response.created', response: wrap(result.text) }) + '\n\n');
+            const items = outputFor(result.text);
+            items.forEach((item, idx) => {
+                res.write('event: response.output_item.added\ndata: ' + JSON.stringify({
+                    type: 'response.output_item.added', output_index: idx, item,
+                }) + '\n\n');
+                if (item.type === 'function_call') {
+                    // pi's decoder only finalizes a functionCall slot that has seen
+                    // function_call_arguments.delta (it requires partialJson present);
+                    // missing these = tool call silently dropped → agent dies w/o submit.
+                    res.write('event: response.function_call_arguments.delta\ndata: ' + JSON.stringify({
+                        type: 'response.function_call_arguments.delta', output_index: idx, delta: item.arguments || '{}',
+                    }) + '\n\n');
+                    res.write('event: response.function_call_arguments.done\ndata: ' + JSON.stringify({
+                        type: 'response.function_call_arguments.done', output_index: idx, arguments: item.arguments || '{}',
+                    }) + '\n\n');
+                }
+                res.write('event: response.output_item.done\ndata: ' + JSON.stringify({
+                    type: 'response.output_item.done', output_index: idx, item,
+                }) + '\n\n');
+            });
+            res.write('event: response.completed\ndata: ' + JSON.stringify({ type: 'response.completed', response: wrap(result.text) }) + '\n\n');
+            return res.end();
+        }
+        res.json(wrap(result.text));
+    } catch (error) {
+        console.error('❌ /v1/responses error:', error);
+        if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+            res.status(500).json({ error: { type: 'api_error', message: error.message } });
         }
     }
 });

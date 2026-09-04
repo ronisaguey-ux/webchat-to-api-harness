@@ -2,7 +2,7 @@ import pickle
 import io
 from typing import Any, Dict
 
-class CheckpointCorruptionError(Exception):
+class CheckpointCorruptionError(pickle.UnpicklingError):
     """Raised when a checkpoint file is corrupted or malicious."""
     pass
 

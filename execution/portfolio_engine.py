@@ -3,6 +3,8 @@ import time
 import logging
 from typing import Dict, Any, List, Optional
 
+from execution.core import validate_token, AuthError
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,10 @@ class PortfolioEngine:
         logger.info(f"AUDIT: {log_entry}")
         with open("audit.log", "a") as f:
             f.write(f"{log_entry}\n")
+
+    def get_positions(self, auth_header: Optional[str] = None) -> Dict[str, Any]:
+        payload = validate_token(auth_header)
+        return self.positions
 
     def get_portfolio(self, caller_id: str, token: str) -> Dict[str, Any]:
         self._validate_session(caller_id, token)
