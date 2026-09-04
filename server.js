@@ -929,6 +929,13 @@ async function maybePauseForDrift(text, userPrompt) {
 }
 
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted, opts = {}) {
+    // 09-04 (user): NEVER build/send a prompt with a blank USER MESSAGE — the
+    // webchat model replies "task empty" and DS rejects it as an empty send
+    // (poisons the thread with "Empty user message"). Refuse before any send.
+    if (!userPrompt || !String(userPrompt).trim()) {
+        console.log('🚫 empty userPrompt refused (blank USER MESSAGE prompt)');
+        throw new Error('empty userPrompt — every send needs non-empty user text');
+    }
     // 09-04 MIN_LANE_GAP: the DS webchat account rate-limits bursts
     // ("Messages too frequent, rate_limit_reached") — pace sends when
     // MIN_LANE_GAP_SECONDS is set (ds-gw drop-in). Global instance gate.
