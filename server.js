@@ -948,14 +948,18 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     // 08-19 (user): TWO MODES — autonomous (execution lane: bare tool calls,
     // no narration) vs user mode (interactive: 💬 narration before tool
     // calls). The executor signals autonomous per request; a process-level
-    // AUTONOMOUS=1 env also opts the whole instance in. Default = user mode.
-    const autonomous = !!(opts.autonomous || config.autonomous);
+    // AUTONOMOUS=1 env also opts the whole instance in.
+    // 09-04 (user mandate): narration OFF BY DEFAULT — garbage 💬 narration
+    // messages only appear when explicitly asked (per-request opts.narrate or
+    // env NARRATION=1). Everything else = bare tool calls, no chatter.
+    const narrate = !!(opts.narrate || process.env.NARRATION === '1');
+    const autonomous = !narrate;
     const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
     let prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
     if (systemText) prompt += `${systemText}\n\n`;
     prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
-    // 08-19 (user): autonomous (execution lane) = bare tool calls, no
-    // narration; user mode = 💬-protocol format with narration.
+    // 08-19 (user): autonomous = bare tool calls, no narration; narrate mode
+    // = 💬-protocol format. 09-04: narration only when explicitly enabled.
     prompt += opts.formatText || (autonomous ? AUTONOMOUS_FORMAT : (config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT));
     prompt += continueDirective(userPrompt);
     prompt += greetingDirective(userPrompt);
@@ -2041,17 +2045,48 @@ app.post('/v1/responses', async (req, res) => {
             // carries only function_call_output + a short follow-up; the actual
             // task lives in the EARLIER messages. Using only the last user
             // message made the lane model reply "No concrete task was
-            // provided". Rebuild the prompt from ALL non-system messages.
-            const prompt = messages
-                .filter((m) => m.role !== 'system')
-                .map((m) => {
-                    const body = typeof m.content === 'string'
-                        ? m.content
-                        : JSON.stringify(m.content ?? '');
-                    return (m.role === 'assistant' ? 'ASSISTANT: ' : 'USER: ') + body;
-                })
-                .join('\n\n')
-                .slice(-120000);
+            // provided".
+            // 09-04 PROMPT-FIX (user): a shared webchat thread accumulates
+            // OTHER lanes' old formats (json-tool protocol, "send_message
+            // first" narration, audit preambles) — the model echoed them and
+            // got confused. Bridge sessions are self-contained (pi resends the
+            // full task context every call), so: keep ONLY the current user
+            // turn (+ the immediately preceding [tool result] if present), and
+            // nothing older.
+            const toBody = (m) => {
+                const body = typeof m.content === 'string'
+                    ? m.content
+                    : JSON.stringify(m.content ?? '');
+                return (m.role === 'assistant' ? 'ASSISTANT: ' : 'USER: ') + body;
+            };
+            const prompt = (() => {
+                const us = messages.filter((m) => m.role === 'user');
+                if (!us.length) return '';
+                const last = us[us.length - 1];
+                const d = (x) => (typeof x === 'string' ? x : JSON.stringify(x ?? ''));
+                // keep the trailing tool result only (short, task-scoped)
+                if (us.length > 1 && String(d(us[us.length - 2])).startsWith('[tool result]')) {
+                    return toBody(us[us.length - 2]) + '\n\n' + toBody(last);
+                }
+                return toBody(last);
+            })();
+            // 09-04: pi's endpoint VALIDATION posts an EMPTY input — it only
+            // asks "does this dialect respond?". Serve a minimal valid
+            // Responses object locally (no browser, no send); the send-time
+            // guard still refuses blank REAL prompts, so nothing empty ever
+            // reaches the tab.
+            if (!String(prompt || '').replace(/^USER: /, '').trim()) {
+                console.log('🔌 validation probe answered locally (empty input)');
+                res.json({
+                    id: 'resp_loc_validation', object: 'response',
+                    created_at: Math.floor(Date.now() / 1000),
+                    model: routedModel || 'anymodel',
+                    output: [{ type: 'message', role: 'assistant', stop_reason: 'end_turn',
+                        content: [{ type: 'output_text', text: 'ok' }] }],
+                    usage: { input_tokens: 0, output_tokens: 1, total_tokens: 1 },
+                });
+                return;
+            }
             if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
                 try { await ensureConnected(); } catch (e) {
                     return { error: `Webchat not connected: ${e.message}` };
