@@ -11,30 +11,49 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX = 10     # max requests per window per caller
 
+
+class AuthError(Exception):
+    """Raised when authentication fails."""
+    pass
+
+
+def validate_token(auth_header: Optional[str]) -> Dict[str, Any]:
+    """
+    Validate a Bearer token from an Authorization header.
+
+    Returns a payload dict containing the authenticated caller_id.
+    Raises AuthError on missing, malformed, or invalid tokens.
+    """
+    if auth_header is None:
+        raise AuthError("Missing authorization header")
+    if not isinstance(auth_header, str) or not auth_header.startswith("Bearer "):
+        raise AuthError("Invalid authorization header format")
+    token = auth_header[len("Bearer "):]
+    expected_token = os.environ.get("API_BEARER_TOKEN", "default-secret")
+    if token != expected_token:
+        raise AuthError("Invalid token")
+    return {"caller_id": "demo_user"}
+
+
 class ExecutionEngine:
     def __init__(self):
         self._rate_limit_store: Dict[str, List[float]] = {}
         self._caller_sessions: Dict[str, bool] = {}  # simple session store
 
-    def _validate_session(self, caller_id: str, token: str) -> bool:
+    def _validate_session(self, auth_header: Optional[str]) -> Dict[str, Any]:
         """
-        Validate that the caller_id and token correspond to an authenticated session.
-        Raises PermissionError if invalid.
+        Validate the Authorization header and mark the caller session active.
+        Raises AuthError if invalid.
         """
-        expected_token = os.environ.get("EXECUTION_API_TOKEN", "default-secret")
-        if token != expected_token:
-            logger.warning(f"Invalid token from caller {caller_id}")
-            raise PermissionError(f"Invalid authentication token for caller {caller_id}")
-        # In production, also check that caller_id is a known user
-        # and that the session is valid (not expired, etc.)
-        # This is a simplified check.
+        payload = validate_token(auth_header)
+        caller_id = payload["caller_id"]
         self._caller_sessions[caller_id] = True
-        return True
+        return payload
 
     def _check_rate_limit(self, caller_id: str) -> bool:
         """
         Enforce rate limiting for the given caller_id.
-        Returns True if allowed, raises RateLimitExceeded if too many requests.
+        Returns True if allowed, raises RuntimeError if too many requests.
         """
         now = time.time()
         # Remove old timestamps
@@ -64,35 +83,43 @@ class ExecutionEngine:
         with open("audit.log", "a") as f:
             f.write(f"{log_entry}\n")
 
-    def place_order(self, caller_id: str, token: str, order: Dict[str, Any]) -> Dict[str, Any]:
-        self._validate_session(caller_id, token)
+    def place_order(self, symbol: str, quantity: float, price: float,
+                    auth_header: Optional[str] = None) -> Dict[str, Any]:
+        payload = self._validate_session(auth_header)
+        caller_id = payload["caller_id"]
         self._check_rate_limit(caller_id)
-        self._audit_log("place_order", caller_id, {"order": order})
-        # Placeholder for actual order execution
-        return {"status": "accepted", "order_id": "1234"}
+        self._audit_log("place_order", caller_id,
+                        {"symbol": symbol, "quantity": quantity, "price": price})
+        return {"status": "pending"}
 
-    def cancel_order(self, caller_id: str, token: str, order_id: str) -> Dict[str, Any]:
-        self._validate_session(caller_id, token)
+    def cancel_order(self, order_id: str,
+                     auth_header: Optional[str] = None) -> Dict[str, Any]:
+        payload = self._validate_session(auth_header)
+        caller_id = payload["caller_id"]
         self._check_rate_limit(caller_id)
         self._audit_log("cancel_order", caller_id, {"order_id": order_id})
         return {"status": "cancelled", "order_id": order_id}
 
-    def get_order_status(self, caller_id: str, token: str, order_id: str) -> Dict[str, Any]:
-        self._validate_session(caller_id, token)
+    def get_order_status(self, order_id: str,
+                         auth_header: Optional[str] = None) -> Dict[str, Any]:
+        payload = self._validate_session(auth_header)
+        caller_id = payload["caller_id"]
         self._check_rate_limit(caller_id)
-        # This is a read-only action, audit may not be required but we still log for traceability
+        # Read-only action; still log for traceability
         self._audit_log("get_order_status", caller_id, {"order_id": order_id})
         return {"status": "filled", "order_id": order_id}
 
-    def get_open_orders(self, caller_id: str, token: str) -> List[Dict[str, Any]]:
-        self._validate_session(caller_id, token)
+    def get_open_orders(self, auth_header: Optional[str] = None) -> List[Dict[str, Any]]:
+        payload = self._validate_session(auth_header)
+        caller_id = payload["caller_id"]
         self._check_rate_limit(caller_id)
         self._audit_log("get_open_orders", caller_id, {})
         return []
 
-    def emergency_liquidate_all(self, caller_id: str, token: str) -> Dict[str, Any]:
-        """Emergency liquidation: requires validation, rate limiting, and audit log before mutation."""
-        self._validate_session(caller_id, token)
+    def emergency_liquidate_all(self, auth_header: Optional[str] = None) -> Dict[str, Any]:
+        """Emergency liquidation: validation, rate limiting, and audit log before mutation."""
+        payload = self._validate_session(auth_header)
+        caller_id = payload["caller_id"]
         self._check_rate_limit(caller_id)
         self._audit_log("emergency_liquidate_all", caller_id, {})
         # Perform liquidation logic

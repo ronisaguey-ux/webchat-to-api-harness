@@ -45,7 +45,8 @@ each chat's tab so respawns land on the right thread.
 ### Why two Chrome instances?
 
 - **9223 (GUI)** — real window on `DISPLAY=:1`, a real profile, keeps the
-  watch window and hosts the qwen/kimi tabs.
+  watch window and hosts the qwen/kimi tabs. **VIEW-ONLY** — it cannot
+  generate; every send rides a 9224 headless driver (see §4).
 - **9224 (headless)** — `--headless=new` with a **copy** of the profile,
   hosts the deepseek threads and gemini. Headless instances use far less
   memory and run on the same login.
@@ -81,6 +82,30 @@ desktop UA (some webchats refuse headless UAs).
 tr '\0' ' ' < /proc/$(pgrep -f 'remote-debugging-port=9224' | head -1)/cmdline
 ```
 
+### Viewport freeze (WM-less drivers)
+
+On a box with no window manager (bare Xvfb, or `--headless=new`), the page's
+inner size is whatever Chrome feels like, and the webchat reflows between the
+send steps — coordinate clicks miss, sticky toolbars cover the composer,
+selectors start matching twice. Pin the viewport once, at attach, and never
+let it move:
+
+```bash
+# per-gateway env, set before server.js starts (multi-site drivers)
+VIEWPORT_W=1440 VIEWPORT_H=900
+```
+
+`0`/`0` (the default) leaves the browser's own size. Pick one size per
+gateway and keep it for the life of the session: the send flow computes click
+geometry fresh per step, and a mid-session resize is the same class of bug as
+a DOM remount. Verify what the page actually sees from any CDP client:
+
+```js
+Runtime.evaluate({ expression: '`' + innerWidth + 'x' + innerHeight + '`' })
+```
+
+It must return the pinned pair on every tab the gateway drives.
+
 ---
 
 ## 3. Asset blocking
@@ -104,12 +129,17 @@ decodes them.
 | `BLOCKED_URLS_EXTRA='a,b'` | append extra globs (comma-separated) |
 | `BLOCKED_CSS=true` | also block all `*.css*` |
 
-> **CSS is DeepSeek-only.** The Gemini and ChatGPT layouts fall apart without
-> stylesheets (overlapping panels, unusable composer). `BLOCKED_CSS=true` is
-> set only on the deepseek gateways.
->
-> `BLOCKED_URLS_EXTRA='*.js*,*.json*'` additionally strips scripts — pure-text
-> head, **nothing works on the page**, diagnostics only.
+**BLOCKED_CSS matrix** — which hosts tolerate stylesheet blocking:
+
+| Host / driver | `BLOCKED_CSS` | Reason |
+|---|---|---|
+| deepseek (9224 headless) | `true` | answers come from the stream tee (§6); the DOM is fallback, so unstyled layout costs nothing |
+| gemini (9224) | `false` | layout falls apart without stylesheets — overlapping panels, unusable composer |
+| chatgpt-class hosts | `false` | same collapse as gemini |
+| any new host | `false` | default; flip to `true` only after an A/B send proves the tee still parses |
+
+`BLOCKED_URLS_EXTRA='*.js*,*.json*'` additionally strips scripts — pure-text
+head, **nothing works on the page**, diagnostics only.
 
 **Verify the block is live:** attach with a CDP client and check the log line,
 or watch the Network events — media requests come back as `canceled`.
@@ -129,11 +159,13 @@ CDP_WS_URL='ws://127.0.0.1:9224/devtools/browser/<id>'   # from /json/version
 - Model chip label: `Open mode picker, currently Flash` = 3.7 Flash active.
 - Responses include `reasoning_content` and `usage.reasoning_tokens` —
   reasoning is on.
-- **The GUI (9223) instance cannot generate.** Reproduced across four error
-  variants, clean 30-char prompts, fresh tabs, and with the asset blocker
-  disabled (A/B): the failure is client-side and pre-network — zero request
-  traffic, zero JS errors, garbage/echo text on fresh tabs. Not the flags
-  (9224 runs the same ones). Don't debug it again — use 9224.
+- **RULE — 9223 is VIEW-ONLY.** The GUI (9223) instance cannot generate.
+  Reproduced across four error variants, clean 30-char prompts, fresh tabs,
+  and with the asset blocker disabled (A/B): the failure is client-side and
+  pre-network — zero request traffic, zero JS errors, garbage/echo text on
+  fresh tabs. Not the flags (9224 runs the same ones). Don't debug it again —
+  use 9224. 9223 exists to hold the login and give a human a window; every
+  send goes through a 9224 headless driver.
 
 ### Why the send flow needed a fix
 
@@ -152,7 +184,11 @@ fast path.
 
 ## 5. Send-flow internals
 
-The full send path (all sites):
+The full send path (all sites) — the numbered sequence below is the
+**canonical send order**. Every host path (including the DeepSeek fast path)
+is a specialization of it; a change that reorders the steps — teeing after
+Enter, clicking before the empty-guard, focusing after typing — reintroduces
+the hangs and mis-clicks catalogued in §10.
 
 1. Wait for the chat input (`config.selectors.input`, first match wins).
 2. Scroll into view + `el.focus()` (page-level evaluate — JSHandle-arg
@@ -193,13 +229,13 @@ Anthropic SSE sequence live, so streaming works end-to-end.
 
 ## 7. Context handoff
 
-DeepSeek's window is 128K tokens (~500K chars ≈ 2000000 char threshold). The
+DeepSeek's window is 128K tokens (~500K chars, threshold 500000). The
 gateway counts the chars it actually feeds the model in one request
 (measured on the real request body via a `tee` capture, not estimated) and
 applies gates:
 
 1. **Pre-send**: running estimate ≥ `CONTEXT_HANDOFF_THRESHOLD` (default
-   `2000000`) → stop the tool loop, write `handoff_to_new_chat.md` (a
+   `500000`) → stop the tool loop, write `handoff_to_new_chat.md` (a
    complete summary the model writes itself), **open a new chat in the same
    tab**, send the document as the first message.
 2. **Round-top growth**: if a single request round grows the estimate by
@@ -240,7 +276,7 @@ sent to the wrong gateway are rejected rather than silently proxied.
 | `MODEL_NAME` | `deepseek webchat` | model id advertised by `/v1/models` |
 | `HEADLESS` | `false` | visible browser for first-time login |
 | `ALLOW_PLAIN_TEXT` | `false` | tolerate plain-text answers (no JSON fence) |
-| `VIEWPORT_W` / `VIEWPORT_H` | `0` / `0` | pin the chat viewport (multi-site drivers) |
+| `VIEWPORT_W` / `VIEWPORT_H` | `0` / `0` | pin the chat viewport at attach (multi-site drivers) — see *Viewport freeze* (§2) |
 | `BLOCKED_URLS_EXTRA` | *(none)* | extra network-block globs, comma-separated (§3) |
 | `BLOCKED_CSS` | `false` | block all `*.css*` (DeepSeek only) |
 | `TIMEOUT` | `1800000` | max wait for a response (ms); 30 min — long webchat cogitations exceed 180 s routinely |
@@ -254,7 +290,7 @@ sent to the wrong gateway are rejected rather than silently proxied.
 | `SKIP_BROWSER` | `false` | run server without a browser (testing) |
 | `SELECTOR_*` | see `config.js` | comma-separated CSS selector lists, first match wins |
 | `CONTEXT_HANDOFF_ENABLED` | `true` | auto-swap to a new chat at the threshold (§7) |
-| `CONTEXT_HANDOFF_THRESHOLD` | `2000000` | rough per-request context estimate (chars/4 ≈ tokens) that triggers the handoff |
+| `CONTEXT_HANDOFF_THRESHOLD` | `500000` | rough per-request context estimate (chars/4 ≈ tokens) that triggers the handoff |
 | `HANDOFF_FILE` | `…/handoff_to_new_chat.md` | where the handoff document is written |
 
 Upstream proxy routes (dual-model mode) read `UPSTREAM_ANTHROPIC_BASE_URL`,
@@ -268,7 +304,7 @@ streaming passes through untouched (`Readable.fromWeb`).
 | Symptom | Recipe |
 |---|---|
 | Gateway alive but **silent** (>120 s, no response, `/status` hangs) | kill the listener PID (by PID, from `ss -tlnp`) — the supervisor respawns it fresh |
-| **Gemini errors / echo / garbage** | you are on the 9223 GUI instance — it cannot generate (see §4). Move to 9224. Do not re-debug. |
+| **Gemini errors / echo / garbage** | you are on the 9223 GUI instance — it is VIEW-ONLY and cannot generate (see §4). Move to 9224. Do not re-debug. |
 | Text stuck in the composer, **model menu opened** | the generic `div[role="button"]` fallback hit the model-picker chip. Non-DeepSeek sites need the trusted composer click (§4); if the fallback is the only hit, fix the selectors |
 | **403 Forbidden on the CDP websocket** | Chrome 151 rejects handshakes bearing *any* `Origin` header. Connect with the origin suppressed (python `websocket-client`: `suppress_origin=True`) |
 | `js-flags` only visible in `/proc` cmdline | your grep alternation is at fault — dump the whole cmdline (`tr '\0' ' '`) |
@@ -297,3 +333,6 @@ streaming passes through untouched (`Readable.fromWeb`).
 6. **Automating webchats violates their ToS** — accounts can be
    rate-limited or banned, and providers change their DOM without notice
    (that's what the selector env vars are for). Use at your own risk.
+7. **9223 is VIEW-ONLY** — the GUI instance holds logins and the watch
+   window; it cannot generate. Every send goes through a 9224 headless
+   driver (§4).

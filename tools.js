@@ -653,6 +653,53 @@ const TOOL_DEFINITIONS = [
         },
     },
     {
+        // 2026-08-25 (owner, NUCLEAR sweep): call_main — the brain's open
+        // channel to the MAIN Claude operator. Anything goes in the message;
+        // attach can carry paths (screenshots, logs, files) that main will
+        // read. Wakes main instantly (same inbox the wake chain watches);
+        // main's reply arrives in the thread's next message via
+        // claude_webchat_outbox.json injection.
+        name: 'call_main',
+        category: 'oculus',
+        description:
+            'Call the MAIN operator (the Claude session running the sweep). Use it to ask anything, ' +
+            'report blockers, or request interpretations of screenshots/files. Attach any paths — ' +
+            'main will read and reply through this thread.',
+        parameters: {
+            type: 'object',
+            properties: {
+                message: { type: 'string', description: 'The message to main — anything you need: status, question, issue, confirmation.' },
+                attach: {
+                    type: 'array', items: { type: 'string' },
+                    description: 'Optional absolute file paths (screenshots, logs) for main to read and interpret.',
+                },
+            },
+            required: ['message'],
+        },
+        handler: async (args, ctx) => {
+            const INBOX = '/home/roni/Roni_Workspace/audits_plans/claude_webchat_inbox.json';
+            const MAIN_INBOX = '/home/roni/Roni_Workspace/audits_plans/claude_main_inbox.json';
+            const text = String((args && args.message) || '').trim();
+            if (!text) return { success: false, error: 'empty message' };
+            const attach = Array.isArray(args?.attach) ? args.attach.filter(Boolean) : [];
+            const full = text + (attach.length ? '\n\nATTACH: ' + attach.join(', ') : '');
+            const item = { ts: new Date().toISOString(), from: 'brain', text: full };
+            if (ctx && ctx.threadId) item.thread = ctx.threadId;
+            const push = async (path) => {
+                let out = [];
+                try { out = JSON.parse(fs.readFileSync(path, 'utf-8')); } catch { out = []; }
+                if (!Array.isArray(out)) out = [];
+                out.push(item);
+                const tmp = path + '.tmp';
+                fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf-8');
+                fs.renameSync(tmp, path);
+            };
+            await push(INBOX);
+            await push(MAIN_INBOX); // the verified wake-chain inbox
+            return { success: true, message: 'Main notified; its reply will appear in your next message.' };
+        },
+    },
+    {
         name: 'send_message_to_antigravity',
         category: 'interagent',
         description:

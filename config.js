@@ -1,4 +1,5 @@
 require('dotenv').config({ override: true });
+const path = require('path');
 
 // chat.js overrides (paste your tab URL there — it wins over .env)
 let chat = {};
@@ -71,7 +72,7 @@ const cfg = {
     // (context_length_exceeded → handoff) still catches any early cap.
     contextHandoffEnabled: process.env.CONTEXT_HANDOFF_ENABLED !== 'false',
     contextHandoffThreshold: parseInt(process.env.CONTEXT_HANDOFF_THRESHOLD) || 2000000,
-    handoffFile: process.env.HANDOFF_FILE || '/home/roni/Roni_workspace/handoff_to_new_chat.md',
+    handoffFile: process.env.HANDOFF_FILE || path.join(__dirname, 'handoff_to_new_chat.md'),
 
     // Behaviour
     timeout: parseInt(process.env.TIMEOUT) || 1800000, // 08-13 EVENING: run-until-done tasks + 6s send spacing + narration exceed 180s routinely; the 180s cap timed out mid-task and its crash path killed the process (now guarded). 08-14: 10 min still too short — the webchat cogitated SILENTLY 11 min on 'add EVERYTHING' (08-13 22:5x) and BOTH the gateway timeout and the client stream-idle watchdog fired. 30 min default; the SSE keepalive (server.js) keeps clients alive through it.
@@ -110,6 +111,29 @@ const cfg = {
         message: (process.env.SELECTOR_MESSAGE || 'model-response, [data-message-author-role="model"], .model-response-text, .response, .ds-markdown, .message, .chat-message')
             .split(',').map((s) => s.trim()).filter(Boolean),
     },
+
+    // ── MODE / FEATURE TOGGLES (09-04: every mode & option configurable; env
+    // always wins, default = safe/proven values). ───────────────────────────
+    // Dialect endpoints:
+    responsesBridge: process.env.RESPONSES_BRIDGE === '1',       // /v1/responses (pi/shannon agent dialect)
+    chatCompletionsSse: process.env.CHAT_COMPLETIONS_SSE === '1', // SSE branch on /v1/chat/completions
+    // Tool-protocol emulation (responses path):
+    callFirstProtocol: process.env.CALL_FIRST === '1',           // call-first formatText
+    toolSchemaSlice: parseInt(process.env.TOOL_SCHEMA_SLICE) || 0, // 0 = ALL tools; N = first N
+    jsonTextFallback: process.env.JSON_TEXT_FALLBACK === '1',    // prose JSON → function_call upgrade
+    thinkingHeadGuard: process.env.THINKING_HEAD_GUARD !== '0',  // skip short "Analyzing..." headline bubbles
+    // Retry / pacing / rounds:
+    maxToolRounds: parseInt(process.env.MAX_TOOL_ROUNDS) || 40,
+    maxFormatErrorRounds: parseInt(process.env.FORMAT_ERROR_ROUNDS) || 4,
+    laneGapSeconds: Math.max(0, parseFloat(process.env.MIN_LANE_GAP_SECONDS || process.env.LANE_GAP_SECONDS || 0)),
+    // Server pacing wait (per request-entry interleave gap, 0 = off)
+    // Persistence / presentation:
+    saveCookies: process.env.SAVE_COOKIES !== '0',
+    collapseReplies: process.env.COLLAPSE_REPLIES !== '0',       // collapse big tool-JSON replies in the tab
+    swapExpertPins: process.env.INSTANT_SWAP_EXPERT === '1' || process.env.FORCE_EXPERT === '1',
+    // Browser identity tweaks:
+    userAgentOverride: process.env.USER_AGENT_OVERRIDE || null,
+    fingerprintPlatform: process.env.FINGERPRINT_PLATFORM || 'windows', // cloak antidetect platform
 };
 
 module.exports = cfg;

@@ -271,8 +271,18 @@ async function connectToWebchat(webchatUrl) {
                 await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
             }
         } else {
+            // 08-30 (fix, DS fresh-chat bug): after a CDP reconnect, `page` is
+            // null and the pick below used to grab the FIRST origin-match —
+            // which, once the driver holds several tabs, was the OLD conversation
+            // tab (/a/chat/s/<uuid>). Every send then typed into the previous
+            // persona's thread (personas shared b824ba98…-186f48365be9). A
+            // fresh-chat tab sits at the ROOT (/a/chat or /a/chat/new) — prefer
+            // those; only fall back to an existing thread tab if nothing else.
+            const origin = new URL(webchatUrl).origin;
+            const isThreadTab = (p) => /\/a\/chat\/s\//.test(p.url());
             page =
-                pages.find((p) => p.url().startsWith(new URL(webchatUrl).origin)) ||
+                pages.find((p) => !isThreadTab(p) && p.url().startsWith(origin)) ||
+                pages.find((p) => p.url().startsWith(origin)) ||
                 pages.find(
                     (p) =>
                         p.url() !== 'about:blank' &&
@@ -387,6 +397,16 @@ async function waitForChatInput() {
 // 4. SEND PROMPT + GET RESPONSE
 // ──────────────────────────────────────────────────────
 async function sendPrompt(prompt, toolDefinitions) {
+    // 09-04 MIN_LANE_GAP (ds-gw): the DeepSeek webchat account rate-limits
+    // bursts ("Messages too frequent") — fires after ~5-8 messages in a few
+    // minutes. Gate EVERY physical send (covers the internal tool-loop turns
+    // too, which skip the request-level gate in handleRequest).
+    if (process.env.MIN_LANE_GAP_SECONDS) {
+        const gap = (Number(process.env.MIN_LANE_GAP_SECONDS) || 0) * 1000;
+        const wait = (global.__lastPhysicalSend || 0) + gap - Date.now();
+        if (wait > 0) await sleep(wait);
+        global.__lastPhysicalSend = Date.now();
+    }
     // Test hook: bypass the browser entirely (used by smoke tests)
     if (process.env.TEST_FAKE_RESPONSE) {
         console.log(`🧪 TEST_FAKE_RESPONSE set — skipping browser (prompt: ${prompt.length} chars)`);
@@ -446,7 +466,7 @@ async function sendPrompt(prompt, toolDefinitions) {
     // has both chips). No-op for foreign webchats (no such chips) and never
     // throws.
     await ensureToggles();
-    console.log(`📤 Sending prompt (${prompt.length} chars)`);
+    console.log(`📤 Sending prompt (${prompt.length} chars) — tab: ${page.url()}`);
 
     // 08-13 FOREIGN-BUSY guard: a generation left running from a
     // disconnected client keeps its STOP control on the tab. Typing into
@@ -516,7 +536,23 @@ async function sendPrompt(prompt, toolDefinitions) {
     }
 
     console.log('⏳ Waiting for response...');
-    const text = await waitForResponse(before, fullPrompt);
+    let text = await waitForResponse(before, fullPrompt);
+    // 09-04 GEMINI EXTENDED-THINKING HEAD GUARD: the first bubble is a short
+    // "Analyzing the Prompt's Design" / "Thinking about..." headline while the
+    // model actually thinks; grabbing it as the answer then blew up the
+    // shannon agents with format-error re-spam. Treat short thinking-head
+    // texts as not-yet-answered and keep waiting (≤ ~4 min).
+    const thinkingHead = (t) => t && t.length < 80 && /analyzing|thinking|planning|reasoning about|reflect|brainstorm/i.test(t);
+    if (config.thinkingHeadGuard !== false && thinkingHead(text)) {
+        for (let i = 0; i < 24; i++) {
+            await sleep(10000);
+            const t2 = await waitForResponse(before, fullPrompt);
+            if (!t2) continue;
+            if (thinkingHead(t2)) continue;
+            text = t2;
+            break;
+        }
+    }
     console.log(`📥 Response received (${text.length} chars)`);
 
     // 08-17 INSTANT-SWAP PIN: capture now happens immediately after
@@ -1908,9 +1944,18 @@ async function openNewChat() {
     // conversation stays safe server-side).
     if (!page && config.cdpWsUrl) {
         const pages = await browser.pages();
-        page = config.tabUrlSubstring
-            ? pages.find((p) => p.url().includes(config.tabUrlSubstring))
-            : pages.find((p) => p.url().startsWith(new URL(config.webchatUrl).origin));
+        if (config.tabUrlSubstring) {
+            page = pages.find((p) => p.url().includes(config.tabUrlSubstring));
+        } else {
+            // 08-30 same fix as connectToWebchat: never navigate an OLD
+            // /a/chat/s/ thread tab away for a new chat when a root tab exists;
+            // the old thread stays pinned for reopenThread.
+            const origin = new URL(config.webchatUrl).origin;
+            const isThreadTab = (p) => /\/a\/chat\/s\//.test(p.url());
+            page =
+                pages.find((p) => !isThreadTab(p) && p.url().startsWith(origin)) ||
+                pages.find((p) => p.url().startsWith(origin));
+        }
         if (!page) {
             page = await browser.newPage();
             await page.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
