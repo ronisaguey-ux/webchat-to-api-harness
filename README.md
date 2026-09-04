@@ -270,3 +270,56 @@ when a stream dies mid-turn, the tab must be reloaded, not just the gateway.
    - Universal Claude Code settings, PreToolUse banned action hooks, and slash commands.
 3. **[`helpotron`](https://github.com/ronisaguey-ux/helpotron.git)**:
    - Full-stack agentic workspace and reactive testing framework.
+
+---
+
+## Shannon / pi-coding-agent compatibility (09-04)
+
+The gateways speak two dialects to AI pentest agents:
+
+- `/v1/chat/completions` — classic OpenAI shape (SSE stream when `CHAT_COMPLETIONS_SSE=1`);
+- `/v1/responses` — the Responses dialect used by pi-coding-agent
+  (the worker runtime of Keygraph Shannon). Enables a **free webchat account
+  as the model backend for @keygraph/shannon**:
+
+```
+export SHANNON_AI_MODEL="openai:anymodel"
+export SHANNON_AI_BASE_URL="http://<host>:<port>/v1"   # this gateway
+export SHANNON_AI_API_KEY="anything"                    # gateways don't auth
+```
+
+### Tool protocol (so the lane model can drive tool calls)
+
+1. Schema injection — the request's tool names+schemas are serialized into the
+   lane prompt (all tools by default; `TOOL_SCHEMA_SLICE=N` caps it).
+2. Call-first — the format text instructs the model to open every tool-requiring
+   reply with `CALL_TOOL: <name> <json>` (toggle: `CALL_FIRST=1`).
+3. The bridge converts that line to a real `function_call` item mid-stream, so
+   the pi worker executes the call and feeds the result back.
+4. Prose fallback — a queue-shaped JSON object inside a prose reply is upgraded
+   to a `function_call` (`JSON_TEXT_FALLBACK=1`).
+5. Thinking-head guard — short gemini "Analyzing..." headings are never taken
+   as answers (`THINKING_HEAD_GUARD`, default on).
+
+### Modes / feature toggles (all env, documented in `.env.example`)
+
+`RESPONSES_BRIDGE` · `CHAT_COMPLETIONS_SSE` · `CALL_FIRST` · `TOOL_SCHEMA_SLICE`
+· `JSON_TEXT_FALLBACK` · `THINKING_HEAD_GUARD` · `MAX_TOOL_ROUNDS` ·
+`FORMAT_ERROR_ROUNDS` · `MIN_LANE_GAP_SECONDS` · `SAVE_COOKIES` ·
+`COLLAPSE_REPLIES` · `INSTANT_SWAP_EXPERT`/`FORCE_EXPERT` · `USER_AGENT_OVERRIDE`
+· `FINGERPRINT_PLATFORM`
+
+### Browser modes
+
+- **Own headless (default)** — the gateway launches its own stealth Chromium
+  (`CLOAKBROWSER=1`, profile via `WEBCHAT_PROFILE`).
+- **CDP attach** — use a browser you own/control (e.g. a logged-in Desktop
+  Chrome): `CDP_WS_URL=ws://127.0.0.1:9223/devtools/browser/x`
+  (placeholder id; the live id is resolved from `/json/version`). Session
+  survival matters — antidetect fingerprints get flagged by Google across
+  accounts; the user's own browser does not.
+
+### Debug routes (dev)
+
+`GET  /debug/dump` — page URL + body text + screenshot length.
+`POST /debug/eval {"code":"..."}` — run JS in the tab.
