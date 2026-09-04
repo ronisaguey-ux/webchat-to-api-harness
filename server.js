@@ -1994,6 +1994,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 // so free-lane runs (shannon, pi agents) need no dialect change upstream.) ──
 app.post('/v1/responses', async (req, res) => {
     try {
+        if (process.env.RESP_RAW_LOG === '1') {
+            const raw = JSON.stringify(req.body || {});
+            const inp = req.body?.input;
+            const lastItem = Array.isArray(inp) ? inp[inp.length - 1] : inp;
+            const lastText = typeof lastItem === 'string' ? lastItem
+                : lastItem?.content ? (Array.isArray(lastItem.content) ? lastItem.content.map((c) => c && c.text).filter(Boolean).join(';') : String(lastItem.content)).slice(0, 160) : String(lastItem).slice(0, 120);
+            console.log(`🔬 resp raw len=${raw.length} nItems=${Array.isArray(inp) ? inp.length : '-'} last=${JSON.stringify(lastText)} tail=${raw.slice(-200)}`);
+        }
         const { model, input, instructions = '', stream, tools } = req.body || {};
         const routedModel = String(model || '').replace(/^claude\//, '');
         // Tool names offered by the caller (pi/shannon agents). Our lane model
@@ -2029,7 +2037,10 @@ app.post('/v1/responses', async (req, res) => {
         const addInput = (item) => {
             if (typeof item === 'string') messages.push({ role: 'user', content: item });
             else if (Array.isArray(item)) messages.push({ role: 'user', content: item.map(toText).join('\n') });
-            else if (item && item.type === 'message' && item.content)
+            else if (item && item.role && item.content !== undefined)
+                // pi's messages are ROLE-BASED responses items ({"role":"user","content":[...]})
+                // — no type:"message". Matching on role alone let the real task prompts
+                // through; the old type:-only branch silently DROPPED them.
                 messages.push({
                     role: item.role === 'assistant' ? 'assistant' : 'user',
                     content: Array.isArray(item.content) ? item.content.map(toText).join('\n') : String(item.content),
@@ -2070,21 +2081,29 @@ app.post('/v1/responses', async (req, res) => {
                 }
                 return toBody(last);
             })();
-            // 09-04: pi's endpoint VALIDATION posts an EMPTY input — it only
-            // asks "does this dialect respond?". Serve a minimal valid
-            // Responses object locally (no browser, no send); the send-time
-            // guard still refuses blank REAL prompts, so nothing empty ever
+            // 09-04: pi's endpoint VALIDATION (runPreflightValidation →
+            // session.prompt probe) POSTs an EMPTY input and requires the
+            // response as an SSE STREAM (pi's responses runtime parses event
+            // chunks; a bare JSON body fails as "provider rejected"). Serve
+            // the minimal stream locally — no browser, no send, nothing ever
             // reaches the tab.
             if (!String(prompt || '').replace(/^USER: /, '').trim()) {
-                console.log('🔌 validation probe answered locally (empty input)');
-                res.json({
-                    id: 'resp_loc_validation', object: 'response',
-                    created_at: Math.floor(Date.now() / 1000),
+                console.log('🔌 validation probe answered locally (empty input, stream)');
+                const now = Math.floor(Date.now() / 1000);
+                const rid = 'resp_loc_validation';
+                const resp = {
+                    id: rid, object: 'response', created_at: now,
                     model: routedModel || 'anymodel',
-                    output: [{ type: 'message', role: 'assistant', stop_reason: 'end_turn',
-                        content: [{ type: 'output_text', text: 'ok' }] }],
+                    output: [{ type: 'message', status: 'completed', role: 'assistant',
+                        stop_reason: 'end_turn', content: [{ type: 'output_text', text: 'ok' }] }],
                     usage: { input_tokens: 0, output_tokens: 1, total_tokens: 1 },
-                });
+                };
+                res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+                res.write(`data: ${JSON.stringify({ type: 'response.created', response: resp })}\n\n`);
+                res.write(`data: ${JSON.stringify({ type: 'response.completed', response: resp })}\n\n`);
+                res.end('data: [DONE]\n\n');
                 return;
             }
             if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
