@@ -13,3 +13,11 @@ bash_tool_log.jsonl
 __pycache__/
 *.pyc
 .env.bak_costsave
+
+# machine-local state (never commit)
+.cookies*
+.cookies-deepseek*
+*.encrypted
+.env
+.config/
+.shannon/
