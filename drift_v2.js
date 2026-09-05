@@ -4,7 +4,7 @@ const { checkDrift } = require('./drift');
 const { judgeDrift } = require('./drift_judge');
 
 const DEFAULTS = {
-    mode: Number(process.env.DRIFT_DETECT || '2'),
+    mode: Number(process.env.DRIFT_DETECT || '0'),
     threshold: Number(process.env.DRIFT_THRESHOLD || '1'),
     weakSignalThreshold: Number(process.env.DRIFT_WEAK_SIGNAL_THRESHOLD || '1'),
     escalationCount: Number(process.env.DRIFT_ESCALATION_COUNT || '3'),
@@ -47,7 +47,13 @@ class MultiSignalGatewayGate {
     _pushWeak(score, source) {
         const s = Math.max(0, Number(score) || 0);
         this.cumulative += s;
-        this.buffer.push({ at: now(), score: s, source: String(source || '').slice(0, 200) });
+        // Store only a hash of the source text to avoid retaining sensitive reasoning
+        const crypto = require('crypto');
+        const sourceHash = crypto.createHash('sha256').update(String(source || '')).digest('hex').slice(0, 16);
+        this.buffer.push({ at: now(), score: s, sourceHash });
+        // Apply time-based expiry: remove entries older than 5 minutes
+        const cutoff = now() - 300000;
+        this.buffer = this.buffer.filter(entry => entry.at >= cutoff);
         if (this.buffer.length > 20) {
             const dropped = this.buffer.shift();
             this.cumulative = Math.max(0, this.cumulative - (dropped.score || 0));

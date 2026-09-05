@@ -11,16 +11,24 @@
 //   3. Seeds the sanitized brief as the first message (creates the thread).
 //   4. Prints the new thread URL for the re-fire.
 const fs = require('fs');
-const browserMod = require('/home/roni/Roni_Workspace/webchat-api/browser.js');
-const configMod = require('/home/roni/Roni_Workspace/webchat-api/config.js');
+const browserMod = require('./browser.js');
+const configMod = require('./config.js');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const DEFAULT_URL = process.env.WEBCHAT_URL || 'https://chat.deepseek.com/a/chat/s/e480da5e-5904-4d25-8040-41ac1dd1c8d6';
-const DEFAULT_BRIEF = process.env.DRIFT_BRIEF_FILE || '/home/roni/Roni_Workspace/audits_plans/sanitized_expert_brief.md';
+const DEFAULT_URL = process.env.WEBCHAT_URL || '';
+const DEFAULT_BRIEF = process.env.DRIFT_BRIEF_FILE || '';
 
 (async () => {
   const threadUrl = process.argv[2] || DEFAULT_URL;
+  if (!threadUrl) {
+    console.error('ERROR: No thread URL provided. Set WEBCHAT_URL env or pass as argument.');
+    process.exit(1);
+  }
   const briefFile = process.argv[3] || DEFAULT_BRIEF;
+  if (!briefFile) {
+    console.error('ERROR: No brief file provided. Set DRIFT_BRIEF_FILE env or pass as the second argument.');
+    process.exit(1);
+  }
   const brief = fs.readFileSync(briefFile, 'utf-8');
 
   // point the harness config at the pinned thread so openNewChat navigates

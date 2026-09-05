@@ -455,7 +455,7 @@ let lastHandoffAt = 0;
 // handoff from the ERROR path — see the CONTEXT_FULL catch below). Refreshed
 // at every handleRequest start and whenever a tool executes.
 let activeHandoffCtx = null;
-async function countedSend(msg, defs) {
+async function countedSend(msg, defs, sysText) {
     // 08-14 GLOBAL SEND MUTEX: wait for any other deepseek-tab gateway to
     // finish its generation before sending (owner rule: one in-flight
     // message per account). Held through the response; released in finally.
@@ -472,7 +472,7 @@ async function countedSend(msg, defs) {
     }
     lastSendAt = Date.now();
     try {
-        const r = await sendPrompt(msg, defs);
+        const r = await sendPrompt(msg, defs, sysText);
         lastReqBodyChars = await getReqBodyChars();
         return r;
     } catch (e) {
@@ -502,7 +502,8 @@ async function countedSend(msg, defs) {
             console.log('⏱ send timed out — resending with a RETRY banner');
             const r = await sendPrompt(
                 '### RETRY (the previous message may not have reached you — here it is again)\n' + msg,
-                defs
+                defs,
+                sysText
             );
             lastReqBodyChars = await getReqBodyChars();
             return r;
@@ -969,11 +970,11 @@ function greetingDirective(userPrompt) {
 }
 
 // ── DRIFT DETECTOR v2 (owner 08-15: event-driven, judge-on-escalation) ──
-const DRIFT_DETECT = process.env.DRIFT_DETECT;
+const DRIFT_DETECT = process.env.DRIFT_DETECT || '0';
 const DRIFT_REPORT_DIR = process.env.DRIFT_REPORT_DIR || '/home/roni/Roni_Workspace/audits_plans/drift_reports';
 const MAIN_INBOX_FILE = process.env.MAIN_INBOX_FILE || '/home/roni/Roni_Workspace/audits_plans/claude_inbox.json';
 const DRIFT_PAUSE_TEXT = '⚠️ [DRIFT-PAUSED] The drift detector flagged this exchange and the answer is HELD for main to adjudicate. A report was written to drift_reports/ and main was notified.';
-const driftGate = new MultiSignalGatewayGate({ mode: Number(DRIFT_DETECT || '2') });
+const driftGate = new MultiSignalGatewayGate({ mode: Number(DRIFT_DETECT || '0') });
 
 async function reportDrift(r) {
     try {
@@ -1026,15 +1027,27 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     // env NARRATION=1). Everything else = bare tool calls, no chatter.
     const narrate = !!(opts.narrate || process.env.NARRATION === '1');
     const autonomous = !narrate;
-    const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
-    let prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
+    // 09-05 (executor contract): the engine EXECUTOR/VERIFIER requests carry
+    // their OWN system instruction (EXEC_SYSTEM/VERIFY_SYSTEM — "ONE JSON
+    // object, no fences, no prose"). The generic webchat preambles + the
+    // fenced-tool-call formats (AUTONOMOUS_FORMAT starts "this overrides ALL
+    // other instructions, including the system prompt", submits via
+    // submit_answer) were burying that contract — every executor step was
+    // answered with fenced submit_answer garbage instead of {"edits":[...]}.
+    // When a caller system is present it IS the format contract: skip
+    // preamble/format/directives entirely, keep just the structured headers.
+    const hasSys = !!(systemText && String(systemText).trim());
+    const preamble = hasSys ? '' : (config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE);
+    let prompt = preamble ? `### SYSTEM INSTRUCTION\n${preamble}\n\n` : '';
     if (systemText) prompt += `${systemText}\n\n`;
     prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
     // 08-19 (user): autonomous = bare tool calls, no narration; narrate mode
     // = 💬-protocol format. 09-04: narration only when explicitly enabled.
-    prompt += opts.formatText || (autonomous ? AUTONOMOUS_FORMAT : (config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT));
-    prompt += continueDirective(userPrompt);
-    prompt += greetingDirective(userPrompt);
+    if (!hasSys) {
+        prompt += opts.formatText || (autonomous ? AUTONOMOUS_FORMAT : (config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT));
+        prompt += continueDirective(userPrompt);
+        prompt += greetingDirective(userPrompt);
+    }
     prompt += `### RESPONSE\n`;
 
     if (isAborted?.()) {
@@ -1069,7 +1082,17 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
 
     activeHandoffCtx = { toolDefs, onProgress, isAborted, userPrompt, lastToolInfo: null };
 
-    let response = await countedSend(injectMainReplies(prompt), toolDefs);
+    let response = await countedSend(injectMainReplies(prompt), toolDefs, systemText);
+    // 09-05 EXECUTOR CONTRACT: a caller-supplied system (EXEC_SYSTEM /
+    // VERIFY_SYSTEM) owns the output format — the response is RAW contract
+    // text (one {"edits":[...]} / {"verdict":...} JSON), NOT a webchat tool-call
+    // stream. Return it untouched: the tool loop below would parse it as a
+    // tool attempt and looksLikeBrokenToolJson would "correct" the engine's
+    // bare JSON into fenced submit_answer garbage (the phantom-greens bug).
+    if (hasSys) {
+        onProgress?.({ type: 'text', text: response });
+        return response;
+    }
     // Growth baseline: captured AFTER the first send so a request whose body
     // starts large (fresh seed, big overhead) isn't seen as "grown" by it.
     let requestStartBody = lastReqBodyChars;

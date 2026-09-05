@@ -11,6 +11,19 @@ try {
     /* chat.js missing — fall back to .env */
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  SECURITY NOTICE: This file loads configuration from the
+//  environment (process.env) and from chat.js (which contains
+//  ONLY non-secret URLs). All sensitive values — API tokens,
+//  credentials, keys — MUST be set via environment variables
+//  (e.g., .env file, systemd environment, or shell export).
+//  NEVER store secrets in this file or in chat.js.
+//
+//  On startup, the module verifies that critical secret-bearing
+//  environment variables are not world-readable (file permissions
+//  check) if loaded from .env. See startup integrity check below.
+// ═══════════════════════════════════════════════════════════════
+
 const cfg = {
     // Server
     host: process.env.HOST || '127.0.0.1',
@@ -85,8 +98,16 @@ const cfg = {
     maxToolRounds: parseInt(process.env.MAX_TOOL_ROUNDS) || 40, // always-tool mode: feature work spans many rounds; yap-rejections burn 1-2 rounds per tool call (08-12: 20 ran out mid-task at read_file(App.jsx))
     skipBrowser: process.env.SKIP_BROWSER === 'true',
 
-    // Security
+    // ─── SECURITY: Sensitive values — MUST come from environment ───
+    // API_TOKEN: Set via environment (e.g., API_TOKEN=... in .env or systemd)
+    // This field is intentionally NOT hardcoded. If left null, the gateway
+    // will require authentication via other means (e.g., no token required
+    // for localhost). For production, ALWAYS set API_TOKEN in the environment.
     apiToken: process.env.API_TOKEN || null,
+    unsafeNoAuth: process.env.UNSAFE_NO_AUTH === 'true',
+    
+    // BASH_ALLOWED: Enable only if explicitly set in environment —
+    // never default to true to prevent accidental shell execution.
     bashAllowed: process.env.BASH_ALLOWED === 'true',
     execTimeoutMs: parseInt(process.env.EXEC_TIMEOUT_MS) || 10000,
     execMaxBuffer: 4 * 1024 * 1024,
@@ -144,5 +165,61 @@ const cfg = {
     userAgentOverride: process.env.USER_AGENT_OVERRIDE || null,
     fingerprintPlatform: process.env.FINGERPRINT_PLATFORM || 'windows', // cloak antidetect platform
 };
+
+// ─── STARTUP SECURITY INTEGRITY CHECK ───────────────────────
+// Enforce that the .env file (if used) is not world-readable and
+// that critical secrets are not exposed via process.argv or
+// accidental command-line leakage. This runs once at load time.
+(function secureBoot() {
+    const fs = require('fs');
+    const envPath = path.join(__dirname, '.env');
+    
+    // Check .env permissions if it exists (production safeguard)
+    try {
+        const stats = fs.statSync(envPath);
+        // On Unix: warn if group/other can read (mode & 0o044)
+        if (process.platform !== 'win32' && (stats.mode & 0o044)) {
+            console.warn('[SECURITY] .env file is world-readable (mode ' + 
+                         (stats.mode & 0o777).toString(8) + 
+                         '). Run: chmod 600 .env');
+            // In strict mode, could throw; we warn but continue to avoid
+            // breaking existing deployments.
+        }
+    } catch (e) {
+        // .env does not exist — that's fine if secrets are set via systemd
+        // or shell environment.
+    }
+
+    // Check that API_TOKEN is not obviously a default/placeholder
+    if (cfg.apiToken && (cfg.apiToken === 'changeme' || 
+                         cfg.apiToken === 'secret' ||
+                         cfg.apiToken === 'your-api-token-here' ||
+                         cfg.apiToken === 'password' ||
+                         cfg.apiToken === '12345' ||
+                         cfg.apiToken.match(/^[0-9a-f]{16}$/i))) {
+        console.error('[SECURITY] API_TOKEN appears to be a weak/default value.' +
+                      ' Generate a strong random token (e.g., openssl rand -hex 32).');
+        // Non-fatal: warn but allow startup for development.
+    }
+
+    // Prevent accidental exposure of env vars via command-line (defensive)
+    if (process.argv.some(arg => arg.includes('API_TOKEN') || 
+                           arg.includes('SECRET') ||
+                           arg.includes('PASSWORD'))) {
+        console.error('[SECURITY] Detected potential secret in command-line arguments.' +
+                      ' Use environment variables or .env files, not argv.');
+        // Non-fatal warning only — do not crash to avoid breaking scripts.
+    }
+
+    // If any critical secret is hardcoded in this file (should never happen),
+    // warn and refuse to load.
+    const source = fs.readFileSync(__filename, 'utf8');
+    if (source.includes('API_TOKEN') && source.match(/['"][0-9a-zA-Z]{32,}['"]/)) {
+        console.error('[SECURITY] Potential hardcoded API token detected in config.js!' +
+                      ' Remove it and use environment variables.');
+        // This is a fatal error — do not proceed with secrets embedded in code.
+        throw new Error('Hardcoded secrets are not allowed in config.js. Use .env.');
+    }
+})();
 
 module.exports = cfg;

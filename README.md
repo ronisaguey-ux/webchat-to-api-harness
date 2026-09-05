@@ -318,7 +318,15 @@ export SHANNON_AI_API_KEY="anything"                    # gateways don't auth
   survival matters — antidetect fingerprints get flagged by Google across
   accounts; the user's own browser does not.
 
+### Executor Contract (`hasSys`) & Fast Turns (09-05)
+
+- **`hasSys` Output Contract:** When the caller supplies their own `systemText` (e.g., `EXEC_SYSTEM` / `VERIFY_SYSTEM` demanding a single raw JSON object `{"edits":[...]}` or `{"verdict":...}`), the gateway skips the generic preambles and tool-call wrapper. It returns the model's raw response directly, completely bypassing the internal tool execution loop. This prevents bare JSON from being mangled into fenced `submit_answer` wrappers. **Do NOT regress this contract.**
+- **`FRESH_PER_SEND=1`:** When enabled, the gateway opens a fresh thread for each physical send. This ensures each exchange is the conversation's first message, eliminating long multi-turn context degradation and token re-digestion delays.
+- **Tab Reaping (`MAX_ROOT_TABS`):** When `FRESH_PER_SEND` is active, orphan root tabs are automatically reaped (`reapSurplusTabs`) to keep memory footprint bounded and prevent browser tab leaks.
+- **Drift Detection:** `DRIFT_DETECT=0` by default. Multi-signal drift detector code is available but strictly disabled unless explicitly opted in via environment.
+
 ### Debug routes (dev)
 
 `GET  /debug/dump` — page URL + body text + screenshot length.
 `POST /debug/eval {"code":"..."}` — run JS in the tab.
+

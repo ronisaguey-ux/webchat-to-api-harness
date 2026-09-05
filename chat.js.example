@@ -9,6 +9,13 @@
 //
 //  Your login persists in .cookies.json after the first session,
 //  so you only log in manually once.
+//
+//  ⚠️  SECURITY: This file contains NO SECRETS — it only holds
+//  URLs and connection endpoints that are machine-specific and
+//  not sensitive. All API tokens, credentials, and keys MUST be
+//  loaded from the environment (see config.js) — NEVER hardcode
+//  them here or in any committed file. Use .env (gitignored) for
+//  secrets in production; see .env.example for required variables.
 // ─────────────────────────────────────────────────────────────
 module.exports = {
     // Paste the URL of your webchat tab here (the full conversation

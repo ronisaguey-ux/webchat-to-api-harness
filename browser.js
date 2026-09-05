@@ -396,7 +396,7 @@ async function waitForChatInput() {
 // ──────────────────────────────────────────────────────
 // 4. SEND PROMPT + GET RESPONSE
 // ──────────────────────────────────────────────────────
-async function sendPrompt(prompt, toolDefinitions) {
+async function sendPrompt(prompt, toolDefinitions, systemText) {
     // 09-04 MIN_LANE_GAP (ds-gw): the DeepSeek webchat account rate-limits
     // bursts ("Messages too frequent") — fires after ~5-8 messages in a few
     // minutes. Gate EVERY physical send (covers the internal tool-loop turns
@@ -466,6 +466,18 @@ async function sendPrompt(prompt, toolDefinitions) {
     // has both chips). No-op for foreign webchats (no such chips) and never
     // throws.
     await ensureToggles();
+    // 09-05 (executor speed): FRESH_PER_SEND env (ds-gw unit, engine lane) —
+    // every send gets its OWN fresh DS chat. The shared executor thread grew
+    // 30+ exchanges deep and each turn crawled (4+ min before first tokens —
+    // the model re-digests the whole thread). Fresh = each engine exchange is
+    // the thread's FIRST message: fast turns + zero cross-step contamination.
+    // Note: deepseek's default fresh chat is INSTANT with DeepThink+Search —
+    // ensureToggles above already ran, and the handoff/swap pin machinery
+    // captures the new thread id via the swap pin (same 08-28 flow).
+    if (process.env.FRESH_PER_SEND === '1') {
+        console.log('🍃 FRESH_PER_SEND — opening a fresh chat for this send');
+        await openNewChat();
+    }
     console.log(`📤 Sending prompt (${prompt.length} chars) — tab: ${page.url()}`);
 
     // 08-13 FOREIGN-BUSY guard: a generation left running from a
@@ -499,7 +511,7 @@ async function sendPrompt(prompt, toolDefinitions) {
         }
     }
 
-    const fullPrompt = buildFullPrompt(prompt, toolDefinitions);
+    const fullPrompt = buildFullPrompt(prompt, toolDefinitions, systemText);
 
     let input;
     try {
@@ -1999,9 +2011,52 @@ async function waitForResponse(before, typedText) {
 // sends the document as the first message. Typing on the new-chat page is
 // what CREATES the thread; the tab's URL then carries the new /s/ id, which
 // server.js captures and pins for every respawn path.
+// 09-05 (tab leak): FRESH_PER_SEND opens a chat per send, but openNewChat can
+// only REUSE a tab that is still at the origin root — once the tab it used
+// becomes a /a/chat/s/ thread (or a send fails and strands it), the next call
+// falls through to browser.newPage(). Nothing ever closed the tab it walked
+// away from, so the driver accumulated one orphan per send: 48 deepseek tabs
+// were live on 09-05, only one holding a real conversation, costing ~2.5 GB on
+// a box that swaps at 13/14 GiB. Reap surplus ROOT tabs before opening another.
+// Thread tabs are never touched (reopenThread depends on them), nor is the
+// active page, nor any tab belonging to a different webchat host.
+const MAX_ROOT_TABS = Number(process.env.MAX_ROOT_TABS || 3);
+
+async function reapSurplusTabs() {
+    try {
+        if (!browser) return 0;
+        const origin = new URL(config.webchatUrl).origin;
+        const isThreadTab = (p) => /\/a\/chat\/s\//.test(p.url());
+        const pages = await browser.pages();
+        const roots = pages.filter((p) => {
+            if (p === page) return false;
+            let u = '';
+            try { u = p.url(); } catch { return false; }
+            if (!u.startsWith(origin)) return false;
+            if (isThreadTab(p)) return false;
+            return u.replace(/\/(a\/chat\/(new)?)?$/, '') === origin;
+        });
+        if (roots.length <= MAX_ROOT_TABS) return 0;
+        const doomed = roots.slice(0, roots.length - MAX_ROOT_TABS);
+        let closed = 0;
+        for (const p of doomed) {
+            try { await p.close(); closed += 1; } catch { /* already gone */ }
+        }
+        if (closed) {
+            console.log(`🧹 reaped ${closed} surplus ${origin} tab(s) — ` +
+                        `${roots.length - closed} root tab(s) kept`);
+        }
+        return closed;
+    } catch (e) {
+        console.log('⚠ tab reap skipped:', String(e.message).slice(0, 80));
+        return 0;
+    }
+}
+
 async function openNewChat() {
     // Fresh CDP session like every send (stale-session refresh).
     await initBrowser({ reconnect: true });
+    await reapSurplusTabs();
     // Re-pick the pinned tab (the old thread's tab gets navigated away — the
     // conversation stays safe server-side).
     if (!page && config.cdpWsUrl) {
@@ -2109,18 +2164,32 @@ async function reopenThread(threadUrl) {
 //    Tool definitions section is capped at TOOL_CONTEXT_WINDOW
 //    chars so huge tool schemas don't eat the chat's context.
 // ──────────────────────────────────────────────────────
-function buildFullPrompt(userPrompt, toolDefinitions) {
+function buildFullPrompt(userPrompt, toolDefinitions, systemText) {
     let fullPrompt = '';
 
     // 09-04 (user): SYSTEM FIRST — rules on top, trimmed tool list (names +
     // short params, no schema dumps), the task after. Up to 5 INDEPENDENT
     // tool calls per reply; tool outputs land at the bottom of the chat.
-    fullPrompt += '### SYSTEM\n\nYou are an autonomous coding agent. You answer the USER REQUEST with tool calls.\n' +
+    // 09-05 FIX (executor contract): engine/fix-executor requests send their
+    // OWN system instruction (EXEC_SYSTEM / VERIFY_SYSTEM — the one that says
+    // ONE JSON object, no fences, no prose). The generic wrapper below used to
+    // OVERRIDE it, and the final REMINDER ("fenced JSON… submit_answer") won
+    // the strongest-memory slot — the engine's system never actually drove the
+    // model. When a system text is present, IT is ### SYSTEM: the wrapper's
+    // rules + reminder switch to a pass-through form so the caller's format
+    // contract wins everywhere (top slot AND final reminder).
+    const hasSys = !!(systemText && String(systemText).trim());
+    fullPrompt += '### SYSTEM\n\n';
+    if (hasSys) {
+        fullPrompt += String(systemText).trim() + '\n\n';
+    } else {
+        fullPrompt += 'You are an autonomous coding agent. You answer the USER REQUEST with tool calls.\n' +
         'RULES:\n' +
         '1. Respond ONLY in English.\n' +
         '2. Tool calls: fenced ```json blocks. You may include up to 5 tool calls in ONE reply.\n' +
         '3. Only batch INDEPENDENT calls: none may depend on another call’s output; never read and write the same file in one batch; never run commands that need each other’s results.\n' +
         '4. When finished, submit the answer: {"tool":"submit_answer","params":{"text":"..."}}. No plain-text replies outside submit_answer.\n\n';
+    }
 
     fullPrompt += '### TOOLS\n\n';
     if (toolDefinitions && toolDefinitions.length > 0) {
@@ -2139,7 +2208,14 @@ function buildFullPrompt(userPrompt, toolDefinitions) {
 
     // Strongest final slot (reinforces format every round — DeepSeek pauses
     // after tool work and writes progress reports; the top rules don't kill it).
-    fullPrompt += 'REMINDER: reply with fenced JSON tool call(s) — up to 5, independent — or submit_answer when finished. English only.\n';
+    // 09-05: executor requests must NOT hear "fenced JSON / submit_answer" —
+    // their system (EXEC_SYSTEM) demands ONE bare JSON object. The generic
+    // reminder stays only for the no-system webchat-agent path.
+    if (hasSys) {
+        fullPrompt += 'REMINDER: follow the ### SYSTEM rules EXACTLY — their output format is authoritative. No fences, no prose, no submit_answer.\n';
+    } else {
+        fullPrompt += 'REMINDER: reply with fenced JSON tool call(s) — up to 5, independent — or submit_answer when finished. English only.\n';
+    }
     return fullPrompt;
 }
 
