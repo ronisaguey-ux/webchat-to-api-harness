@@ -12,6 +12,14 @@ let page = null;
 let context = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// puppeteer 23+ dropped Browser.isConnected() in favour of the `.connected`
+// boolean; support both across the 18 -> 25 upgrade (09-05 audit fix).
+const browserAlive = (b) => {
+    if (!b) return false;
+    if (typeof b.isConnected === 'function') return b.isConnected();
+    return Boolean(b.connected);
+};
+
 
 // 08-17 INSTANT SWAP (user rule: deepseek webchat runs in INSTANT mode with
 // DeepThink + Search ON — mode is locked at thread creation, so an EXPERT
@@ -91,7 +99,7 @@ async function initBrowser({ reconnect = false } = {}) {
         // re-cookies, fresh tab, ~10-20s wasted each, tab state lost. A
         // HEALTHY own browser survives the round loop untouched; only a
         // dead page/socket gets rebuilt.
-        if (!config.cdpWsUrl && browser.isConnected() && page && !page.isClosed()) {
+        if (!config.cdpWsUrl && browserAlive(browser) && page && !page.isClosed()) {
             console.log('🟢 Own browser healthy — reusing across rounds.');
             return;
         }
@@ -105,7 +113,7 @@ async function initBrowser({ reconnect = false } = {}) {
             ? '🔌 Reconnecting CDP session (stale session refresh).'
             : '🧹 Closed own browser (stale) — relaunching fresh.');
     }
-    if (browser && browser.isConnected()) {
+    if (browser && browserAlive(browser)) {
         console.log('🟢 Browser already connected.');
         return;
     }
@@ -1693,7 +1701,7 @@ async function waitForResponse(before, typedText) {
             // fast with a clear error instead; the supervisor's chrome_cdp
             // ensure relaunches Chrome and the next request auto-resolves the
             // new ws id.
-            if (!browser || !browser.isConnected() || page.isClosed()) {
+            if (!browser || !browserAlive(browser) || page.isClosed()) {
                 throw new Error('Webchat browser connection lost (Chrome crashed?) — please resend');
             }
             // Page busy (long cogitation / heavy render) — an evaluate can throw
