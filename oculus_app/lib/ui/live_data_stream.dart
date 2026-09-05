@@ -15,3 +15,13 @@ Future<WebSocketChannel> _connectLiveStream() async {
     headers: {'Authorization': 'Bearer ${token ?? ''}'},
   );
 }
+
+void _onNewTick(Map<String, dynamic> tick) {
+    setState(() {
+      _ticks.add(tick);
+      // Decimate to 500 points max to avoid chart redraw overhead
+      if (_ticks.length > 500) {
+        _ticks = DataDecimator.lttb(_ticks, 500);
+      }
+    });
+  }

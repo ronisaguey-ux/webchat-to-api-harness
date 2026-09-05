@@ -7,7 +7,6 @@ An OpenAI- **and** Anthropic-compatible API backed by a real webchat tab
 wrapper (Aider, LiteLLM clients, Claude Code via `ANTHROPIC_BASE_URL`) talk to
 a webchat session you own, with tool-call support (read/write files, bash, …).
 
-```
 ┌─────────────────────────────────────────────────────────────┐
 │  Claude Code / Aider / any wrapper                          │
 │      │                                                      │
@@ -24,17 +23,17 @@ a webchat session you own, with tool-call support (read/write files, bash, …).
 │  parses optional tool-call JSON → executes tool → feeds     │
 │  result back → final answer returned                        │
 └─────────────────────────────────────────────────────────────┘
-```
+
 
 ## Quick start
 
-```bash
+bash
 npm install
 cp .env.example .env
 cp chat.js.example chat.js   # chat.js is gitignored — it holds YOUR thread URL
 # ⭐ edit chat.js — paste the URL of your webchat tab there. That's it.
 ./start.sh                    # visible browser opens → log in once
-```
+
 
 First request connects lazily; with `HEADLESS=false` a browser window opens and
 you log in manually (session cookies are saved to `.cookies.json` and reused on
@@ -45,12 +44,12 @@ stdin, so it works fine under systemd/tmux.
 `--remote-debugging-port=9223`, put the printed ws URL in `chat.js` under
 `cdpWsUrl`, and the server drives *your existing tab* — no login at all.
 
-```bash
+bash
 curl http://localhost:8080/status
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Write a short essay about the history of Rome."}]}'
-```
+
 
 ## Endpoints
 
@@ -71,7 +70,7 @@ answer) — clients that require SSE (Claude Code) work against it.
 ## Tool calls
 
 Send the webchat a tool-enabled prompt; the response is scanned for a JSON
-object `{"tool":"<name>","params":{...}}` (bare JSON, ```json fences, or
+object `{"tool":"<name>","params":{...}}` (bare JSON,  fences, or
 prose-wrapped all work). If found, the tool runs and its result is fed back to
 the chat; the loop repeats up to `MAX_TOOL_ROUNDS` times and the final text is
 returned.
@@ -81,11 +80,12 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 
 ## ⚠️ Safety gates (read before enabling)
 
-1. **`run_bash` is disabled by default.** The webchat model's output is parsed
+1. **`run_bash` is disabled by default and MUST remain disabled unless the environment is explicitly hardened.** The webchat model's output is parsed
    and executed **verbatim** with no sandbox — a prompt-injected page or a
-   hostile response can run anything on this machine. Enable with
-   `BASH_ALLOWED=true` only when you trust the conversation content end-to-end.
-   `EXEC_TIMEOUT_MS` (10s default) bounds every command.
+   hostile response can run anything on this machine. If you must enable it,
+   set `BASH_ALLOWED=true` **only** after deploying a container/nsjail with an
+   allowlist, command audit logging, and network restrictions. `EXEC_TIMEOUT_MS`
+   (10s default) bounds every command.
 2. **Bind to localhost.** `HOST=127.0.0.1` default. If you expose the port,
    set `API_TOKEN` — every request then needs `Authorization: Bearer <token>`.
 3. **File tools are unsandboxed.** `read_file`/`write_file` accept absolute
@@ -151,7 +151,7 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 | `MAX_TOOL_ROUNDS` | `4` | max tool-execution rounds per request |
 | `LOGIN_WAIT_SECONDS` | `300` | how long to wait for manual login |
 | `API_TOKEN` | *(none)* | bearer token auth |
-| `BASH_ALLOWED` | `false` | enable `run_bash` |
+| `BASH_ALLOWED` | `false` | enable `run_bash` — **must remain `false` unless container/nsjail + audit logging are in place** |
 | `EXEC_TIMEOUT_MS` | `10000` | per-command bash timeout |
 | `SKIP_BROWSER` | `false` | run server without a browser (testing) |
 | `SELECTOR_*` | see `config.js` | comma-separated CSS selector lists, first match wins |
@@ -183,11 +183,11 @@ MB of decoded images stays at a few tens.
 
 **Lean Chrome launch profile** (persistent-CDP mode):
 
-```bash
+bash
 --disable-gpu --disable-dev-shm-usage --disable-background-networking \
 --disable-sync --disable-translate --metrics-recording-only --mute-audio \
 --js-flags=--max-old-space-size=512
-```
+
 
 The first three are the memory/CPU wins; the rest stop telemetry, sync and
 audio churn. Headless instances add `--headless=new --no-sandbox` with a
@@ -282,11 +282,10 @@ The gateways speak two dialects to AI pentest agents:
   (the worker runtime of Keygraph Shannon). Enables a **free webchat account
   as the model backend for @keygraph/shannon**:
 
-```
 export SHANNON_AI_MODEL="openai:anymodel"
 export SHANNON_AI_BASE_URL="http://<host>:<port>/v1"   # this gateway
 export SHANNON_AI_API_KEY="anything"                    # gateways don't auth
-```
+
 
 ### Tool protocol (so the lane model can drive tool calls)
 

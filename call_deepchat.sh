@@ -19,7 +19,7 @@ done
 TEXT="${ARGS[*]:-}"
 [ -z "$TEXT" ] && { echo "usage: call_deepchat.sh [-a] \"message\"" >&2; exit 1; }
 GATEWAY="${CALL_DEEPCHAT_URL:-http://127.0.0.1:8080/v1/chat/completions}"
-CONTENT="### OPERATOR (main Claude session):\n${TEXT}"
+
 python3 - "$GATEWAY" "$TEXT" "$AUTONOMOUS" << 'PYEOF' > /tmp/call_deepchat_payload.json
 import json, sys
 sys.path.insert(0, '/home/roni/Roni_Workspace/webchat-api')

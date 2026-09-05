@@ -40,7 +40,7 @@ function extractVerdict(text) {
   if (!text) return null;
   let t = String(text).trim();
   // strip fences / code markers
-  t = t.replace(/```(?:json)?/gi, '').trim();
+  t = t.replace(/(?:json)?/gi, '').trim();
   const m = t.match(/\{[\s\S]*\}/);
   if (!m) return null;
   try {
