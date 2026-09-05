@@ -32,7 +32,12 @@ const {
     buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
     resetTeeForHandoff, takeThreadSwap, openNewChat, reopenThread,
 } = require('./browser');
-const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
+const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse, storeOverflow } = require('./tools');
+// 09-04 (user): storeOverflow is the output-overflow buffer hook (added to
+// tools.js alongside the see_overflow tool; nextOverflowChunk is consumed
+// inside tools.js by that tool's handler). server.js guards every use with
+// typeof — if the export has not landed yet, receipts degrade to the old
+// pre-overflow behavior instead of crashing.
 const { MultiSignalGatewayGate } = require('./drift_v2');
 
 let driftClean = null;
@@ -289,6 +294,73 @@ function formatToolResultView(call, result, cap, opts = {}) {
     } catch (e) {
         return omitHeader ? `(result formatting error: ${e.message})` : `🔧 ${name} — (result formatting error: ${e.message})`;
     }
+}
+
+// ── Tool-result labels + output overflow (09-04, user) ───────────────────
+// Every emitted tool result is headed by an explicit label line (`### tool:
+// <name>`) so both the streamed client receipt (where the 08-19 rule hides
+// the emoji header) and the model-facing receipt name the producing tool
+// unambiguously. formatToolResultView itself does not add this label — the
+// call sites below wrap it.
+function toolResultLabel(call) {
+    return `### tool: ${call.toolName}`;
+}
+
+// Real (never-capped) char size of the output a finished call produced —
+// decides whether the short client view actually cut real output.
+function realToolOutputChars(call, result) {
+    try {
+        const name = call.toolName;
+        if (name === 'run_bash') {
+            return String(result?.stdout ?? '').length + String(result?.stderr ?? '').length;
+        }
+        if (name === 'read_file') {
+            const content = String(result?.content ?? '');
+            return Math.max(result?.totalLength ?? 0, content.length);
+        }
+        if (name === 'write_file') {
+            return diffLines(result?.oldContent ?? '', call?.args?.content ?? '').text.length;
+        }
+        return JSON.stringify(result ?? {}).length;
+    } catch { return 0; }
+}
+
+// Streamed CLIENT receipt: label + short view, plus the see_overflow note
+// when the real output was bigger than the view. The full body lives in the
+// model receipt / overflow buffer (see_overflow tool), not in the tab stream.
+function toolReceiptForClient(call, result, cap, opts) {
+    const limit = cap || 6000;
+    const view = formatToolResultView(call, result, limit, { omitHeader: true, ...(opts || {}) });
+    const truncated = realToolOutputChars(call, result) > limit
+        ? '\n…(output truncated — see_overflow holds the rest)'
+        : '';
+    return `${toolResultLabel(call)}\n${view}${truncated}`;
+}
+
+// MODEL receipt (per finished call, cap 150K): label + full receipt. When the
+// rendered text is longer than the chunk, the full text goes through
+// storeOverflow (tools.js) — only the first chunk rides in the receipt, the
+// rest stays buffered for the see_overflow tool, and the receipt ENDS with
+// the overflow note instructing the model to page the remainder. Text that
+// fits the chunk never touches the buffer (so unrelated pending overflow data
+// is not clobbered by a small receipt).
+const MODEL_RECEIPT_CHUNK = 150000;
+const OVERFLOW_NOTE = '⚠️ tool call output overflow — call {"tool":"see_overflow","params":{}} to see the next chunk (repeat until "(END OF OVERFLOWED OUTPUT)" or stop).';
+function toolReceiptForModel(call, result) {
+    const view = formatToolResultView(call, result, MODEL_RECEIPT_CHUNK, { forModel: true });
+    const text = `${toolResultLabel(call)}\n${view}`;
+    if (typeof storeOverflow === 'function' && text.length > MODEL_RECEIPT_CHUNK) {
+        return storeOverflow(text, MODEL_RECEIPT_CHUNK) + '\n\n' + OVERFLOW_NOTE;
+    }
+    return text;
+}
+
+// Whole follow-up text (joined receipts + turn instructions) — same chunker:
+// first chunk goes to the model, the tail waits in the overflow buffer, and
+// the visible receipt ends with the overflow note.
+function capFollowUpForModel(text) {
+    if (typeof storeOverflow !== 'function' || text.length <= MODEL_RECEIPT_CHUNK) return text;
+    return storeOverflow(text, MODEL_RECEIPT_CHUNK) + '\n\n' + OVERFLOW_NOTE;
 }
 
 // 08-13 RATE-LIMIT GATE (user-visible hang fix): DeepSeek's account limiter
@@ -1099,10 +1171,10 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                     if (activeHandoffCtx) activeHandoffCtx.lastToolInfo = lastToolInfo;
                     const br = await executeTool(bc.toolName, bc.args, { threadId: config.webchatUrl || null });
                     workCallsMade += 1;
-                    onProgress?.({ type: 'text', text: formatToolResultView(bc, br, 6000, { omitHeader: true }) });
-                    receipts.push(formatToolResultView(bc, br, 150000, { forModel: true }));
+                    onProgress?.({ type: 'text', text: toolReceiptForClient(bc, br) });
+                    receipts.push(toolReceiptForModel(bc, br));
                 }
-                response = await countedSend(receipts.join('\n\n') + '\n\n' + TOOL_INSTRUCTIONS, toolDefs);
+                response = await countedSend(capFollowUpForModel(receipts.join('\n\n') + '\n\n' + TOOL_INSTRUCTIONS), toolDefs);
                 continue;
             }
 
@@ -1201,7 +1273,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // 08-19 (user): omitHeader — the 🔧 line already showed the call;
             // the receipt must not repeat the command (double-display fix).
             if (call.toolName !== 'send_message') {
-                onProgress?.({ type: 'text', text: formatToolResultView(call, result, 6000, { omitHeader: true }) });
+                onProgress?.({ type: 'text', text: toolReceiptForClient(call, result) });
             }
             // 08-14 WEDGE ROOT-CAUSE belt: whatever a tool returns, the result
             // message must stay small — a huge read_file output previously
@@ -1228,9 +1300,9 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             const followUp =
                 // 08-19 (user, de-lobotomize): forModel=true — this receipt goes
                 // into the agent's context, so it MUST carry the real tool output.
-                (call.toolName === 'send_message' ? '' : formatToolResultView(call, result, 150000, { forModel: true }) + '\n\n') +
+                (call.toolName === 'send_message' ? '' : toolReceiptForModel(call, result) + '\n\n') +
                 TOOL_INSTRUCTIONS;
-            response = await countedSend(followUp, toolDefs);
+            response = await countedSend(capFollowUpForModel(followUp), toolDefs);
             continue;
         }
 
@@ -1535,7 +1607,7 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
                 const p = String(call.args?.path || '');
                 if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
                 response = await countedSend(
-                    formatToolResultView(call, result, 6000) + '\n\n' +
+                    toolResultLabel(call) + '\n' + formatToolResultView(call, result, 6000) + '\n\n' +
                     'The task is: write the handoff document via write_file (if you have not yet) at EXACTLY ' +
                     `${config.handoffFile}, then reply with a fenced submit_answer — one line confirming the path.`,
                     toolDefs

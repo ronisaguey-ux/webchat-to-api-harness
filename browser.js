@@ -1072,21 +1072,26 @@ async function verifySendCleared(promptLen = 0) {
         }, config.selectors.input);
         if (empty) return;
     }
-    // 08-17: surface the REAL cause when gemini's backend rejected the send —
-    // the composer stays full because the request never committed (BardErrorInfo
-    // 1095/1096 = rate-limit/abuse block, NOT a React-state bug; reloading
-    // doesn't help, waiting out the cooldown does). Fall back to the old
-    // message when no backend code was recorded.
+    // 08-17/08-23 stranded-composer flow (shared with waitForResponse since
+    // 09-04): bard-check → inline reload → strand throw — see healStrandedComposer().
+    await healStrandedComposer();
+}
+
+// ── Stranded-composer heal (08-17/08-23 flow, shared since 09-04) ─────────
+// Called once the composer provably still holds the prompt — i.e. the send
+// never COMMITTED (React out of sync OR the backend rejected it). Surface
+// the REAL cause when gemini's backend rejected the send (BardErrorInfo
+// 1095/1096 = rate-limit/abuse block, NOT a React-state bug; reloading
+// doesn't help, waiting out the cooldown does). Otherwise auto-heal: the
+// tab's React state is gone, so reload it INLINE — the client's retry
+// (attempt 2/2) then lands on a fresh tab instead of a second guaranteed
+// failure. ALWAYS throws (bard-rejection error OR the strand error).
+async function healStrandedComposer() {
     let bard = '';
     try { bard = await page.evaluate(() => window.__wsLastBardError || ''); } catch { /* ignore */ }
     if (bard) {
         throw new Error(`webchat send failed — gemini backend rejected the send (BardErrorInfo ${bard} = rate-limit/abuse block). Wait out the cooldown; do NOT reload-hammer it.`);
     }
-    // 08-23: auto-heal instead of only instructing — the tab's React state is
-    // gone, so reload it INLINE; the client's retry (attempt 2/2) then lands on
-    // a fresh tab instead of a second guaranteed failure. Bard-backend
-    // rejections (BardErrorInfo branch above) still bypass this deliberately —
-    // waiting out the cooldown is the fix there, not a reload.
     console.log('🧹 stranded composer detected — reloading tab for inline self-heal');
     try {
         await page.reload({ waitUntil: 'domcontentloaded' });
@@ -1104,6 +1109,32 @@ async function verifySendCleared(promptLen = 0) {
         console.log('🧹 inline reload failed:', String(e.message).slice(0, 60));
     }
     throw new Error('webchat send failed — prompt stranded in composer (React out of sync). Tab reloaded; retry the send.');
+}
+
+// ── Composer-holds-prompt probe (09-04) ─────────────────────────────────
+// True when the composer still contains the ORIGINAL typed prompt (the send
+// never committed). waitForResponse's extended empty-wait uses this to tell
+// a STRANDED tab (needs the heal reload) from a merely SLOW one (keep
+// waiting). Normalized whitespace so contenteditable line breaks don't hide
+// a verbatim hold; returns false on any read failure (never a false heal).
+async function composerHoldsPrompt(typedText) {
+    const probe = String(typedText || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+    if (!probe) return false;
+    try {
+        return await page.evaluate((sels, probe) => {
+            const norm = (s) => String(s || '').replace(/\s+/g, ' ');
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const v = el.value !== undefined ? el.value : el.innerText || '';
+                const t = norm(v).trim();
+                if (t.length > 0 && t.includes(probe)) return true;
+            }
+            return false;
+        }, config.selectors.input, probe);
+    } catch {
+        return false;
+    }
 }
 
 // ── Chat snapshot (build-agnostic) ─────────────────────────────
@@ -1611,6 +1642,12 @@ async function waitForResponse(before, typedText) {
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
     let emptySince = 0; // how long the newest message element has been empty
+    // 09-04 (A3 resilience): the 12s empty verdict is NOT a hard fail on a
+    // busy/slow tab — grant ONE longer re-check window first, and only heal/
+    // throw after that. Bounded per call: one extension + one heal, never loops.
+    let emptyBudget = 12000;    // first empty window; 25000 after the grace
+    let emptyExtended = false;  // "⏳ slow reply" extension already granted
+    let strandHealDone = false; // stranded-composer heal already attempted
     // 08-23 WEDGE FIX (investigator report): phantom-stop detector state.
     let busySilentSince = 0;      // busy-without-progress start, ms since epoch (0=armed)
     let lastProgressLen = 0;      // text+answer length at last poll (progress baseline)
@@ -1803,8 +1840,33 @@ async function waitForResponse(before, typedText) {
             if (state.body.includes('You stopped this response')) {
                 throw new Error('Webchat response was stopped (Stop button pressed while generating)');
             }
-            if (emptySince > 12000) {
-                throw new Error('Webchat response is empty after 12s — stopped or aborted by the UI');
+            if (emptySince > emptyBudget) {
+                // 09-04 (A3 resilience): gemini's SPA is often just SLOW/busy —
+                // the send commits, the tab shows the prompt, but the output
+                // lands well past 12s. Before treating the empty row as a hard
+                // fail, grant ONE longer re-check window (~25s more); a tab
+                // that is merely busy answers inside it. Still empty after the
+                // extension → decide between "stranded" and "stopped" below.
+                if (!emptyExtended) {
+                    emptyExtended = true;
+                    emptySince = 0;
+                    emptyBudget = 25000;
+                    console.log('⏳ slow reply (busy tab) — extending wait');
+                } else {
+                    // Extended wait still returned nothing. If the composer
+                    // still holds the ORIGINAL prompt text, the send never
+                    // COMMITTED — that is a stranded composer, not a slow tab.
+                    // Heal it with the same inline reload verifySendCleared
+                    // uses (healStrandedComposer — bard-check + reload, always
+                    // throws its strand error) ONCE per call, so the client's
+                    // retry lands on the healed tab. Bounded: strandHealDone
+                    // guarantees the reload happens at most once here.
+                    if (isGeminiWebchat() && !strandHealDone && await composerHoldsPrompt(typedText)) {
+                        strandHealDone = true;
+                        await healStrandedComposer(); // reload then throw the strand error
+                    }
+                    throw new Error('Webchat response is empty after 12s — stopped or aborted by the UI');
+                }
             }
         } else {
             emptySince = 0;
@@ -2050,49 +2112,34 @@ async function reopenThread(threadUrl) {
 function buildFullPrompt(userPrompt, toolDefinitions) {
     let fullPrompt = '';
 
-    // 08-19 (user idea): the USER REQUEST leads — the model locks onto the
-    // real task before it sees any tool/protocol text. The format rules follow
-    // (tools section + the REMINDER below stays in the strongest last slot).
-    fullPrompt += `### USER REQUEST\n\n${userPrompt}\n\n`;
+    // 09-04 (user): SYSTEM FIRST — rules on top, trimmed tool list (names +
+    // short params, no schema dumps), the task after. Up to 5 INDEPENDENT
+    // tool calls per reply; tool outputs land at the bottom of the chat.
+    fullPrompt += '### SYSTEM\n\nYou are an autonomous coding agent. You answer the USER REQUEST with tool calls.\n' +
+        'RULES:\n' +
+        '1. Respond ONLY in English.\n' +
+        '2. Tool calls: fenced ```json blocks. You may include up to 5 tool calls in ONE reply.\n' +
+        '3. Only batch INDEPENDENT calls: none may depend on another call’s output; never read and write the same file in one batch; never run commands that need each other’s results.\n' +
+        '4. When finished, submit the answer: {"tool":"submit_answer","params":{"text":"..."}}. No plain-text replies outside submit_answer.\n\n';
 
+    fullPrompt += '### TOOLS\n\n';
     if (toolDefinitions && toolDefinitions.length > 0) {
-        let section =
-            'You have access to the tools below. ALWAYS respond with exactly one JSON object ' +
-            '{"tool":"<name>","params":{...}} — never plain text, never prose (user rule 08-12). ' +
-            'ALWAYS wrap it in a markdown code fence (```json ... ```) so this chat cannot corrupt your backticks. ' +
-            'ONE tool call at a time. Use a real tool to perform work when the task needs it — you judge whether it ' +
-            'does. When the task is complete (or it was a simple question needing no tools), submit your final ' +
-            'plain-text answer via the submit_answer tool: {"tool":"submit_answer","params":{"text":"..."}}.\n\n';
-
-        const toolsByCategory = {};
         for (const tool of toolDefinitions) {
-            const cat = tool.category || 'general';
-            if (!toolsByCategory[cat]) toolsByCategory[cat] = [];
-            toolsByCategory[cat].push(tool);
-        }
-
-        for (const [category, tools] of Object.entries(toolsByCategory)) {
-            section += `## ${category.toUpperCase()} TOOLS\n\n`;
-            for (const tool of tools) {
-                section += `- **${tool.name}**: ${tool.description}\n`;
-                section += `  Params: ${JSON.stringify(tool.parameters)}\n\n`;
-                if (section.length > config.toolContextWindow) {
-                    section = section.slice(0, config.toolContextWindow) + '\n…(tool list truncated)\n';
-                    break;
-                }
+            const argNames = Object.keys((tool.parameters && tool.parameters.properties) || {}).join(', ');
+            fullPrompt += `- ${tool.name}: ${tool.description} (params: ${argNames || 'none'})\n`;
+            if (fullPrompt.length > config.toolContextWindow) {
+                fullPrompt += '…(tool list truncated)\n';
+                break;
             }
         }
-
-        fullPrompt += section;
     }
+    fullPrompt += '\n';
 
-    // Absolute final slot, after everything: this is the strongest instruction
-    // position, and it must reinforce the format for EVERY round (first message
-    // AND follow-ups) — DeepSeek's chat behavior is to pause after tool work
-    // and write a progress report, which the middle-of-prompt rules don't kill.
-    fullPrompt += 'REMINDER: your reply must be a fenced tool-call JSON (```json {"tool":"<name>","params":{...}} ```) ' +
-        'or a fenced submit_answer (```json {"tool":"submit_answer","params":{"text":"..."}} ```). ' +
-        'Plain text — including progress reports, summaries of what you did, and lists of "next steps" — is NEVER accepted.\n';
+    fullPrompt += `### USER REQUEST\n\n${userPrompt}\n\n`;
+
+    // Strongest final slot (reinforces format every round — DeepSeek pauses
+    // after tool work and writes progress reports; the top rules don't kill it).
+    fullPrompt += 'REMINDER: reply with fenced JSON tool call(s) — up to 5, independent — or submit_answer when finished. English only.\n';
     return fullPrompt;
 }
 

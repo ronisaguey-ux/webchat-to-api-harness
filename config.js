@@ -1,4 +1,6 @@
-require('dotenv').config({ override: true });
+// 09-04 (bug): dotenv must NEVER override service env — a stray .env with PORT broke the gemini gateway (systemd PORT=8085 -> 8080). override:false.
+const dotenv = require('dotenv');
+dotenv.config({ override: false });
 const path = require('path');
 
 // chat.js overrides (paste your tab URL there — it wins over .env)
@@ -24,6 +26,8 @@ const cfg = {
     // this substring instead of first-tab-with-matching-origin — lets two
     // instances share one browser, each pinned to its own thread.
     tabUrlSubstring: process.env.TAB_URL_SUBSTRING || null,
+    // Max response body length for logging/diagnostics
+    maxResponseBodyLength: parseInt(process.env.MAX_RESPONSE_BODY_LENGTH) || 1024,
     // Conversation mode (08-12): accept plain-text replies as the final answer
     // instead of demanding fenced tool JSON — for personal threads whose model
     // talks like a friend. Tool calls still work when the model makes them.

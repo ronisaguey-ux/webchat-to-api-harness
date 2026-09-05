@@ -63,6 +63,41 @@ function gitRootCd(cmd) {
 // prompt → tab choked, gateway wedged). See read_file handler.
 const MAX_READ_FILE_CHARS = parseInt(process.env.MAX_READ_FILE_CHARS || '200000', 10);
 
+// 09-04 (user): see_overflow — long tool outputs can't round-trip through the
+// chat prompt (see MAX_READ_FILE_CHARS wedge above), so the gateway stores the
+// full text here and the agent pages through it one chunk at a time. EXACTLY
+// ONE buffer at a time: a new storeOverflow call replaces whatever was buffered
+// before it; the buffer is also reset when paging is exhausted.
+const overflowStore = { buf: '', offset: 0 };
+
+// 09-04 (user): the seed call's chunkSize is carried over here so every chunk
+// in one paging run has the SAME width — nextOverflowChunk() takes no size arg.
+let overflowChunkSize = 150000;
+
+// Seed the overflow store with fullText and return the FIRST chunk (chunkSize
+// default 150000). No truncation marker on the chunk — the agent keeps calling
+// see_overflow until the END marker appears.
+function storeOverflow(fullText, chunkSize = 150000) {
+    overflowStore.buf = String(fullText ?? '');
+    overflowChunkSize = chunkSize;
+    overflowStore.offset = chunkSize;
+    return overflowStore.buf.slice(0, chunkSize);
+}
+
+// Return the next chunk of the buffered output; null when exhausted (the store
+// is reset on exhaustion, so the next call reports "no overflowed output").
+function nextOverflowChunk() {
+    if (overflowStore.offset >= overflowStore.buf.length) {
+        overflowStore.buf = '';
+        overflowStore.offset = 0;
+        overflowChunkSize = 150000;
+        return null;
+    }
+    const chunk = overflowStore.buf.slice(overflowStore.offset, overflowStore.offset + overflowChunkSize);
+    overflowStore.offset += chunk.length;
+    return chunk;
+}
+
 // Small read-only command runner (git_status). Captures stdout/stderr with a
 // hard timeout — never used for interactive or long-running commands.
 function runCmd(argv, timeoutMs = 8000) {
@@ -215,6 +250,35 @@ const TOOL_DEFINITIONS = [
                 };
             }
             return { success: true, content };
+        },
+    },
+    {
+        // 09-04 (user): see_overflow — pages through a previous tool call's
+        // output that overflowed the chat-prompt size cap. The gateway seeds the
+        // one-buffer store (storeOverflow) when it caps a tool result; each call
+        // here returns the next chunk, with a continue/END marker line attached.
+        name: 'see_overflow',
+        category: 'system',
+        description:
+            'Show the next chunk of a previous tool call output that overflowed ' +
+            '(call repeatedly to page through; returns "END" when done).',
+        parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+        },
+        handler: async () => {
+            const chunk = nextOverflowChunk();
+            if (chunk === null) {
+                return { success: false, error: 'No overflowed output available.' };
+            }
+            const more = overflowStore.offset < overflowStore.buf.length;
+            return {
+                success: true,
+                output: chunk + '\n' + (more
+                    ? '⚠️ output continues — call see_overflow again'
+                    : '(END OF OVERFLOWED OUTPUT)'),
+            };
         },
     },
     {
