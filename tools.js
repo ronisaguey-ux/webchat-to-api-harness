@@ -586,7 +586,7 @@ const TOOL_DEFINITIONS = [
         // the audit finish" itself — same data the main session reads.
         name: 'audit_status',
         category: 'oculus',
-        description: 'Get the Oculus pipeline status: cycle, phase, running/paused, and audit pass/batch progress.',
+        description: 'Get the pipeline status: cycle, phase, running/paused, and audit pass/batch progress.',
         parameters: {
             type: 'object',
             properties: {},
