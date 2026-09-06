@@ -447,45 +447,67 @@ async function sendPrompt(prompt, toolDefinitions, systemText) {
     // Not fixed by flipping the unit env: 8080 is SHARED (audit engine +
     // telegram_auto_responder + lane_watcher + cross_eval), so the env is not
     // the engine's to own.
+    // 09-05 PING-PONG FIX (lane D strand root cause): this block used to be able
+    // to run openNewChat() TWICE per send — the FORCE_EXPERT branch opened a
+    // fresh chat and selected EXPERT, then the FRESH_PER_SEND branch below
+    // opened ANOTHER one, and openNewChat's tail unconditionally re-pinned
+    // INSTANT. Net effect on the ds-gw lanes (FORCE_EXPERT=1 AND
+    // FRESH_PER_SEND=1): ~11s of extra SPA navigation churn before EVERY
+    // prompt, the requested EXPERT mode silently discarded, and the composer
+    // typed into a tab that had just finished a second full remount — which is
+    // exactly the window in which the Enter keypress dispatches but React never
+    // commits the send (the "stranded composer" 500). One fresh chat per send,
+    // opened directly in the mode we actually want.
+    const isDeepseekTab = new URL(config.webchatUrl).host.includes('deepseek');
+    const wantExpert = process.env.FORCE_EXPERT === '1' && isDeepseekTab;
+    const freshPerSend = process.env.FRESH_PER_SEND === '1';
+    let openedFreshChat = false;
     if (
         process.env.INSTANT_SWAP_EXPERT === '1' &&
         process.env.FORCE_EXPERT !== '1' &&
-        new URL(config.webchatUrl).host.includes('deepseek') &&
+        isDeepseekTab &&
         !(await isInstantThread())
     ) {
         console.log('🧪 pinned thread is EXPERT — swapping to a fresh INSTANT chat');
         swappingToInstant = true;
-        await openNewChat();
+        await openNewChat({ mode: 'instant' });
+        openedFreshChat = true;
     }
     // 08-25 (owner, NUCLEAR sweep): FORCE_EXPERT=1 — mirror-swap an INSTANT
     // pinned thread to a fresh EXPERT chat (expert = DeepThink chip only, no
     // Search). Same env-gated pattern as above; other gateways unaffected.
-    if (
-        process.env.FORCE_EXPERT === '1' &&
-        new URL(config.webchatUrl).host.includes('deepseek') &&
-        (await isInstantThread())
-    ) {
-        console.log('🧪 pinned thread is INSTANT — swapping to a fresh EXPERT chat (FORCE_EXPERT=1)');
+    // 09-05: when FRESH_PER_SEND is also on, the fresh chat this send needs IS
+    // the expert swap — do it once, here, instead of opening twice.
+    if (wantExpert && (freshPerSend || (await isInstantThread()))) {
+        console.log(freshPerSend
+            ? '🧪 fresh EXPERT chat for this send (FORCE_EXPERT=1 + FRESH_PER_SEND=1)'
+            : '🧪 pinned thread is INSTANT — swapping to a fresh EXPERT chat (FORCE_EXPERT=1)');
         swappingToExpert = true;   // 08-28: arm the pin capture (see below)
-        await openNewChat();
-        await selectExpertMode();
+        await openNewChat({ mode: 'expert' });
+        openedFreshChat = true;
     }
-    // 08-17: force DeepThink + Search ON for the deepseek tab (instant mode
-    // has both chips). No-op for foreign webchats (no such chips) and never
-    // throws.
-    await ensureToggles();
     // 09-05 (executor speed): FRESH_PER_SEND env (ds-gw unit, engine lane) —
     // every send gets its OWN fresh DS chat. The shared executor thread grew
     // 30+ exchanges deep and each turn crawled (4+ min before first tokens —
     // the model re-digests the whole thread). Fresh = each engine exchange is
     // the thread's FIRST message: fast turns + zero cross-step contamination.
-    // Note: deepseek's default fresh chat is INSTANT with DeepThink+Search —
-    // ensureToggles above already ran, and the handoff/swap pin machinery
-    // captures the new thread id via the swap pin (same 08-28 flow).
-    if (process.env.FRESH_PER_SEND === '1') {
+    // Skipped when a swap branch above already opened the fresh chat.
+    if (freshPerSend && !openedFreshChat) {
         console.log('🍃 FRESH_PER_SEND — opening a fresh chat for this send');
-        await openNewChat();
+        await openNewChat({ mode: wantExpert ? 'expert' : 'instant' });
+        openedFreshChat = true;
     }
+    // 08-17: force DeepThink + Search ON for the deepseek tab (instant mode
+    // has both chips). No-op for foreign webchats (no such chips) and never
+    // throws.
+    // 09-05: MOVED below the chat-opening block — it used to run BEFORE the
+    // FRESH_PER_SEND navigation, i.e. it toggled the chips on a tab that was
+    // then thrown away, leaving the tab we actually send in un-toggled.
+    await ensureToggles();
+    // 09-05: chip clicks re-render the composer. ensureToggles has no settle at
+    // all, so control used to reach typePrompt while the SPA was still swapping
+    // the composer subtree out. Wait for a genuinely interactive composer.
+    await waitComposerReady();
     console.log(`📤 Sending prompt (${prompt.length} chars) — tab: ${page.url()}`);
 
     // 08-13 FOREIGN-BUSY guard: a generation left running from a
@@ -666,6 +688,70 @@ async function ensureToggles() {
 // 08-14 (user rule): instant mode = Search chip present, expert = DeepThink
 // only. The chip set is the reliable mode detector — the mode itself is
 // locked at thread creation and cannot be read from the URL.
+// ── Composer-ready gate (09-05, lane-D strand fix) ───────────────────────
+// Mode-radio and toggle-chip clicks REMOUNT the composer subtree. Typing (or
+// pressing Enter) into a composer React is still mounting is the mechanism
+// behind the "stranded prompt": the keystrokes land in a DOM node that is then
+// replaced, so the text is visible but the send never commits. The old code
+// covered this with blind sleeps (900ms in selectInstantMode, 2500+500ms in
+// openNewChat) and NOTHING at all after ensureToggles' click loop.
+//
+// This is a real check, not a sleep. The composer must be present, rendered,
+// enabled, and carry a React fiber/props key (React has mounted AND claimed the
+// node), the send control must exist — and all of that must hold for the SAME
+// live element instance across three consecutive polls, so a remount in flight
+// is caught instead of typed into. Returns as soon as it is satisfied (~0.5s on
+// a settled tab), so it is cheaper than the sleeps it backstops.
+//
+// It also brings the tab to the front. Four DeepSeek SPAs share one headless
+// Chrome and nothing in this file ever called bringToFront, so three of them
+// sat at visibilityState:'hidden' with throttled timers/rAF — which is exactly
+// the load correlation the strand shows.
+async function waitComposerReady(timeoutMs = 15000) {
+    try { await page.bringToFront(); } catch { /* detached / single-target browser */ }
+    // The React-fiber requirement is DeepSeek-specific: gemini/qwen/kimi are not
+    // React apps, so demanding a fiber key there would stall this gate for its
+    // whole budget on every send. Those sites still get the mount/visible/
+    // enabled/stable-instance checks.
+    const needReactKey = new URL(config.webchatUrl).host.includes('deepseek');
+    const deadline = Date.now() + timeoutMs;
+    let lastMark = null;
+    let stable = 0;
+    while (Date.now() < deadline) {
+        let s = null;
+        try {
+            s = await page.evaluate((sels, sendSels, needReactKey) => {
+                let el = null;
+                for (const sel of sels) { el = document.querySelector(sel); if (el) break; }
+                if (!el) return null;
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true') return null;
+                if (!el.getClientRects().length) return null;          // not rendered yet
+                const keyed = Object.keys(el).some(
+                    (k) => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                if (needReactKey && !keyed) return null;                // React hasn't claimed it
+                // Stamp the live node: a remount between polls yields a fresh
+                // node with no stamp, so the mark changes and stability resets.
+                if (!el.dataset.wsReadyMark) {
+                    el.dataset.wsReadyMark = String(Date.now()) + '-' + String(Math.random()).slice(2, 8);
+                }
+                let send = false;
+                for (const sel of sendSels) { if (document.querySelector(sel)) { send = true; break; } }
+                return { mark: el.dataset.wsReadyMark, send };
+            }, config.selectors.input, config.selectors.send, needReactKey);
+        } catch { s = null; }
+        if (s && s.send && s.mark === lastMark) {
+            stable += 1;
+            if (stable >= 2) return true;      // same live node, ready, 3 polls running
+        } else {
+            stable = 0;
+        }
+        lastMark = s ? s.mark : null;
+        await sleep(250);
+    }
+    console.log('⚠ composer-ready gate timed out — proceeding anyway');
+    return false;
+}
+
 async function isInstantThread() {
     try {
         return await page.evaluate(() =>
@@ -1043,11 +1129,11 @@ async function sendMessage(input, text) {
                     }, config.selectors.send);
                     if (!pos) throw new Error('send button vanished before click');
                     await page.mouse.click(pos.x, pos.y);
-                    if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text.length);
+                    if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text);
                 }
                 await page.keyboard.press('Enter');
             }
-            if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text.length);
+            if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text);
         } catch (e) {
             const stale = /not clickable|not an Element|detached|context destroyed/i.test(e.message);
             if (!stale || attempt >= 2) throw e;
@@ -1066,21 +1152,39 @@ async function sendMessage(input, text) {
 // from "never sent", and ground to the hard cap (25 min) for a message that
 // isn't coming. Poll for the composer to clear; fail fast with a clear error
 // if it doesn't — the client retries and the tab stays usable.
-async function verifySendCleared(promptLen = 0) {
-    // 08-24 (transport audit): patience scales with prompt size. Bulk
-    // insertText of a 60k-char chunk takes the SPA measurably longer to
-    // commit; a premature "stranded" verdict fires the heal reload, which
-    // DESTROYS an in-flight submission — observed downstream as the gemini
-    // "generation stopped" banner on the client's retry. Small prompts keep
-    // the proven fast-fail (genuine React desyncs need the reload anyway).
-    // 08-24 (investigator 1): 30 polls was tight for the audit engine's
-    // 60k-char chunk sends on a busy renderer — a premature "stranded"
-    // verdict fires the heal reload, which destroys an in-flight submission
-    // (seen downstream as the gemini "generation stopped" banner). 45 keeps
-    // the fail-fast spirit with margin for a slow React commit.
-    const polls = promptLen > 20000 ? 45 : 10;
+// 09-05 (lane-D strand fix): takes the TYPED TEXT, not just its length. The old
+// verdict was "is ANY matched input non-empty" — it never checked that what sat
+// in the composer was OUR prompt, so an unrelated non-empty input (or a stale
+// contenteditable) read as a strand, and a genuinely stranded prompt was
+// indistinguishable from one. composerHoldsPrompt() has been the correct
+// discriminator all along; it just could not be reached because both call sites
+// passed `text.length`.
+async function verifySendCleared(typedText = '') {
+    const promptLen = String(typedText || '').length;
+    // 09-05: the old `promptLen > 20000 ? 45 : 10` gave sub-20k prompts a flat
+    // 10s. Observed strands include 440- and 462-char prompts, and the SAME
+    // 5551-char prompt stranded twice then committed unchanged on the third
+    // try — size is not the discriminator, so the small tier was simply too
+    // tight under the global send mutex. 20s for small, 45s for bulk.
+    const polls = promptLen > 20000 ? 45 : 20;
+    if (await waitComposerCleared(typedText, polls)) return;
+    // 08-17/08-23 stranded-composer flow (shared with waitForResponse since
+    // 09-04) — now recovers the send instead of only reloading + throwing.
+    await healStrandedComposer(typedText);
+}
+
+// Poll until the composer no longer holds `typedText` (i.e. the send committed).
+// Split out of verifySendCleared so the heal path can re-verify a replayed send
+// WITHOUT re-entering the heal. Falls back to the legacy "any input empty" test
+// when no text is available (the gemini waitForResponse call site).
+async function waitComposerCleared(typedText, polls) {
+    const haveProbe = String(typedText || '').trim().length > 0;
     for (let i = 0; i < polls; i++) {
         await sleep(1000);
+        if (haveProbe) {
+            if (!(await composerHoldsPrompt(typedText))) return true;
+            continue;
+        }
         const empty = await page.evaluate((sels) => {
             for (const sel of sels) {
                 const el = document.querySelector(sel);
@@ -1089,12 +1193,65 @@ async function verifySendCleared(promptLen = 0) {
                 if (v.trim().length > 0) return false;
             }
             return true;
-        }, config.selectors.input);
-        if (empty) return;
+        }, config.selectors.input).catch(() => false);
+        if (empty) return true;
     }
-    // 08-17/08-23 stranded-composer flow (shared with waitForResponse since
-    // 09-04): bard-check → inline reload → strand throw — see healStrandedComposer().
-    await healStrandedComposer();
+    return false;
+}
+
+// Re-commit a prompt that is sitting in the composer: focus, Enter, and — only
+// if Enter did not take — the send button (SEND-glyph guarded, never STOP).
+// Returns true when the composer no longer holds the text.
+async function recommitSend(typedText) {
+    try {
+        await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return true; }
+            }
+            return false;
+        }, config.selectors.input);
+        await sleep(400);
+        await page.keyboard.press('Enter');
+        await sleep(1500);
+        if (!(await composerHoldsPrompt(typedText))) return true;   // Enter took
+        const btn = await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                el.scrollIntoView({ block: 'center' });
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2, glyph: d.slice(0, 8) };
+            }
+            return null;
+        }, config.selectors.send);
+        if (!btn) return false;
+        // Same STOP-morph guard as sendMessage: never click a button that is in
+        // STOP state — it would kill a live generation.
+        const isDeepseek = new URL(config.webchatUrl).host.includes('deepseek');
+        if (isDeepseek && !btn.glyph.startsWith('M8.3125')) {
+            console.log('🛑 re-commit skipped — send button is in STOP state');
+            return false;
+        }
+        await sleep(300);
+        const pos = await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            }
+            return null;
+        }, config.selectors.send);
+        if (!pos) return false;
+        await page.mouse.click(pos.x, pos.y);
+        return true;
+    } catch (e) {
+        console.log('⚠ re-commit send failed:', String(e.message).slice(0, 80));
+        return false;
+    }
 }
 
 // ── Stranded-composer heal (08-17/08-23 flow, shared since 09-04) ─────────
@@ -1106,29 +1263,100 @@ async function verifySendCleared(promptLen = 0) {
 // tab's React state is gone, so reload it INLINE — the client's retry
 // (attempt 2/2) then lands on a fresh tab instead of a second guaranteed
 // failure. ALWAYS throws (bard-rejection error OR the strand error).
-async function healStrandedComposer() {
+// 09-05 (lane-D fix): this used to reload the tab and then ALWAYS throw, which
+// turned a transient, self-correcting timing race into a hard HTTP 500 for the
+// engine — one strand cost a whole batch (lane hop + cooldown). Evidence: the
+// identical 5551-char prompt stranded twice and then committed unchanged on the
+// third attempt, and 521 composer samples across three strand windows showed
+// DOM == React == _valueTracker with the send button in SEND state, i.e. NO
+// React desync at all. The send simply never committed. So recover it here:
+//   1. re-commit in place (focus + Enter, then the SEND-glyph button) — no
+//      reload, so an in-flight stream tee stays armed;
+//   2. failing that, reload, restore the mode/toggles, RE-ARM the stream tee
+//      (the reload destroys it, and the answer is read from the tee — not the
+//      DOM — so replaying without re-arming would return an empty reply),
+//      re-type and re-send.
+// Only when both fail does it throw. `strandReplayDepth` keeps the replay from
+// re-entering itself through verifySendCleared.
+let strandReplayDepth = 0;
+
+async function healStrandedComposer(typedText = '') {
     let bard = '';
     try { bard = await page.evaluate(() => window.__wsLastBardError || ''); } catch { /* ignore */ }
     if (bard) {
         throw new Error(`webchat send failed — gemini backend rejected the send (BardErrorInfo ${bard} = rate-limit/abuse block). Wait out the cooldown; do NOT reload-hammer it.`);
     }
-    console.log('🧹 stranded composer detected — reloading tab for inline self-heal');
-    try {
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await sleep(3000); // let the UI settle after reload
-        const inputAvail = await page.evaluate((sels) => {
-            for (const sel of sels) {
-                if (document.querySelector(sel)) return true;
-            }
-            return false;
-        }, config.selectors.input);
-        console.log(inputAvail
-            ? '🧹 tab reloaded — composer input present, ready for client retry'
-            : '🧹 tab reloaded but composer input not found — client retry may still fail');
-    } catch (e) {
-        console.log('🧹 inline reload failed:', String(e.message).slice(0, 60));
+    const probe = String(typedText || '');
+    // No text to replay (the gemini waitForResponse call site) or already inside
+    // a replay → keep the legacy behaviour: reload so the client's retry lands
+    // on a clean tab, then throw.
+    if (!probe.trim() || strandReplayDepth > 0) {
+        console.log('🧹 stranded composer detected — reloading tab for inline self-heal');
+        try {
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await sleep(3000); // let the UI settle after reload
+            const inputAvail = await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    if (document.querySelector(sel)) return true;
+                }
+                return false;
+            }, config.selectors.input);
+            console.log(inputAvail
+                ? '🧹 tab reloaded — composer input present, ready for client retry'
+                : '🧹 tab reloaded but composer input not found — client retry may still fail');
+        } catch (e) {
+            console.log('🧹 inline reload failed:', String(e.message).slice(0, 60));
+        }
+        throw new Error('webchat send failed — prompt stranded in composer. Tab reloaded; retry the send.');
     }
-    throw new Error('webchat send failed — prompt stranded in composer (React out of sync). Tab reloaded; retry the send.');
+
+    strandReplayDepth += 1;
+    try {
+        // ── Attempt 1: in-place re-commit (no reload) ───────────────────────
+        console.log('🧹 stranded composer — re-committing the prompt in place (no reload)');
+        await waitComposerReady();
+        if (await recommitSend(probe)) {
+            if (await waitComposerCleared(probe, 20)) {
+                console.log('✅ strand recovered — send committed on the in-place re-commit');
+                return;
+            }
+        }
+        // ── Attempt 2: reload, restore state, replay ────────────────────────
+        console.log('🧹 in-place re-commit did not take — reloading tab and replaying the prompt');
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await waitForChatInput();
+        await waitComposerReady();
+        const isDeepseek = new URL(config.webchatUrl).host.includes('deepseek');
+        // Mode is locked at thread creation, so only re-select it while the tab
+        // is still on a NEW chat — never on an existing /a/chat/s/ thread.
+        if (isDeepseek && !/\/a\/chat\/s\//.test(page.url())) {
+            if (process.env.FORCE_EXPERT === '1') await selectExpertMode();
+            else await selectInstantMode();
+            await waitComposerReady();
+        }
+        await ensureToggles();
+        await waitComposerReady();
+        // The reload wiped the page-side stream tee. waitForResponse reads the
+        // answer from it (window.__wsTeeSeq / readStreamedAnswer), and its
+        // sequence snapshot was taken once at the top of sendMessage — before
+        // this reload — so both must be re-established or the replayed answer
+        // is invisible to the caller.
+        await installStreamTee().catch(
+            (e) => console.log('⚠ stream tee re-install failed:', String(e.message).slice(0, 60)));
+        requestTeeStart = await page.evaluate(() => (window.__wsTeeSeq || 0)).catch(() => 0);
+        await typePrompt(probe);
+        if (await recommitSend(probe)) {
+            if (await waitComposerCleared(probe, 30)) {
+                console.log('✅ strand recovered — prompt replayed on the reloaded tab');
+                return;
+            }
+        }
+    } catch (e) {
+        console.log('🧹 strand replay failed:', String(e.message).slice(0, 120));
+    } finally {
+        strandReplayDepth -= 1;
+    }
+    throw new Error('webchat send failed — prompt stranded in composer; in-place re-commit and reload+replay both failed. Retry the send.');
 }
 
 // ── Composer-holds-prompt probe (09-04) ─────────────────────────────────
@@ -2061,7 +2289,13 @@ async function reapSurplusTabs() {
     }
 }
 
-async function openNewChat() {
+// 09-05: `opts.mode` ('instant' | 'expert') picks the mode selected on the
+// fresh composer BEFORE the first message locks the thread. It used to be
+// hard-wired to INSTANT, which is why a FORCE_EXPERT swap that opened a chat
+// and selected EXPERT was immediately undone by the next openNewChat() —
+// the ping-pong that ran on every single send of the ds-gw lanes.
+async function openNewChat(opts = {}) {
+    const mode = opts.mode || (process.env.FORCE_EXPERT === '1' ? 'expert' : 'instant');
     // Fresh CDP session like every send (stale-session refresh).
     await initBrowser({ reconnect: true });
     await reapSurplusTabs();
@@ -2100,14 +2334,20 @@ async function openNewChat() {
         : config.webchatUrl;
     await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForChatInput();
-    await sleep(2500); // let the SPA settle the composer
+    // 09-05: was a blind `sleep(2500)`. The gate below verifies the composer is
+    // actually mounted and interactive instead of guessing, and returns early
+    // on a settled tab.
+    await waitComposerReady();
     generationErrHealed = false; // fresh chat = clean slate; re-arm banner heal (08-24)
-    // 08-17 (user rule): mode is locked at thread creation — select INSTANT
+    // 08-17 (user rule): mode is locked at thread creation — select the mode
     // on the fresh new-chat composer BEFORE the first message creates the
-    // thread (expert threads can never become instant afterwards).
+    // thread (an expert thread can never become instant afterwards).
     if (new URL(config.webchatUrl).host.includes('deepseek')) {
-        await selectInstantMode();
-        await sleep(500);
+        if (mode === 'expert') await selectExpertMode();
+        else await selectInstantMode();
+        // 09-05: the mode radio swaps the composer subtree — the old blind
+        // `sleep(500)` is the exact window the strand was typed into.
+        await waitComposerReady();
     }
     return page;
 }

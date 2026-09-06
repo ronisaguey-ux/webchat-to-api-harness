@@ -16,7 +16,7 @@ BACKSTOP_ROUNDS feedback rounds (rate-limit backoff 45*2^(r-1) cap 600s) ->
 recorded failed + notify main, continue. Free-skip: batch whose verification
 commands already ALL pass costs zero LLM calls.
 
-This is a SEPARATE pipeline from the oculus plan: own state file
+This is a SEPARATE pipeline from the main plan: own state file
 (helpotron_execution_state.json + flock, kept alive for the whole run), own
 repo (/home/roni/Roni_Workspace/helpotron), own lane (gemini 8085). The oculus
 batch executor keeps running on the deepseek lane untouched.

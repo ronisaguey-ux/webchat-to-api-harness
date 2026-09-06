@@ -1261,7 +1261,7 @@ async def call_webchat(session: aiohttp.ClientSession, user_prompt: str,
     if rl_seen:
         # 08-21 (user directive): deepseek rate-limited -> OmniRoute kicks in for
         # THIS call (free fallback via the gateway's WEBCHAT_ROUTES omniroute slot,
-        # model rewritten to auto/best-coding). Gated to the oculus lane (8080):
+        # model rewritten to auto/best-coding). Gated to the primary webchat lane:
         # helpotron stays gemini-only (user lane rule — lanes never crossed).
         # OmniRoute's own errors are NOT swapped again (no recursion); the caller's
         # flat 300s cadence paces retries while both lanes are down, and the next
@@ -1360,7 +1360,7 @@ async def solve_step_with_webchat(session: aiohttp.ClientSession, step: dict,
     ver_cmds = step.get("verification", [])
 
     sys_prompt = (
-        "You are the OCULUS webchat expert — the PRIMARY executor of every "
+        "You are the webchat expert — the PRIMARY executor of every "
         "pipeline plan step (the OmniRoute LLM team is retired per the "
         "2026-08-16 directive; each step is yours to implement and verify). "
         "You have TOOLS: run_bash, "

@@ -4,8 +4,27 @@ const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const { Readable } = require('stream');
 const config = require('./config');
+
+// P1B5R0F8: Fail startup when HOST is non-loopback and API_TOKEN is absent,
+// unless UNSAFE_NO_AUTH is explicitly set.
+function enforceAuthPolicy() {
+    const host = String(config.host || '127.0.0.1').toLowerCase();
+    const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1' || host.startsWith('127.');
+    const hasToken = !!config.apiToken;
+    const unsafeNoAuth = process.env.UNSAFE_NO_AUTH === 'true';
+    if (!isLoopback && !hasToken && !unsafeNoAuth) {
+        console.error('❌ STARTUP BLOCKED: HOST is non-loopback (' + host + ') but API_TOKEN is not set.');
+        console.error('   Set API_TOKEN in .env, or bind to 127.0.0.1/localhost, or explicitly set UNSAFE_NO_AUTH=true to acknowledge the risk.');
+        process.exit(1);
+    }
+    if (!hasToken && unsafeNoAuth) {
+        console.warn('⚠️  WARNING: UNSAFE_NO_AUTH=true — all endpoints are UNAUTHENTICATED.');
+    }
+}
+enforceAuthPolicy();
 
 // 09-04 AUTHORIZATION FRAME — module-level (AUTH_FRAMED=0 disables). Consumer
 // webchat safety filters refuse exploitation-framed pentest prompts without an
@@ -382,7 +401,36 @@ let lastSendAt = 0;
 // mkdir is atomic (one winner), a heartbeat keeps the mtime fresh so long
 // generations aren't stolen, and a 120s-stale steal frees the lock if a
 // gateway dies mid-hold. Non-deepseek gates (qwen/kimi/gemini) skip it.
-const DEEPSEEK_LOCK_DIR = '/tmp/deepseek_webchat_mutex';
+// 09-05 PER-ACCOUNT LOCK (lane-D throughput fix). The owner rule is one
+// in-flight message per ACCOUNT ("u cant have 2 deepseek webchats working at
+// once ... if u make sure a message is never sent to more then one chat at once
+// u can basically have infinite chats open"). When this lock was written every
+// deepseek gateway drove ONE browser/account, so a single global lock file was
+// the account lock. That is no longer true: the executor runs four lanes on
+// four SEPARATE Chromes with four separate profiles (8081→cdp 9225, 8082→9229,
+// 8083→9227, 8084→9228), i.e. four different accounts — and they were all
+// serializing on one mutex across the FULL send→response window. Measured
+// consequence on lane D: `🔒 deepseek mutex: queued` at 21:00:30 with no
+// further output for 9+ minutes, four concurrent probe requests all starving to
+// a 400s timeout, and the strand rate rising with parallel load. The lock is
+// now keyed by the browser that actually owns the session (its CDP endpoint,
+// falling back to the profile dir), so same-account gateways still serialize
+// and different-account lanes finally run in parallel as designed.
+// DEEPSEEK_LOCK_KEY overrides the key when two gateways must share one lock
+// (e.g. two units pointed at the same account); an unset identity keeps the
+// historical shared file.
+function deepseekLockIdent() {
+    if (process.env.DEEPSEEK_LOCK_KEY) return process.env.DEEPSEEK_LOCK_KEY;
+    if (process.env.CDP_WS_URL) {
+        try { return 'cdp-' + new URL(process.env.CDP_WS_URL).host; } catch (e) { /* malformed */ }
+    }
+    if (process.env.WEBCHAT_PROFILE) return 'profile-' + path.basename(process.env.WEBCHAT_PROFILE);
+    return '';
+}
+const DEEPSEEK_LOCK_IDENT = deepseekLockIdent().replace(/[^A-Za-z0-9._-]/g, '_');
+const DEEPSEEK_LOCK_DIR = DEEPSEEK_LOCK_IDENT
+    ? `/tmp/deepseek_webchat_mutex.${DEEPSEEK_LOCK_IDENT}`
+    : '/tmp/deepseek_webchat_mutex';
 const LOCK_STEAL_MS = 120000;
 const LOCK_HEARTBEAT_MS = 30000;
 const LOCK_ACQUIRE_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_LOCK_TIMEOUT_MS || '1800000', 10);
@@ -407,7 +455,7 @@ async function acquireDeepSeekLock() {
         } catch (e) { /* held by another gateway */ }
         if (!waited) {
             waited = true;
-            console.log('🔒 deepseek mutex: queued — waiting for the in-flight message (one at a time)');
+            console.log(`🔒 deepseek mutex [${DEEPSEEK_LOCK_IDENT || 'shared'}]: queued — waiting for the in-flight message on this account (one at a time)`);
         }
         try {
             const st = fs.statSync(DEEPSEEK_LOCK_DIR);

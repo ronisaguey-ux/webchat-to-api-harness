@@ -156,7 +156,7 @@ async def _commit_step(step) -> tuple[bool, str]:
 
 def _batch_sys_prompt() -> str:
     return (
-        "You are the OCULUS webchat expert — the PRIMARY executor of pipeline plan steps "
+        "You are the webchat expert — the PRIMARY executor of pipeline plan steps "
         "(the OmniRoute LLM team is retired per the 2026-08-16 directive; every step in this "
         "message is yours to implement and verify). You have TOOLS: run_bash, read_file, "
         "write_file, list_dir, search_web, git_status, audit_status, telegram_send. "
