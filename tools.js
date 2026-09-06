@@ -4,8 +4,8 @@ const path = require('path');
 const { spawn } = require('child_process');
 const config = require('./config');
 
-// 08-17 EXECUTION-LANE CWD FIX (plan-execution root cause): the OCULUS
-// executor verifies/commits from the git root (/home/roni/Roni_Workspace/oculus)
+// 08-17 EXECUTION-LANE CWD FIX (plan-execution root cause): the pipeline
+// executor verifies/commits from the git root (the git root)
 // but the webchat expert's relative file/bash ops resolved against the server
 // cwd (repo root) — so expert code landed ONE level above where verification
 // ran (fake-passes + HALTs, steps 490/491). Webchat lanes launched with
@@ -14,9 +14,9 @@ const config = require('./config');
 const GIT_ROOT = process.env.GIT_ROOT || '';
 
 // 08-19 USER-SESSION SCOPING (root-cause fix: "wtf is going on" — the gemini
-// user session kept running oculus-harness actions instead of the user's
+// user session kept running webchat-harness actions instead of the user's
 // helpotron plan). User-mode gateways (ALLOW_PLAIN_TEXT=true, e.g. PORT=8085)
-// serve a NEUTRAL toolset: no oculus-category tools (audit_status, send_message_
+// serve a NEUTRAL toolset: no pipeline-category tools (audit_status, send_message_
 // to_main) and git_status defaults to the USER's repo (helpotron), not oculus.
 // Autonomous/executor lanes (no ALLOW_PLAIN_TEXT) keep the full harness toolset.
 const USER_MODE = process.env.ALLOW_PLAIN_TEXT === 'true';
@@ -635,7 +635,7 @@ const TOOL_DEFINITIONS = [
         },
         handler: async (args) => {
             const repos = {
-                oculus: '/home/roni/Roni_Workspace/oculus',
+                oculus: 'the git root',
                 'webchat-api': '/home/roni/Roni_Workspace/webchat-api',
                 helpotron: '/home/roni/Roni_Workspace/helpotron',
             };
