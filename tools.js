@@ -821,7 +821,7 @@ const TOOL_DEFINITIONS = [
             }
             // 08-20: corrected telegram_monitor dir (audit SEC-03 surface — the
             // tool silently returned "failed" with the old hyphen path).
-            const sendScript = '/home/roni/Roni_workspace/oculus/scripts/telegram_monitor/telegram-monitor/bin/send-telegram.sh';
+            const sendScript = 'os.homedir() + "/.config/oculus/telegram-monitor/bin/send-telegram.sh"';
             const envFile = `${os.homedir()}/.config/oculus/orchestrator.env`;
             const cmd = `set -a; [ -f "${envFile}" ] && source "${envFile}"; set +a; bash "${sendScript}" "${text.replace(/"/g, '\\"')}"`;
             return new Promise((resolve) => {
