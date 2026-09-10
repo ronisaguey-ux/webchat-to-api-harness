@@ -4,3 +4,39 @@ node_modules/
 *.log
 chat.js
 bash_tool_log.jsonl
+
+# --- IP-breach guard (2026-09-10): this repo is the webchat-to-api harness ONLY.
+# Oculus/trading sources are NEVER part of it. Blocked here so a stray `git add -A`
+# from a shared worktree can never re-contaminate this repo again.
+oculus/
+oculus_auth/
+oculus_app/
+live/
+execution/
+swarm/
+genetic_algorithm/
+historical_data/
+executor/
+alt_important_scripts/
+config/
+app/
+dashboard/
+audits_plans/
+tests/
+scripts/
+__pycache__/
+*.bak-*
+*.settings.json
+regime.py
+risk_manager.py
+weight_store.py
+asset_registry.py
+cache.py
+cookie_encrypt.py
+rollback_validator.py
+api_server.py
+call_deepchat.sh
+handoff_to_new_chat.md
+weight_store_integrity_failopen_and_path_toctou_analysis_report.json
+audit_findings_live_sot_batch.json
+.claude/
