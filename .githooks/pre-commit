@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# IP-breach guard (2026-09-10): this repo is the webchat-to-api harness ONLY.
+# Block any staged path that belongs to the oculus/trading codebase.
+set -euo pipefail
+blocked='^(oculus/|oculus_auth/|oculus_app/|live/|execution/|swarm/|genetic_algorithm/|historical_data/|executor/|alt_important_scripts/|security/|config/|app/|dashboard/|tests/|scripts/|regime\.py$|risk_manager\.py$|weight_store\.py$|asset_registry\.py$|cache\.py$|cookie_encrypt\.py$|rollback_validator\.py$|api_server\.py$|call_deepchat\.sh$)'
+hits=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$blocked" || true)
+if [ -n "$hits" ]; then
+  echo "✗ BLOCKED: oculus/trading paths staged in the harness repo:" >&2
+  echo "$hits" >&2
+  echo "  This repo is webchat-to-api-harness ONLY. Commit oculus work in ~/Roni_Workspace/oculus." >&2
+  exit 1
+fi
