@@ -15,7 +15,7 @@ const IS_GEMINI = (config.modelName || '').toLowerCase().startsWith('gemini');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
     buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
-    resetTeeForHandoff, takeThreadSwap,
+    resetTeeForHandoff, takeThreadSwap, browserAlive,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 const { MultiSignalGatewayGate } = require('./drift_v2');
@@ -949,7 +949,13 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // chrome glued to an opening brace — raw triple quotes, raw newlines,
         // or a truncated brace made the parse fail). Send it back as a
         // correction — never ship the raw row text to the client.
-        if (looksLikeBrokenToolJson(response) && malformedRounds < 3) {
+        //
+        // CONVERSATION MODE IS EXEMPT. With ALLOW_PLAIN_TEXT the caller wants
+        // the model's raw text (the fix-executor's `{"edits":[...]}` block is
+        // exactly this shape) — treating it as a broken tool call made the
+        // gateway re-send a correction up to maxToolRounds times and never
+        // return, so every engine step burned its full timeout on this lane.
+        if (!config.allowPlainText && looksLikeBrokenToolJson(response) && malformedRounds < 3) {
             malformedRounds++;
             console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent`);
             onProgress?.({ type: 'rejected', text: 'malformed tool JSON — correction sent' });
@@ -1404,6 +1410,32 @@ async function ensureRouteUp(target) {
         await new Promise((resolve) => setTimeout(resolve, 5000));
     }
 }
+
+// Health probe for the systemd watchdog. A wedged gateway (waiting forever on a
+// dead webchat tab) is still an ALIVE process, so Restart=always never fires —
+// observed 2026-09-11, five manual restarts in one hour. This reports whether the
+// browser session is actually usable, so the watchdog can restart on a wedge.
+app.get('/health', (req, res) => {
+    // `browser` is module-private to browser.js, so probe the live page instead:
+    // getPage() is exported and is null until a tab is attached.
+    const alive = (() => {
+        try {
+            const pg = getPage();
+            return !!pg && !pg.isClosed();
+        } catch { return false; }
+    })();
+    const busySince = typeof lastSendAt === 'number' ? Date.now() - lastSendAt : 0;
+    // A send outstanding for over 4 minutes is the wedge signature. There is no
+    // in-flight flag to read, so the proxy is "a send started and no completion
+    // was recorded since" — lastSendAt is refreshed at completion in sendPrompt.
+    const wedged = busySince > 240000;
+    res.status(alive && !wedged ? 200 : 503).json({
+        ok: alive && !wedged,
+        browserAlive: alive,
+        wedged,
+        outstandingMs: busySince,
+    });
+});
 
 app.get('/v1/models', (req, res) => {
     // 08-14 GATEWAY PICKER: Claude Code's model discovery

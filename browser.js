@@ -8,6 +8,19 @@ const config = require('./config');
 const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS || '900000', 10);
 
 let browser = null;
+
+// puppeteer 25 removed Browser#isConnected(); it is now the `connected` getter.
+// Support both so an older/newer puppeteer never breaks the connect path.
+function browserAlive(b) {
+    if (!b) return false;
+    try {
+        if (typeof b.isConnected === 'function') return b.isConnected();
+        if (typeof b.connected === 'boolean') return b.connected;
+        return !!b.connection;
+    } catch {
+        return false;
+    }
+}
 let page = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -56,7 +69,7 @@ async function initBrowser({ reconnect = false } = {}) {
         page = null;
         console.log('🔌 Reconnecting CDP session (stale session refresh).');
     }
-    if (browser && browser.isConnected()) {
+    if (browser && browserAlive(browser)) {
         console.log('🟢 Browser already connected.');
         return;
     }
@@ -1217,7 +1230,7 @@ async function waitForResponse(before, typedText) {
             // fast with a clear error instead; the supervisor's chrome_cdp
             // ensure relaunches Chrome and the next request auto-resolves the
             // new ws id.
-            if (!browser || !browser.isConnected() || page.isClosed()) {
+            if (!browser || !browserAlive(browser) || page.isClosed()) {
                 throw new Error('Webchat browser connection lost (Chrome crashed?) — please resend');
             }
             // Page busy (long cogitation / heavy render) — an evaluate can throw
@@ -1550,6 +1563,7 @@ async function firstMatch(selectors) {
 
 module.exports = {
     initBrowser,
+    browserAlive,
     connectToWebchat,
     sendPrompt,
     closeBrowser,
