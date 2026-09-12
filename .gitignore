@@ -40,3 +40,23 @@ handoff_to_new_chat.md
 weight_store_integrity_failopen_and_path_toctou_analysis_report.json
 audit_findings_live_sot_batch.json
 .claude/
+
+# --- local secrets, backups and stray scratch (2026-09-12) ---
+# Runtime cookie jars and env backups must never be committed.
+.cookies-*.json
+.cookies-*.json.encrypted
+.env.bak*
+.env.disabled*
+.config/
+.shannon/
+foo.py
+ftrom_*.json
+
+# Internal notes that are not part of the public harness docs.
+# docs/OPERATIONS_AND_PERFORMANCE.md is the only tracked doc — do not ignore docs/.
+docs/SECRET_ROTATION.md
+docs/analysis/
+docs/execution_layer_injection_audit.md
+docs/master_oculus_plan_7_29.md
+docs/plan_oculus.md
+docs/rollback_policy.md
