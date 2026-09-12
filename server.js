@@ -368,7 +368,14 @@ async function countedSend(msg, defs) {
             return Math.max(0, prev + MIN_SEND_INTERVAL_MS - Date.now());
         } catch { return 0; }
     })();
-    const gap = nextSendGapMs();
+    // 09-12: the RANDOM 20-80s gap is a DeepSeek anti-ban measure (owner rule:
+    // "to make it seem less botted"). Gemini is a different account on a
+    // different host and needs no such padding — applying it there only added up
+    // to 80s to every gemini send on top of its own latency, which is what made
+    // the engine's lane budget expire (measured: `gemini failed (timeout after
+    // 200s)` while the gateway was still generating). Keep the single-thread
+    // mutex for gemini; drop the random padding.
+    const gap = usesDeepSeek() ? nextSendGapMs() : 0;
     const waitMs = Math.max(0, lastSendAt + gap - Date.now(), sharedWaitMs);
     if (waitMs > 0) {
         console.log(`⏱ send gate: waiting ${waitMs}ms (random ${gap}ms gap this send, shared across lanes)`);
