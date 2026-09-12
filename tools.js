@@ -396,10 +396,14 @@ const TOOL_DEFINITIONS = [
         name: 'send_message',
         category: 'chat',
         description:
-            'Send a plain-text message to the user (delivered verbatim, rendered as "💬 <text>"). ' +
-            'Use this to acknowledge the user\'s message, narrate what you are about to do before ' +
-            'every other tool call, and to send your final summary. This is the ONLY way to ' +
-            'communicate in plain text.',
+            (config.narration
+                ? 'Send a plain-text message to the user (delivered verbatim, rendered as "💬 <text>"). ' +
+                  'Use this to acknowledge the user\'s message, narrate what you are about to do before ' +
+                  'every other tool call, and to send your final summary. This is the ONLY way to ' +
+                  'communicate in plain text.'
+                : 'Send a plain-text message to the user (delivered verbatim, rendered as "💬 <text>"). ' +
+                  'Use this only for the final summary or something the user must read — do NOT narrate ' +
+                  'tool calls (narration is disabled: NARRATION=false).'),
         parameters: {
             type: 'object',
             properties: {
