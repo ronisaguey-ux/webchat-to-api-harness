@@ -14,7 +14,7 @@ const config = require('./config');
 const IS_GEMINI = (config.modelName || '').toLowerCase().startsWith('gemini');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
-    buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
+    buildFullPrompt, openNewChat, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
     resetTeeForHandoff, takeThreadSwap, browserAlive,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
@@ -228,6 +228,9 @@ function formatToolResultView(call, result, cap) {
 // ms (queued, not rejected) so the account never sees a burst from us.
 const MIN_SEND_INTERVAL_MS = parseInt(process.env.MIN_SEND_INTERVAL_MS || '6000', 10);
 let lastSendAt = 0;
+// Process lifetime anchor for the /health wedge check. lastSendAt starts at 0, so
+// without this an idle gateway computes Date.now() - 0 and reports wedged:true.
+const processStartAt = Date.now();
 
 // 08-14 GLOBAL SEND MUTEX (owner rule: deepseek webchat supports ONE message
 // in-flight per account — "u cant have 2 deepseek webchats working at once",
@@ -736,14 +739,34 @@ async function maybePauseForDrift(text, userPrompt) {
 }
 
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
-    const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
-    let prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
-    if (systemText) prompt += `${systemText}\n\n`;
-    prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
-    prompt += config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT;
-    prompt += continueDirective(userPrompt);
-    prompt += greetingDirective(userPrompt);
-    prompt += `### RESPONSE\n`;
+    // PASSTHROUGH_FORMAT: the caller ships a complete, self-contained contract in
+    // its system text (the oculus step engine's {"edits":[...]}). This gateway
+    // must then add NOTHING — every block it used to wrap around it was a
+    // competing instruction, and the model obeys the most recent one:
+    //   ### SYSTEM INSTRUCTION + CONV_PREAMBLE  -> "you are a coding assistant in
+    //       an interactive terminal session; state what you are about to do" —
+    //       invites prose and narration.
+    //   CONV_FORMAT / WEBCHAT_FORMAT            -> "reply in friendly plain text"
+    //       or "call submit_answer" — a different output schema entirely.
+    //   continueDirective                       -> "reply with your NEXT tool call
+    //       JSON ... or submit_answer" — a third schema.
+    //   greetingDirective                       -> "reply in plain text, no tools".
+    // Stacked around a strict JSON contract, these are why gemini answered
+    // "Task completed successfully." and why the engine's steps never landed.
+    // A caller that defines its own contract gets its own contract, verbatim.
+    let prompt;
+    if (config.passthroughFormat) {
+        prompt = systemText ? `${systemText}\n\n${userPrompt}` : userPrompt;
+    } else {
+        const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
+        prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
+        if (systemText) prompt += `${systemText}\n\n`;
+        prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
+        prompt += config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT;
+        prompt += continueDirective(userPrompt);
+        prompt += greetingDirective(userPrompt);
+        prompt += `### RESPONSE\n`;
+    }
 
     if (isAborted?.()) {
         console.log('🔴 client disconnected before request started — skipping');
@@ -776,6 +799,20 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     }
 
     activeHandoffCtx = { toolDefs, onProgress, isAborted, userPrompt, lastToolInfo: null };
+
+    // FRESH_CHAT_PER_SEND: gemini's send is reliable on a new chat and flaky on a
+    // conversation page — the first call after a fresh chat answers in ~6s, every
+    // later one times out with the prompt still in the composer. Open a new chat
+    // before each send so the lane always starts from the state that works.
+    // Costs a navigation; the engine is throughput-bound on the model anyway.
+    if (process.env.FRESH_CHAT_PER_SEND === 'true') {
+        try {
+            await openNewChat();
+            await sleep(600);
+        } catch (e) {
+            console.log('⚠️ fresh-chat-per-send failed (continuing on current thread):', String(e.message).slice(0, 80));
+        }
+    }
 
     let response = await countedSend(injectMainReplies(prompt), toolDefs);
     // Growth baseline: captured AFTER the first send so a request whose body
@@ -1005,6 +1042,13 @@ function exhaustedMarker(prefix, response) {
 // Conversation-mode final answer: strip the renderer chrome and never let a
 // broken tool envelope through as text.
 function finalAnswerFor(text) {
+    // PASSTHROUGH_FORMAT: the caller defined the contract, so this gateway has
+    // no standing to call its reply malformed. `looksLikeBrokenToolJson` matches
+    // any string starting with '{', which is exactly what the oculus engine's
+    // {"edits":[...]} reply is — the gateway was shredding a valid answer and
+    // returning a 79-byte "malformed tool calls" marker, so every step hopped
+    // lanes forever. Pass the caller's answer through untouched.
+    if (config.passthroughFormat) return text;
     if (looksLikeBrokenToolJson(text)) {
         return '[⚠️ webchat model kept sending malformed tool calls — please retry the request]';
     }
@@ -1424,11 +1468,26 @@ app.get('/health', (req, res) => {
             return !!pg && !pg.isClosed();
         } catch { return false; }
     })();
-    const busySince = typeof lastSendAt === 'number' ? Date.now() - lastSendAt : 0;
     // A send outstanding for over 4 minutes is the wedge signature. There is no
     // in-flight flag to read, so the proxy is "a send started and no completion
     // was recorded since" — lastSendAt is refreshed at completion in sendPrompt.
-    const wedged = busySince > 240000;
+    //
+    // Guard the never-sent case: lastSendAt starts at 0, so `Date.now() - 0` is
+    // the epoch in ms and the gateway reported `wedged:true` with a nonsense
+    // outstandingMs (1.7e12) on a perfectly idle process — which 503s /health and
+    // makes the watchdog restart a healthy gateway. Only a timestamp that is
+    // actually within this process's lifetime counts as an outstanding send.
+    const started = typeof processStartAt === 'number' ? processStartAt : 0;
+    const busySince =
+        typeof lastSendAt === 'number' && lastSendAt > started ? Date.now() - lastSendAt : 0;
+    // The wedge threshold MUST exceed the request timeout, or the watchdog kills
+    // the gateway while a legitimate long send is still running: gemini takes
+    // 150-260s per reply and the gemini unit sets TIMEOUT=300000, so a flat 240s
+    // threshold guillotined healthy in-flight calls every 2 minutes (observed
+    // 2026-09-11 — the client saw RemoteDisconnected mid-request). Derive it from
+    // the configured timeout plus a queue margin instead of hardcoding.
+    const wedgeThresholdMs = (config.timeout || 300000) + 30000;
+    const wedged = busySince > wedgeThresholdMs;
     res.status(alive && !wedged ? 200 : 503).json({
         ok: alive && !wedged,
         browserAlive: alive,
