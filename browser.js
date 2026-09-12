@@ -199,6 +199,26 @@ async function saveCookies() {
 async function connectToWebchat(webchatUrl) {
     if (!page) await initBrowser();
 
+    // A cached `page` can outlive its frame: Chrome swaps the renderer (tab
+    // discarded, crash, or the page navigated) and every call on the old handle
+    // throws "Attempted to use detached Frame '<id>'". Observed 2026-09-12 — the
+    // gateway answered a good response, refreshed its CDP session, then 503'd the
+    // next request with a detached frame and the engine burned a hop on it.
+    // Probe first; on a stale handle, drop it and re-attach before doing work.
+    if (page) {
+        try {
+            await page.evaluate(() => 1);
+        } catch (e) {
+            if (/detached Frame|Session closed|Target closed|Cannot find context/i.test(String(e.message))) {
+                console.log(`♻️  Stale page handle (${String(e.message).slice(0, 60)}) — re-attaching.`);
+                page = null;
+                await initBrowser({ reconnect: true });
+            } else {
+                throw e;
+            }
+        }
+    }
+
     if (config.cdpWsUrl) {
         const pages = await browser.pages();
         // TAB_URL_SUBSTRING mode (second instance, 08-12): match the tab whose
