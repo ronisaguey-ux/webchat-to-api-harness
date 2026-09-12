@@ -15,7 +15,7 @@ const IS_GEMINI = (config.modelName || '').toLowerCase().startsWith('gemini');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
     buildFullPrompt, openNewChat, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
-    resetTeeForHandoff, takeThreadSwap, browserAlive,
+    resetTeeForHandoff, takeThreadSwap, browserAlive, markShuttingDown,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
 const { MultiSignalGatewayGate } = require('./drift_v2');
@@ -1834,6 +1834,9 @@ async function main() {
 for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, async () => {
         console.log(`\n🔴 ${sig} — shutting down...`);
+        // Tell the disconnect guard this is deliberate, so it does not log a
+        // crash or try to re-attach while we are tearing down.
+        try { markShuttingDown(); } catch { /* older module shape */ }
         // Bounded: closeBrowser() can hang on a STALE CDP connection (Chrome
         // died — puppeteer waits up to protocolTimeout). Never wedge shutdown.
         await Promise.race([closeBrowser(), new Promise((r) => setTimeout(r, 5000))]);
