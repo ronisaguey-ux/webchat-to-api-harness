@@ -2,6 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
 const config = require('./config');
+const sandbox = require('./sandbox');
 
 // 08-14 WEDGE ROOT-CAUSE ceiling: tool RESULTS must never round-trip a huge
 // file through the chat tab (read_file on a 5.86MB state file → 6.2M-char
@@ -46,6 +47,8 @@ const TOOL_DEFINITIONS = [
             required: ['path'],
         },
         handler: async (args) => {
+            const sb = sandbox.denyResult(sandbox.checkPath(args.path));
+            if (sb) return sb;
             const content = fs.readFileSync(args.path, 'utf-8');
             // 08-14 WEDGE ROOT-CAUSE: read_file without maxLength returned the
             // FULL file (5.86MB cross_eval_state.json) into the tool-result
@@ -78,6 +81,8 @@ const TOOL_DEFINITIONS = [
             required: ['path', 'content'],
         },
         handler: async (args) => {
+            const sb = sandbox.denyResult(sandbox.checkPath(args.path));
+            if (sb) return sb;
             let oldContent = null;
             try {
                 oldContent = fs.readFileSync(args.path, 'utf-8');
@@ -116,6 +121,10 @@ const TOOL_DEFINITIONS = [
                             'run_bash is disabled. Set BASH_ALLOWED=true in .env to enable ' +
                             '(it executes webchat-model-controlled strings — read the README warning).',
                     });
+                }
+                const sbCheck = sandbox.checkCommand(args.command);
+                if (!sbCheck.ok) {
+                    return resolve({ success: false, error: sbCheck.error, sandbox: true });
                 }
                 const cmd = String(args.command || "");
                 // 08-14 DENY-BY-DEFAULT guard (owner directive): hard-block
@@ -225,6 +234,8 @@ const TOOL_DEFINITIONS = [
             required: ['path'],
         },
         handler: async (args) => {
+            const sb = sandbox.denyResult(sandbox.checkPath(args.path));
+            if (sb) return sb;
             const files = fs.readdirSync(args.path);
             return { success: true, files };
         },
