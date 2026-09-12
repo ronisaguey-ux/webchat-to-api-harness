@@ -614,7 +614,7 @@ async function typePrompt(text) {
     await page.evaluate((sels) => {
         for (const sel of sels) {
             const el = document.querySelector(sel);
-            if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return; }
+            if (el) { el.scrollIntoView({ block: 'center', inline: 'center' }); el.focus(); return; }
         }
     }, config.selectors.input);
     await sleep(400);
@@ -665,7 +665,7 @@ async function sendMessage(input, text) {
             await page.evaluate((sels) => {
                 for (const sel of sels) {
                     const el = document.querySelector(sel);
-                    if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return true; }
+                    if (el) { el.scrollIntoView({ block: 'center', inline: 'center' }); el.focus(); return true; }
                 }
                 return false;
             }, config.selectors.input);
@@ -749,7 +749,7 @@ async function sendMessage(input, text) {
                     await page.evaluate((sels) => {
                         for (const sel of sels) {
                             const el = document.querySelector(sel);
-                            if (el) { el.scrollIntoView({ block: 'center' }); return; }
+                            if (el) { el.scrollIntoView({ block: 'center', inline: 'center' }); return; }
                         }
                     }, config.selectors.send);
                     await sleep(300);
@@ -810,7 +810,32 @@ async function sendMessage(input, text) {
                         return null;
                     }, config.selectors.send);
                     if (!pos) throw new Error('send button vanished before click');
-                    await page.mouse.click(pos.x, pos.y);
+                    // 09-12 (owner screenshot): the prompt was typed and the send
+                    // button was never clicked. The button can be laid out
+                    // OFF-VIEWPORT — measured live on the DeepSeek composer, a
+                    // prompt sitting in the textarea with the send button at
+                    // x = -14 (left of the viewport). `scrollIntoView` above now
+                    // asks for inline centering, but a horizontal scroll does not
+                    // always take; a mouse click at a negative x lands nowhere and
+                    // the text just sits in the box. If the coordinates are still
+                    // outside the viewport, dispatch the click in-page instead —
+                    // it reaches the element regardless of layout.
+                    const vp = page.viewportSize() || { width: 0, height: 0 };
+                    const inView = pos.x >= 0 && pos.y >= 0 &&
+                                   pos.x <= vp.width && pos.y <= vp.height;
+                    if (inView) {
+                        await page.mouse.click(pos.x, pos.y);
+                    } else {
+                        console.log(`🖱 send button off-viewport (${Math.round(pos.x)},${Math.round(pos.y)}) — clicking in-page`);
+                        const clicked = await page.evaluate((sels) => {
+                            for (const sel of sels) {
+                                const el = document.querySelector(sel);
+                                if (el && el.getBoundingClientRect().width > 0) { el.click(); return true; }
+                            }
+                            return false;
+                        }, config.selectors.send);
+                        if (!clicked) throw new Error('send button could not be clicked (off-viewport)');
+                    }
                     return;
                 }
                 await page.keyboard.press('Enter');
