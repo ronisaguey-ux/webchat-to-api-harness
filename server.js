@@ -334,12 +334,25 @@ async function countedSend(msg, defs) {
     // above). DeepSeek rejected burst traffic with a hint-error that this
     // harness previously could not see — requests hung until timeout, the
     // client retried, and the retry storm deepened the limit.
-    const waitMs = lastSendAt + MIN_SEND_INTERVAL_MS - Date.now();
+    // 09-12 (owner): 30s minimum between EVERY deepseek send, ACROSS all lanes.
+    // `lastSendAt` is per-process, so three lane gateways each spaced themselves
+    // and still hit the account together. Use a shared timestamp file so every
+    // deepseek gateway honours the same gap.
+    const SHARED_SEND_FILE = process.env.SEND_SPACING_FILE || '/tmp/deepseek_last_send';
+    const sharedWaitMs = (() => {
+        if (!needsSingleThread()) return 0;
+        try {
+            const prev = parseInt(fs.readFileSync(SHARED_SEND_FILE, 'utf-8'), 10) || 0;
+            return Math.max(0, prev + MIN_SEND_INTERVAL_MS - Date.now());
+        } catch { return 0; }
+    })();
+    const waitMs = Math.max(0, lastSendAt + MIN_SEND_INTERVAL_MS - Date.now(), sharedWaitMs);
     if (waitMs > 0) {
-        console.log(`⏱ send gate: waiting ${waitMs}ms (account rate limit spacing)`);
+        console.log(`⏱ send gate: waiting ${waitMs}ms (account rate limit spacing, shared across lanes)`);
         await sleep(waitMs);
     }
     lastSendAt = Date.now();
+    try { fs.writeFileSync(SHARED_SEND_FILE, String(lastSendAt)); } catch { /* non-fatal */ }
     try {
         const r = await sendPrompt(msg, defs);
         lastReqBodyChars = await getReqBodyChars();
