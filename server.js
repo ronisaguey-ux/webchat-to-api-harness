@@ -252,7 +252,18 @@ const processStartAt = Date.now();
 // mkdir is atomic (one winner), a heartbeat keeps the mtime fresh so long
 // generations aren't stolen, and a 120s-stale steal frees the lock if a
 // gateway dies mid-hold. Non-deepseek gates (qwen/kimi/gemini) skip it.
-const DEEPSEEK_LOCK_DIR = '/tmp/deepseek_webchat_mutex';
+// 09-12 (owner): the mutex is per WEBCHAT ACCOUNT, not global. Making gemini
+// single-threaded via needsSingleThread() above accidentally put it behind the
+// SAME filesystem lock as the three deepseek gateways — so a wedged deepseek
+// send held the lock and gemini queued forever ('deepseek mutex: queued' in the
+// gemini log, then RemoteDisconnected to the engine). Derive the lock from the
+// webchat host: the three deepseek gateways still share one lock (one account),
+// gemini gets its own. The lock name is kept for compatibility with any tooling.
+const WEBCHAT_HOST = (() => {
+    try { return new URL(String(config.webchatUrl || '')).host.replace(/[^a-z0-9.]/gi, '_'); }
+    catch { return 'default'; }
+})();
+const DEEPSEEK_LOCK_DIR = process.env.WEBCHAT_LOCK_DIR || `/tmp/webchat_mutex_${WEBCHAT_HOST}`;
 const LOCK_STEAL_MS = 120000;
 const LOCK_HEARTBEAT_MS = 30000;
 const LOCK_ACQUIRE_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_LOCK_TIMEOUT_MS || '1800000', 10);
@@ -349,7 +360,7 @@ async function countedSend(msg, defs) {
     // `lastSendAt` is per-process, so three lane gateways each spaced themselves
     // and still hit the account together. Use a shared timestamp file so every
     // deepseek gateway honours the same gap.
-    const SHARED_SEND_FILE = process.env.SEND_SPACING_FILE || '/tmp/deepseek_last_send';
+    const SHARED_SEND_FILE = process.env.SEND_SPACING_FILE || `/tmp/webchat_last_send_${WEBCHAT_HOST}`;
     const sharedWaitMs = (() => {
         if (!needsSingleThread()) return 0;
         try {
