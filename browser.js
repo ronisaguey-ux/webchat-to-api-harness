@@ -220,7 +220,22 @@ async function ensureLivePage() {
     }
 }
 
+// Public entry: attach to the webchat tab, retrying ONCE if the page handle dies
+// mid-setup. The handle can go stale at any point (probe, waitForChatInput, CDP
+// session setup) and each site used to surface as its own 503 to the engine.
 async function connectToWebchat(webchatUrl) {
+    try {
+        return await connectToWebchatOnce(webchatUrl);
+    } catch (e) {
+        if (!isStaleHandleError(e)) throw e;
+        console.log(`♻️  connect failed on a dead handle (${String(e.message).slice(0, 60)}) — re-attaching and retrying once.`);
+        page = null;
+        await initBrowser({ reconnect: true });
+        return await connectToWebchatOnce(webchatUrl);
+    }
+}
+
+async function connectToWebchatOnce(webchatUrl) {
     if (!page) await initBrowser();
 
     // A cached `page` can outlive its frame: Chrome swaps the renderer (tab
