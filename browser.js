@@ -196,6 +196,30 @@ async function saveCookies() {
 //    In CDP mode, reuse the user's already-open tab matching
 //    the configured URL — no cookie dance at all.
 // ──────────────────────────────────────────────────────
+// A cached page handle can outlive its frame/renderer: Chrome discards the tab,
+// swaps the renderer, or the page navigates, and every call on the old handle
+// then throws "Attempted to use detached Frame" / "Target closed". Observed
+// 2026-09-12 — the gateway answered a good response, refreshed its CDP session,
+// then 503'd the next request with a dead handle and the engine burned a hop.
+const STALE_HANDLE_RE = /detached Frame|Session closed|Target closed|Cannot find context|Execution context was destroyed|Protocol error \(Runtime\.callFunctionOn\)/i;
+
+function isStaleHandleError(e) {
+    return STALE_HANDLE_RE.test(String(e && e.message ? e.message : e));
+}
+
+// Probe the cached page; on a dead handle, drop it and re-attach once.
+async function ensureLivePage() {
+    if (!page) return;
+    try {
+        await page.evaluate(() => 1);
+    } catch (e) {
+        if (!isStaleHandleError(e)) throw e;
+        console.log(`♻️  Stale page handle (${String(e.message).slice(0, 60)}) — re-attaching.`);
+        page = null;
+        await initBrowser({ reconnect: true });
+    }
+}
+
 async function connectToWebchat(webchatUrl) {
     if (!page) await initBrowser();
 
@@ -205,19 +229,7 @@ async function connectToWebchat(webchatUrl) {
     // gateway answered a good response, refreshed its CDP session, then 503'd the
     // next request with a detached frame and the engine burned a hop on it.
     // Probe first; on a stale handle, drop it and re-attach before doing work.
-    if (page) {
-        try {
-            await page.evaluate(() => 1);
-        } catch (e) {
-            if (/detached Frame|Session closed|Target closed|Cannot find context/i.test(String(e.message))) {
-                console.log(`♻️  Stale page handle (${String(e.message).slice(0, 60)}) — re-attaching.`);
-                page = null;
-                await initBrowser({ reconnect: true });
-            } else {
-                throw e;
-            }
-        }
-    }
+    await ensureLivePage();
 
     if (config.cdpWsUrl) {
         const pages = await browser.pages();
