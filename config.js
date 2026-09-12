@@ -85,6 +85,17 @@ const cfg = {
     execTimeoutMs: parseInt(process.env.EXEC_TIMEOUT_MS) || 10000,
     execMaxBuffer: 4 * 1024 * 1024,
 
+    // Sandbox (see sandbox.js). Every file path and every path-like token in a
+    // bash command must resolve inside one of these roots. Defaults to the
+    // oculus-relevant paths; override with a comma-separated SANDBOX_ROOTS.
+    sandbox: {
+        enabled: process.env.SANDBOX_ENABLED !== 'false',
+        roots: (process.env.SANDBOX_ROOTS || '')
+            .split(',').map((s) => s.trim()).filter(Boolean),
+        allowBash: process.env.SANDBOX_ALLOW_BASH === 'true',
+        log: process.env.SANDBOX_LOG !== 'false',
+    },
+
     // Session persistence
     cookieFile: process.env.COOKIE_FILE || '.cookies.json',
 

@@ -79,6 +79,41 @@ returned.
 Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 (placeholder). Custom tools = add entries to `TOOL_DEFINITIONS` in `tools.js`.
 
+## 🔒 Sandbox (path fence for every file tool)
+
+`read_file`, `write_file`, `list_dir` and `run_bash` all take paths that come
+from a webchat model's output. `sandbox.js` requires every one of them to resolve
+inside an explicit allowlist of roots.
+
+```bash
+SANDBOX_ENABLED=true            # default true
+SANDBOX_ROOTS=/home/roni/Roni_workspace/oculus,/home/roni/Roni_Workspace/audits_plans
+SANDBOX_ALLOW_BASH=false        # run_bash stays blocked even if BASH_ALLOWED=true
+SANDBOX_LOG=true                # log every denial to stderr
+```
+
+Defaults to the oculus-relevant paths. Adding a root is one comma-separated
+entry — no code change. Restart the gateway after editing `.env` (config is read
+once at process start).
+
+**How it resists escapes**
+
+- Paths are `realpath`-resolved **before** the prefix test, so `..` traversal and
+  symlinks pointing outside a root are both rejected.
+- A target that does not exist yet (`write_file`) is resolved against its nearest
+  existing ancestor, so `foo/../../etc/passwd` still fails.
+- The prefix test appends a separator, so `/root/oculus-evil` does **not** match
+  the root `/root/oculus`.
+- Bash is checked by extracting path-like tokens; any that resolve outside the
+  roots denies the whole command.
+
+**Caveat — this is a guardrail, not a jail.** It stops the realistic failure
+modes (a confused or prompt-injected model reaching for `~/.ssh` or `/etc`), and
+it is not a substitute for running the harness as an unprivileged user. Bash in
+particular is checked by token inspection, not by a kernel sandbox — a
+sufficiently creative command can still do things the token scan does not
+recognise. Keep `SANDBOX_ALLOW_BASH=false` unless you need it.
+
 ## ⚠️ Safety gates (read before enabling)
 
 1. **`run_bash` is disabled by default.** The webchat model's output is parsed
