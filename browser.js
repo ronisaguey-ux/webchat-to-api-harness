@@ -1478,6 +1478,14 @@ async function waitForResponse(before, typedText) {
     // (long cogitations on big tasks), keep waiting — bounded by the hard cap —
     // instead of throwing. A throw here is exactly what made webchat tasks
     // "stop mid task": the client saw an error while the tab was mid-thought.
+    // Seed the progress baseline from the CURRENT answer length. lastAnswerLen is
+    // -1 here (the main loop only sets it for 'vl' mode), so `grewNow` would be
+    // true for any non-empty answer and the loop extended to the full hard cap
+    // regardless — the stuck-send guard was a no-op (observed outstandingMs 383s).
+    try {
+        const seed = await snapshotChat();
+        lastAnswerLen = (seed.answer || '').length;
+    } catch { /* keep -1; the guard still fires once the answer is read */ }
     while (Date.now() < hardCap) {
         try {
             const tee = await readStreamedAnswer(teeStart);
