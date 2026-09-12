@@ -238,22 +238,14 @@ async function connectToWebchat(webchatUrl) {
 async function connectToWebchatOnce(webchatUrl) {
     if (!page) await initBrowser();
 
-    // ensureLivePage can null the page on a stale handle and the re-attach may
-    // not have produced a target yet; the CDP branch then dereferenced null and
-    // the gateway answered '503: connect failed: Cannot read properties of null
-    // (reading $)' (observed 2026-09-12).
+    // Probe first; on a stale handle, drop it and re-attach before doing work.
     await ensureLivePage();
-    if (!page) {
-        await initBrowser();
-        if (!page) throw new Error('no webchat page after re-attach');
-    }
 
     // A cached `page` can outlive its frame: Chrome swaps the renderer (tab
     // discarded, crash, or the page navigated) and every call on the old handle
     // throws "Attempted to use detached Frame '<id>'". Observed 2026-09-12 — the
     // gateway answered a good response, refreshed its CDP session, then 503'd the
     // next request with a detached frame and the engine burned a hop on it.
-    // (probe already ran above)
 
     if (config.cdpWsUrl) {
         const pages = await browser.pages();
