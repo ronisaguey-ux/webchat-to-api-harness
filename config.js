@@ -27,6 +27,10 @@ const cfg = {
     // instead of demanding fenced tool JSON — for personal threads whose model
     // talks like a friend. Tool calls still work when the model makes them.
     allowPlainText: process.env.ALLOW_PLAIN_TEXT === 'true',
+    // The caller supplies its own strict output contract in the system text and
+    // this gateway must not append a competing one. Set by the oculus step
+    // engine lane, whose contract is {"edits":[...]} — see server.js handleRequest.
+    passthroughFormat: process.env.PASSTHROUGH_FORMAT === 'true',
     headless: process.env.HEADLESS === 'true',
     modelName: process.env.MODEL_NAME || 'deepseek webchat',
     // 08-13 MULTI-SITE: env FIRST — chat.js carries a hardcoded 9224 URL, so

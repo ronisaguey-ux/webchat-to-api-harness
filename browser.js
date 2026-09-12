@@ -1197,7 +1197,14 @@ async function waitForResponse(before, typedText) {
     let deadline = Date.now() + config.timeout;
     // Absolute cap so a pathological never-ending stream can't hang the client
     // forever — activity may extend the deadline, but not past this.
-    const hardCap = deadline + config.timeout * 5;
+    //
+    // 09-12: this was deadline + timeout*5. With TIMEOUT=600000 that is 600s +
+    // 3000s = ONE HOUR, so a send whose reply never arrives wedged the gateway
+    // for an hour (observed outstandingMs 601339, and the engine timing out at
+    // its 420s lane budget every time). Cap the extension at one extra timeout
+    // instead: a stream that is still producing output gets up to 2x the budget,
+    // and one that is simply stuck fails fast so the caller can retry.
+    const hardCap = deadline + config.timeout;
     let lastLen = -1; // forces at least two polls before accepting
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
@@ -1486,6 +1493,14 @@ async function openNewChatAndSeed(text) {
 //    chars so huge tool schemas don't eat the chat's context.
 // ──────────────────────────────────────────────────────
 function buildFullPrompt(userPrompt, toolDefinitions) {
+    // PASSTHROUGH_FORMAT: the caller supplied a complete contract (the oculus
+    // step engine's {"edits":[...]}). This builder must add NOTHING — it used to
+    // prepend the tool schema and append the REMINDER demanding a fenced
+    // tool-call JSON or submit_answer, a competing schema stacked on the
+    // caller's. Verified live: the composer carried exactly that block while the
+    // caller's contract was supposed to be the only instruction.
+    if (config.passthroughFormat) return userPrompt;
+
     let fullPrompt = '';
 
     if (toolDefinitions && toolDefinitions.length > 0) {
