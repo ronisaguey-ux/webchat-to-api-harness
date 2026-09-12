@@ -1489,11 +1489,23 @@ async function waitForResponse(before, typedText) {
             // 08-13: never rescue while a generation is still running — the
             // newest row may be a stale previous answer or a stream fragment
             // (observed: the 20197-char gemini request rescued a 22-char row).
+            // 09-12: only extend while the tab is actually PRODUCING new text.
+            // isGenerating() alone stays true on a wedged tab, so the loop used
+            // to hold the send for the full hard cap (~480s) with nothing
+            // arriving — and because sends are serialized, that blocked the lane
+            // for 8 minutes at a time (observed outstandingMs 429-474s, repeatedly,
+            // while the engine's own lane budget is 280s). Track progress instead.
             const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
-            if (busyNow) {
+            const grewNow = (last.answer || '').length > lastAnswerLen;
+            if (busyNow && grewNow) {
+                lastAnswerLen = (last.answer || '').length;
                 console.log('⏱ still generating past the deadline — extending (bounded by hard cap)');
                 await sleep(1500);
                 continue;
+            }
+            if (busyNow && !grewNow) {
+                console.log('⏱ tab reports busy but produced no new text — giving up (stuck send)');
+                break;
             }
             const ans = (last.answer || '').trim();
             if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans) && !/^You have access to the tools below/.test(ans)) {
