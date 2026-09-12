@@ -27,6 +27,10 @@ const cfg = {
     // instead of demanding fenced tool JSON — for personal threads whose model
     // talks like a friend. Tool calls still work when the model makes them.
     allowPlainText: process.env.ALLOW_PLAIN_TEXT === 'true',
+    // 09-12 (owner): the "send a 💬 line before every work tool call" rule is a
+    // legacy harness feature for when the owner drives a chat himself. Off by
+    // default for autonomous runs; set NARRATION=true to get it back.
+    narration: process.env.NARRATION === 'true',
     // The caller supplies its own strict output contract in the system text and
     // this gateway must not append a competing one. Set by the oculus step
     // engine lane, whose contract is {"edits":[...]} — see server.js handleRequest.

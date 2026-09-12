@@ -634,13 +634,19 @@ const CONV_PREAMBLE =
 const CONV_FORMAT =
     '### RESPONSE INSTRUCTIONS (STRICT)\n' +
     '1. GREETINGS & CONVERSATION: If the user says hello, asks a conversational question, or gives a non-tool message (e.g. "yo", "yo u there", "how are you"), reply directly in friendly, concise plain text. Do NOT execute any tools for greetings.\n' +
-    '2. TOOL ACTIONS (MANDATORY NARRATION BEFORE TOOL):\n' +
-    '   When the user asks for a task that requires tools (reading files, executing bash commands, searching, editing):\n' +
-    '   You MUST start your response with one clear 💬 explanation line describing what you are about to do and why, followed immediately by your tool call in a code fence:\n' +
-    '   <One clear sentence explaining the tool action you are about to take>\n' +
-    '   ```json\n' +
-    '   {"tool":"<name>","params":{...}}\n' +
-    '   ```\n' +
+    (config.narration
+        ? '2. TOOL ACTIONS (MANDATORY NARRATION BEFORE TOOL):\n' +
+          '   When the user asks for a task that requires tools (reading files, executing bash commands, searching, editing):\n' +
+          '   You MUST start your response with one clear 💬 explanation line describing what you are about to do and why, followed immediately by your tool call in a code fence:\n' +
+          '   <One clear sentence explaining the tool action you are about to take>\n' +
+          '   ```json\n' +
+          '   {"tool":"<name>","params":{...}}\n' +
+          '   ```\n'
+        : '2. TOOL ACTIONS (NO NARRATION — 09-12 owner rule):\n' +
+          '   When the user asks for a task that requires tools, emit the tool call directly in a code fence. Do NOT send a 💬 line first, do NOT announce what you are about to do. Act:\n' +
+          '   ```json\n' +
+          '   {"tool":"<name>","params":{...}}\n' +
+          '   ```\n') +
     '3. COMPLETION: When the task is complete and verified, deliver your final summary in plain text or via submit_answer.\n';
 
 // ── Always-tool mode (user directive 08-12) ─────────────────────────────
@@ -933,6 +939,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // one extra round max; the call itself is not lost, the model
             // re-sends it after the send_message.)
             if (
+                config.narration &&
                 !config.allowPlainText &&
                 !parsed.prose &&
                 call.toolName !== SUBMIT_TOOL &&
