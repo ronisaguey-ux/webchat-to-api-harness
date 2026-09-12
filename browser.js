@@ -1299,7 +1299,11 @@ async function waitForResponse(before, typedText) {
     // its 420s lane budget every time). Cap the extension at one extra timeout
     // instead: a stream that is still producing output gets up to 2x the budget,
     // and one that is simply stuck fails fast so the caller can retry.
-    const hardCap = deadline + config.timeout;
+    // 09-12: allow the extension to be tuned. A genuinely stuck send must fail
+    // fast so the engine can hop to another lane, instead of holding the whole
+    // gateway for 2x the timeout (observed outstandingMs 360-373s repeatedly).
+    const hardCapMs = parseInt(process.env.HARD_CAP_MS) || (deadline + config.timeout);
+    const hardCap = Math.max(deadline, hardCapMs);
     let lastLen = -1; // forces at least two polls before accepting
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
