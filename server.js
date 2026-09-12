@@ -226,7 +226,18 @@ function formatToolResultView(call, result, cap) {
 // consumers (user client + orchestrator) hammering the same account made
 // requests hang at "Waiting for response...". Sends are spaced by this many
 // ms (queued, not rejected) so the account never sees a burst from us.
+// 09-12 (owner): a FIXED gap is itself a bot signature. Pick a fresh random
+// delay in [MIN, MAX] for EVERY send, on EVERY lane, so the cadence never
+// repeats. MIN_SEND_INTERVAL_MS stays as the floor for backwards compatibility;
+// SEND_GAP_MIN_MS / SEND_GAP_MAX_MS set the range (default 20s-80s).
 const MIN_SEND_INTERVAL_MS = parseInt(process.env.MIN_SEND_INTERVAL_MS || '6000', 10);
+const SEND_GAP_MIN_MS = parseInt(process.env.SEND_GAP_MIN_MS || '20000', 10);
+const SEND_GAP_MAX_MS = parseInt(process.env.SEND_GAP_MAX_MS || '80000', 10);
+function nextSendGapMs() {
+    const lo = Math.max(0, Math.min(SEND_GAP_MIN_MS, SEND_GAP_MAX_MS));
+    const hi = Math.max(lo, SEND_GAP_MAX_MS);
+    return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
 let lastSendAt = 0;
 // Process lifetime anchor for the /health wedge check. lastSendAt starts at 0, so
 // without this an idle gateway computes Date.now() - 0 and reports wedged:true.
@@ -346,9 +357,10 @@ async function countedSend(msg, defs) {
             return Math.max(0, prev + MIN_SEND_INTERVAL_MS - Date.now());
         } catch { return 0; }
     })();
-    const waitMs = Math.max(0, lastSendAt + MIN_SEND_INTERVAL_MS - Date.now(), sharedWaitMs);
+    const gap = nextSendGapMs();
+    const waitMs = Math.max(0, lastSendAt + gap - Date.now(), sharedWaitMs);
     if (waitMs > 0) {
-        console.log(`⏱ send gate: waiting ${waitMs}ms (account rate limit spacing, shared across lanes)`);
+        console.log(`⏱ send gate: waiting ${waitMs}ms (random ${gap}ms gap this send, shared across lanes)`);
         await sleep(waitMs);
     }
     lastSendAt = Date.now();
