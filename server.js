@@ -1486,13 +1486,21 @@ app.get('/health', (req, res) => {
     // threshold guillotined healthy in-flight calls every 2 minutes (observed
     // 2026-09-11 — the client saw RemoteDisconnected mid-request). Derive it from
     // the configured timeout plus a queue margin instead of hardcoding.
-    const wedgeThresholdMs = (config.timeout || 300000) + 30000;
+    //
+    // 2026-09-12 (owner): `timeout + 30s` was still too eager — a slow webchat
+    // reply is NOT a wedge, and restarting it mid-cogitation throws away the
+    // work in progress. Default is now 3x the timeout, and WEDGE_THRESHOLD_MS
+    // overrides it outright. A real wedge (dead tab, never answering) still
+    // gets caught, just after the call has had a fair chance to finish.
+    const wedgeThresholdMs =
+        parseInt(process.env.WEDGE_THRESHOLD_MS) || (config.timeout || 300000) * 3;
     const wedged = busySince > wedgeThresholdMs;
     res.status(alive && !wedged ? 200 : 503).json({
         ok: alive && !wedged,
         browserAlive: alive,
         wedged,
         outstandingMs: busySince,
+        wedgeThresholdMs,
     });
 });
 
