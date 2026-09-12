@@ -64,7 +64,14 @@ async function initBrowser({ reconnect = false } = {}) {
     if (reconnect && browser) {
         // A long-lived CDP session can go stale (evaluates hang while fresh
         // sessions work). Detach and attach again — cheap (~50ms).
+        //
+        // This is a DELIBERATE disconnect: tell the guard so it does not report
+        // a crash for our own stale-session refresh (observed 2026-09-12 — every
+        // send logged "Browser disconnected unexpectedly" right after a good
+        // response, because this path fires the same 'disconnected' event).
+        detachingOnPurpose = true;
         try { await browser.disconnect(); } catch {}
+        detachingOnPurpose = false;
         browser = null;
         page = null;
         console.log('🔌 Reconnecting CDP session (stale session refresh).');
@@ -132,6 +139,7 @@ async function initBrowser({ reconnect = false } = {}) {
 //     NOT trigger a reconnect, and a crash must not spin.
 // ──────────────────────────────────────────────────────
 let shuttingDown = false;
+let detachingOnPurpose = false;
 let disconnectHandled = false;
 
 function markShuttingDown() {
@@ -144,8 +152,8 @@ function attachDisconnectGuard() {
     browser.once('disconnected', () => {
         if (disconnectHandled) return; // single-flight: the event can fire twice
         disconnectHandled = true;
-        if (shuttingDown) {
-            console.log('🔌 Browser disconnected (intentional shutdown).');
+        if (shuttingDown || detachingOnPurpose) {
+            console.log('🔌 Browser disconnected (intentional — shutdown or stale-session refresh).');
             return;
         }
         // Every Page/ElementHandle/CDP session is now invalid — drop them so the
