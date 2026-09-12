@@ -9,6 +9,14 @@ const sandbox = require('./sandbox');
 // prompt → tab choked, gateway wedged). See read_file handler.
 const MAX_READ_FILE_CHARS = parseInt(process.env.MAX_READ_FILE_CHARS || '200000', 10);
 
+// 09-12 (owner): "give them the tool call to see_next_chunk whenever output of
+// any tool call is truncated". A truncated read used to be a dead end — the
+// model saw `truncated:true` and either guessed at the missing lines or gave up
+// with a cannot-fix. Remember where each read stopped so see_next_chunk can
+// hand back the NEXT window instead of re-sending the same head.
+const lastChunkEnd = new Map();
+const CHUNK_CHARS = parseInt(process.env.CHUNK_CHARS || '20000', 10);
+
 // Small read-only command runner (git_status). Captures stdout/stderr with a
 // hard timeout — never used for interactive or long-running commands.
 function runCmd(argv, timeoutMs = 8000) {
@@ -58,14 +66,58 @@ const TOOL_DEFINITIONS = [
             // round-trip through the tab, and explicit maxLength is clamped too.
             const limit = Math.min(args.maxLength || MAX_READ_FILE_CHARS, MAX_READ_FILE_CHARS);
             if (content.length > limit) {
+                lastChunkEnd.set(args.path, limit);
                 return {
                     success: true,
                     truncated: true,
                     totalLength: content.length,
                     content: content.slice(0, limit),
+                    nextChunk: `Output truncated at ${limit} of ${content.length} chars. Call see_next_chunk with {"path":"${args.path}"} to read the next ${CHUNK_CHARS} chars, and keep calling it until you have the lines you need.`,
                 };
             }
+            lastChunkEnd.set(args.path, content.length);
             return { success: true, content };
+        },
+    },
+    {
+        // 09-12 (owner): the follow-up call for ANY truncated output. read_file
+        // now answers a capped read with `nextChunk` naming this tool, so the
+        // model has a real way to continue instead of guessing at the missing
+        // lines or returning a cannot-fix. Calling it with no args continues
+        // from where the last read of that file stopped.
+        name: 'see_next_chunk',
+        category: 'file',
+        description: 'Read the NEXT chunk of a file whose output was truncated. Call this whenever a tool result says truncated:true / "output truncated" — repeat until you have the lines you need. With no offset it continues from where the last read stopped.',
+        parameters: {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: 'File path to continue reading' },
+                offset: { type: 'integer', description: 'Optional character offset to start at; defaults to where the last read stopped' },
+                length: { type: 'integer', description: `Optional number of characters to return (default ${CHUNK_CHARS})` },
+            },
+            required: ['path'],
+        },
+        handler: async (args) => {
+            const sb = sandbox.denyResult(sandbox.checkPath(args.path));
+            if (sb) return sb;
+            const content = fs.readFileSync(args.path, 'utf-8');
+            const start = Number.isInteger(args.offset) ? Math.max(0, args.offset) : (lastChunkEnd.get(args.path) || 0);
+            const len = Math.min(args.length || CHUNK_CHARS, MAX_READ_FILE_CHARS);
+            if (start >= content.length) {
+                return { success: true, truncated: false, content: '', message: `End of ${args.path} (${content.length} chars). Nothing left to read.` };
+            }
+            const end = Math.min(content.length, start + len);
+            lastChunkEnd.set(args.path, end);
+            const more = end < content.length;
+            return {
+                success: true,
+                truncated: more,
+                offset: start,
+                end,
+                totalLength: content.length,
+                content: content.slice(start, end),
+                ...(more ? { nextChunk: `Call see_next_chunk with {"path":"${args.path}"} for the next ${CHUNK_CHARS} chars (at ${end} of ${content.length}).` } : {}),
+            };
         },
     },
     {
