@@ -103,21 +103,60 @@ async function initBrowser({ reconnect = false } = {}) {
             protocolTimeout: 240000, // tab can cogitate for minutes before answering
         });
         console.log('✅ Attached to existing browser.');
+        attachDisconnectGuard();
         return;
     }
 
     console.log('🚀 Launching browser...');
+    // detached:true puts Chromium in its own process group so a crash can be
+    // reaped with kill(-pid) — orphaned renderer/GPU/zygote children otherwise
+    // accumulate as zombies (documented Puppeteer-in-container failure mode).
     browser = await puppeteer.launch({
         headless: config.headless,
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
         defaultViewport: { width: 1280, height: 800 },
+        detached: true,
     });
+    attachDisconnectGuard();
     page = await browser.newPage();
     await page.setUserAgent(
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
     console.log('✅ Browser ready.');
 }
+
+// ──────────────────────────────────────────────────────
+// 1b. DISCONNECT GUARD (research: the #1 production Puppeteer failure)
+//     'disconnected' cannot tell you WHY the browser went away, so track intent
+//     ourselves: a deliberate disconnect (shutdown / stale-session refresh) must
+//     NOT trigger a reconnect, and a crash must not spin.
+// ──────────────────────────────────────────────────────
+let shuttingDown = false;
+let disconnectHandled = false;
+
+function markShuttingDown() {
+    shuttingDown = true;
+}
+
+function attachDisconnectGuard() {
+    if (!browser || typeof browser.on !== 'function') return;
+    disconnectHandled = false;
+    browser.once('disconnected', () => {
+        if (disconnectHandled) return; // single-flight: the event can fire twice
+        disconnectHandled = true;
+        if (shuttingDown) {
+            console.log('🔌 Browser disconnected (intentional shutdown).');
+            return;
+        }
+        // Every Page/ElementHandle/CDP session is now invalid — drop them so the
+        // next request re-attaches instead of failing with "Target does not
+        // belong to session" on stale handles.
+        console.error('⚠️  Browser disconnected unexpectedly — clearing page handles.');
+        page = null;
+        browser = null;
+    });
+}
+
 
 // ──────────────────────────────────────────────────────
 // 2. SESSION PERSISTENCE (cookies)
@@ -1579,6 +1618,7 @@ async function firstMatch(selectors) {
 module.exports = {
     initBrowser,
     browserAlive,
+    markShuttingDown,
     connectToWebchat,
     sendPrompt,
     closeBrowser,
