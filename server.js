@@ -252,8 +252,18 @@ function usesDeepSeek() {
     return /chat\.deepseek\.com/.test(String(config.webchatUrl || ''));
 }
 
+// 09-12 (owner): gemini is a webchat too and must be SINGLE-THREADED — no
+// concurrency over the tab. The engine runs EXEC_WORKERS>1, so two step workers
+// could hit the same tab at once; the log showed overlapping "Sending prompt"
+// lines and the tab then cogitated for minutes. Serialize every webchat tab, not
+// just deepseek.
+function needsSingleThread() {
+    const url = String(config.webchatUrl || '');
+    return /chat\.deepseek\.com|gemini\.google\.com/.test(url);
+}
+
 async function acquireDeepSeekLock() {
-    if (!usesDeepSeek()) return;
+    if (!needsSingleThread()) return;
     // Reentrant: context-handoff / retry flows send nested messages from
     // within an already-locked request (same process) — depth-count them.
     if (lockDepth > 0) { lockDepth++; return; }
