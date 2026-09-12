@@ -1808,6 +1808,28 @@ app.post('/v1/messages', async (req, res) => {
 });
 
 // ── Manual connect / reconnect ──
+// Reset the webchat thread: open a FRESH chat in the same tab.
+//
+// 09-12 (owner sleep shift): gemini's tab accumulates an unbounded conversation,
+// and once the thread is long even a 4500-char prompt hangs for ~6 min
+// (observed repeatedly: outstandingMs climbing to 300-370s with no reply, the
+// engine stalling on it). The engine's context lives in ITS prompt, not in the
+// tab, so dropping the tab's history costs nothing and clears the hang.
+app.post('/newchat', async (req, res) => {
+    try {
+        const pg = getPage();
+        if (!pg || pg.isClosed()) {
+            return res.status(503).json({ error: 'no live webchat page — POST /connect first' });
+        }
+        await openNewChat();
+        console.log('🆕 /newchat — fresh thread opened');
+        res.json({ ok: true, message: 'fresh chat opened', page: getPage() ? getPage().url() : null });
+    } catch (e) {
+        console.log('⚠️ /newchat failed:', String(e.message).slice(0, 90));
+        res.status(500).json({ error: String(e.message) });
+    }
+});
+
 app.post('/connect', async (req, res) => {
     try {
         await ensureConnected();
