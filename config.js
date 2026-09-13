@@ -110,7 +110,11 @@ const cfg = {
     timeout: MC.pickNum('TIMEOUT', 'limits', 'timeoutMs') || 1800000, // 08-13 EVENING: run-until-done tasks + 6s send spacing + narration exceed 180s routinely; the 180s cap timed out mid-task and its crash path killed the process (now guarded). 08-14: 10 min still too short — the webchat cogitated SILENTLY 11 min on 'add EVERYTHING' (08-13 22:5x) and BOTH the gateway timeout and the client stream-idle watchdog fired. 30 min default; the SSE keepalive (server.js) keeps clients alive through it.
     toolContextWindow: MC.pickNum('TOOL_CONTEXT_WINDOW', 'limits', 'toolContextWindow') || 30000, // Claude Code's tool list + schemas is ~20K chars
     loginWaitMs: (MC.pickNum('LOGIN_WAIT_SECONDS', 'webchat', 'loginWaitSeconds') || 300) * 1000,
-    maxToolRounds: MC.pickNum('MAX_TOOL_ROUNDS', 'limits', 'maxToolRounds') || 40, // always-tool mode: feature work spans many rounds; yap-rejections burn 1-2 rounds per tool call (08-12: 20 ran out mid-task at read_file(App.jsx))
+    maxToolRounds: MC.pickNum('MAX_TOOL_ROUNDS', 'limits', 'maxToolRounds') || 40,
+    // 09-13: how many rounds BEFORE maxToolRounds the harness stops the model and
+    // demands its final answer, so running out of rounds yields a summary instead
+    // of an error. Configurable in harness.config.json (limits.wrapUpRounds).
+    wrapUpRounds: MC.pickNum('WRAP_UP_ROUNDS', 'limits', 'wrapUpRounds') || 3, // always-tool mode: feature work spans many rounds; yap-rejections burn 1-2 rounds per tool call (08-12: 20 ran out mid-task at read_file(App.jsx))
     skipBrowser: MC.pickBool('SKIP_BROWSER', 'features', 'skipBrowser') === true,
 
     // Security

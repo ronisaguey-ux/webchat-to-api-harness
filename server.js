@@ -929,7 +929,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // all the work the model had done. Spend the LAST few rounds asking for
         // the summary instead: the model has a complete task at this point, it
         // only needs to be told to stop working and report.
-        if (!wrapUpSent && round >= config.maxToolRounds - 3) {
+        if (!wrapUpSent && round >= config.maxToolRounds - Math.max(1, config.wrapUpRounds)) {
             wrapUpSent = true;
             console.log(`⏳ round budget nearly spent (${round}/${config.maxToolRounds}) — demanding the final submit_answer`);
             onProgress?.({ type: 'rejected', text: 'round budget nearly spent — demanding the final answer now' });
