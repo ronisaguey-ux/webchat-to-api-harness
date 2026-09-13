@@ -44,6 +44,9 @@ a webchat session you own, with tool-call support (read/write files, bash, …).
   override. No username, no drive letter, nothing machine-specific.
 - **Webchat-mode quirks** — per-site behaviour for the composer clear, the
   submit path, empty phantom rows and busy detection, driven by the mode.
+- **Rate-limit cooldown** — a webchat that answers "Messages too frequent" is
+  put on a 15-minute cooldown and callers get `429` + `Retry-After` instead of
+  retrying into the throttle.
 - **Anti-spiral** *(experimental, off by default)* — detects a reasoning loop,
   redirects the model back to the task, and puts a warning at the top of the
   answer if it loops again. Narration-aware.
@@ -235,6 +238,8 @@ Run the harness as a user whose files you are willing to lose.
 | `HARNESS_CONFIG` | `./harness.config.json` | path to a different master config file |
 | `HANDOFF_FILE` | `<workspace>/handoff_to_new_chat.md` | where the handoff document is written |
 | `WORKSPACE_ROOT` | the harness's parent directory | base for every default path (audits, handoff, sibling repos) |
+| `RATE_LIMIT_COOLDOWN_S` | `900` | seconds to cool a webchat after a "Messages too frequent" throttle |
+| `RATE_LIMIT_GUARD` | `true` | set `false` to disable the rate-limit detector |
 | `ANTI_SPIRAL` | `false` | `true` enables reasoning-loop detection (see below) |
 | `ANTI_SPIRAL_MIN_WORDS` | `40` | don't judge a reply shorter than this |
 | `NARRATION` | `false` | `true` lets the model narrate; also relaxes anti-spiral so narration is never mistaken for a loop |
@@ -331,6 +336,33 @@ Point `HARNESS_CONFIG` at a different file to use a second config.
 
 An empty string (or `""`) in the file means "not configured" and falls back to
 the default — it never blanks out a real value.
+
+## ⏳ Rate-limit cooldown
+
+A webchat account throttles you for sending too fast and answers with
+**"Messages too frequent. Try again later."** (DeepSeek; `finish_reason:
+rate_limit`). The harness used to read that as a normal empty reply, so the
+caller retried immediately, got throttled again, and burned its whole round
+budget on a lane that could not answer.
+
+Now the gateway:
+
+1. **detects** the throttle notice in a reply — or in a thrown send error,
+2. puts **that account** on a flat cooldown (`RATE_LIMIT_COOLDOWN_S`, default
+   **900s = 15 min**), and
+3. answers **`429` + `Retry-After`** while the cooldown is in force, so a caller
+   fails fast and moves to another lane instead of hanging.
+
+The cooldown is per **account** (the same lock key the gateway already uses), so
+the DeepSeek accounts never cool each other. It is persisted to a small JSON file
+in `RATE_LIMIT_STATE_DIR` (default `/tmp`), so a gateway restart does not forget
+a live throttle. A real answer clears it.
+
+Detection is deliberately tight: only the notice's own words
+(`messages too frequent`, `too many requests`, `rate_limit_reached`,
+`free_rate_limited`, `发送太频繁`), only in the first 160 characters, and only in
+a reply under 300 characters. A loose `/rate limit/i` matched a genuine answer
+about rate-limiting middleware, which is why it is anchored.
 
 ## 🧪 EXPERIMENTAL — Anti-spiral (`ANTI_SPIRAL=true`)
 

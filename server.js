@@ -28,6 +28,7 @@ const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanPro
 // telegram responder skips "to"-tagged items (they are gateway-routed).
 const PATHS = require('./paths');
 const ANTI_SPIRAL = require('./anti_spiral');
+const RATE_LIMIT = require('./rate_limit');
 const MAIN_REPLY_FILE = PATHS.mainReplyFile();
 const MAIN_REPLY_SEEN_FILE = PATHS.mainReplySeenFile(process.env.PORT);
 let mainReplyLastSeen = '';
@@ -1631,9 +1632,52 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         const toolDefs = buildExecutableToolDefs();
 
+        // 09-13: if this account is cooling from a "Messages too frequent"
+        // throttle, answer 429 immediately with Retry-After instead of sending
+        // into the throttle. A caller that retries into it burns its whole round
+        // budget on a lane that cannot answer; a fast 429 lets it move on.
+        if (RATE_LIMIT.enabled()) {
+            const cool = RATE_LIMIT.remainingMs(process.env.WEBCHAT_ACCOUNT || process.env.PORT);
+            if (cool > 0) {
+                const secs = Math.ceil(cool / 1000);
+                console.log(`⏳ rate-limit cooldown: ${secs}s left — answering 429`);
+                res.set('Retry-After', String(secs));
+                return res.status(429).json({
+                    error: {
+                        message: `Webchat account throttled ("Messages too frequent"). Retry in ${secs}s.`,
+                        type: 'rate_limit_error',
+                        code: 'webchat_rate_limited',
+                        retry_after_seconds: secs,
+                    },
+                });
+            }
+        }
+
         const text = await enqueue(() =>
             handleRequest(systemMessage?.content || '', prompt, toolDefs)
         );
+
+        // 09-13: the webchat can answer the throttle notice as its REPLY (a 200
+        // with the text). Detect it, start the cooldown, and surface a 429 so the
+        // caller knows this was a throttle and not an empty answer.
+        if (RATE_LIMIT.enabled() && RATE_LIMIT.isRateLimitText(text)) {
+            const { seconds } = RATE_LIMIT.startCooldown(
+                process.env.WEBCHAT_ACCOUNT || process.env.PORT,
+                config.rateLimitCooldownSeconds,
+            );
+            console.log(`🛑 webchat rate limit — cooling this account ${seconds}s`);
+            res.set('Retry-After', String(seconds));
+            return res.status(429).json({
+                error: {
+                    message: `Webchat account throttled ("Messages too frequent"). Retry in ${seconds}s.`,
+                    type: 'rate_limit_error',
+                    code: 'webchat_rate_limited',
+                    retry_after_seconds: seconds,
+                },
+            });
+        }
+        // a real answer clears any stale cooldown
+        if (RATE_LIMIT.enabled()) RATE_LIMIT.clearCooldown(process.env.WEBCHAT_ACCOUNT || process.env.PORT);
 
         res.json({
             id: 'chatcmpl_' + Math.random().toString(36).slice(2, 12),
