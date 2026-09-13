@@ -3,6 +3,30 @@ require('dotenv').config();
 // Master config (harness.config.json): env var > this file > the default below.
 // Turn features on/off and set their values in that one file.
 const MC = require('./master_config');
+
+// ── Webchat mode ───────────────────────────────────────────────────────────
+// Different webchats need different selectors and submit behaviour. A mode
+// supplies them; anything set explicitly (env or the top-level keys) still wins.
+const MODES = (MC.raw.webchatModes && typeof MC.raw.webchatModes === 'object') ? MC.raw.webchatModes : {};
+const MODE_NAME = MC.pickStr('WEBCHAT_MODE', 'webchat', 'mode') || 'generic';
+const MODE = (MODES[MODE_NAME] && typeof MODES[MODE_NAME] === 'object') ? MODES[MODE_NAME] : {};
+if (!MODES[MODE_NAME]) {
+    console.warn(`⚠️ unknown webchat.mode "${MODE_NAME}" — falling back to generic. ` +
+        `Known modes: ${Object.keys(MODES).join(', ') || '(none configured)'}`);
+}
+const modeSel = (MODE.selectors && typeof MODE.selectors === 'object') ? MODE.selectors : {};
+const modeQuirks = (MODE.quirks && typeof MODE.quirks === 'object') ? MODE.quirks : {};
+
+// ── System prompt ──────────────────────────────────────────────────────────
+// perMode[mode] > text > the harness's built-in prompt ('' = built-in).
+const SP = (MC.raw.systemPrompt && typeof MC.raw.systemPrompt === 'object') ? MC.raw.systemPrompt : {};
+const SP_PER = (SP.perMode && typeof SP.perMode === 'object') ? SP.perMode : {};
+const SYSTEM_PROMPT = String(
+    (process.env.SYSTEM_PROMPT)
+    || (SP_PER[MODE_NAME] && String(SP_PER[MODE_NAME]).trim())
+    || (SP.text && String(SP.text).trim())
+    || ''
+);
 const env = (n) => process.env[n];  // kept for readability at the call sites
 
 // chat.js overrides (paste your tab URL there — it wins over .env)
@@ -21,13 +45,14 @@ const cfg = {
     // Webchat target — WEBCHAT_URL_OVERRIDE=true lets a second instance
     // (different PORT) pin its own thread even though chat.js exists
     // (chat.js normally wins). Multi-instance pattern 08-12.
-    webchatUrl: process.env.WEBCHAT_URL_OVERRIDE === 'true'
-        ? process.env.WEBCHAT_URL
-        : (chat.url || process.env.WEBCHAT_URL || 'https://chat.deepseek.com'),
+    webchatMode: MODE_NAME,
+    webchatUrl: MC.pickBool('WEBCHAT_URL_OVERRIDE', 'webchat', 'urlOverride') === true
+        ? (MC.pickStr('WEBCHAT_URL', 'webchat', 'url') || MODE.url || 'https://chat.deepseek.com')
+        : (chat.url || MC.pickStr('WEBCHAT_URL', 'webchat', 'url') || MODE.url || 'https://chat.deepseek.com'),
     // Second-instance tab matching: when set, pick the tab whose URL CONTAINS
     // this substring instead of first-tab-with-matching-origin — lets two
     // instances share one browser, each pinned to its own thread.
-    tabUrlSubstring: MC.pickStr('TAB_URL_SUBSTRING', 'webchat', 'tabUrlSubstring') || null,
+    tabUrlSubstring: MC.pickStr('TAB_URL_SUBSTRING', 'webchat', 'tabUrlSubstring') || MODE.tabUrlSubstring || null,
     // Conversation mode (08-12): accept plain-text replies as the final answer
     // instead of demanding fenced tool JSON — for personal threads whose model
     // talks like a friend. Tool calls still work when the model makes them.
@@ -104,6 +129,12 @@ const cfg = {
         log: process.env.SANDBOX_LOG !== 'false',
     },
 
+    // 09-13: webchat-specific behaviour from the selected mode (see
+    // harness.config.json → webchatModes). Empty object for "generic".
+    quirks: modeQuirks,
+    // The system prompt the caller wants sent; '' means "use the built-in".
+    systemPrompt: SYSTEM_PROMPT,
+
     // 09-13 EXPERIMENTAL — reasoning-loop detection. Off by default; see the
     // README "Anti-spiral" section. NARRATION=true also relaxes the detector so
     // narration is never mistaken for a loop.
@@ -115,11 +146,16 @@ const cfg = {
     // Selectors (comma-separated, first match wins). Override via env when
     // a webchat UI changes.
     selectors: {
-        input: (process.env.SELECTOR_INPUT || 'textarea, div[contenteditable="true"]')
+        // env SELECTOR_INPUT > harness.config.json webchat.selectors.input >
+        // the selected mode's input > the built-in default.
+        input: (process.env.SELECTOR_INPUT
+            || (MC.raw.webchat && MC.raw.webchat.selectors && MC.raw.webchat.selectors.input)
+            || modeSel.input
+            || 'textarea, div[contenteditable="true"]')
             .split(',').map((s) => s.trim()).filter(Boolean),
-        send: (process.env.SELECTOR_SEND || 'button[aria-label="Send message"], button[aria-label*="Send" i], div[role="button"].ds-button--primary, div[role="button"].ds-button--filled, button[type="submit"], .send-button, [data-testid="send-button"]')
+        send: ((MC.raw.webchat && MC.raw.webchat.selectors && MC.raw.webchat.selectors.send) || modeSel.send || 'button[aria-label="Send message"], button[aria-label*="Send" i], div[role="button"].ds-button--primary, div[role="button"].ds-button--filled, button[type="submit"], .send-button, [data-testid="send-button"]')
             .split(',').map((s) => s.trim()).filter(Boolean),
-        message: (process.env.SELECTOR_MESSAGE || 'model-response, [data-message-author-role="model"], .model-response-text, .response, .ds-markdown, .message, .chat-message')
+        message: ((MC.raw.webchat && MC.raw.webchat.selectors && MC.raw.webchat.selectors.message) || modeSel.message || 'model-response, [data-message-author-role="model"], .model-response-text, .response, .ds-markdown, .message, .chat-message')
             .split(',').map((s) => s.trim()).filter(Boolean),
     },
 };

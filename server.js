@@ -1772,12 +1772,18 @@ app.post('/v1/messages', async (req, res) => {
             }
         }
 
-        const systemText =
+        // 09-13: harness.config.json → systemPrompt. perMode[mode] > text > ''.
+        // '' keeps the harness's own built-in prompt; a configured prompt REPLACES
+        // it for callers that send no system message of their own (a caller that
+        // does send one keeps it — its contract wins, as before).
+        const configuredSystem = config.systemPrompt || '';
+        const clientSystem =
             typeof system === 'string'
                 ? system
                 : Array.isArray(system)
                   ? system.map((b) => (b.type === 'text' ? b.text : '')).join('\n')
                   : '';
+        const systemText = clientSystem || configuredSystem;
 
         const userMessage = [...(messages || [])].reverse().find((m) => m.role === 'user');
         const prompt = Array.isArray(userMessage?.content)
