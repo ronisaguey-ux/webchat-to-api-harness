@@ -978,7 +978,13 @@ async function snapshotChat() {
 
                 n++;
                 seen.add(el);
-                lastEl = el;
+                // 09-13 (ChatGPT lane): ChatGPT leaves EMPTY phantom assistant
+                // rows in the DOM (measured: 6 nodes, lens [22,4,54,0,0,0]).
+                // Taking the last match unconditionally made `lastEl` an empty
+                // node, so waitForResponse read "" for 12s and threw "response
+                // is empty after 12s" while the real answer sat in an earlier
+                // node. Only a text-bearing row may become the newest answer.
+                if (t.length > 0) lastEl = el;
             }
         }
         let rawTxt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
