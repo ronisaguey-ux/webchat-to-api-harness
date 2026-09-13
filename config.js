@@ -46,9 +46,15 @@ const cfg = {
     // (different PORT) pin its own thread even though chat.js exists
     // (chat.js normally wins). Multi-instance pattern 08-12.
     webchatMode: MODE_NAME,
-    webchatUrl: MC.pickBool('WEBCHAT_URL_OVERRIDE', 'webchat', 'urlOverride') === true
-        ? (MC.pickStr('WEBCHAT_URL', 'webchat', 'url') || MODE.url || 'https://chat.deepseek.com')
-        : (chat.url || MC.pickStr('WEBCHAT_URL', 'webchat', 'url') || MODE.url || 'https://chat.deepseek.com'),
+    // Precedence for the target URL: an explicit env/URL override, then the
+    // selected MODE's url, then chat.js, then the built-in default. The mode
+    // has to outrank chat.js: chat.js is a hardcoded per-machine tab URL, so
+    // without this every mode would silently drive this box's DeepSeek tab
+    // (verified: WEBCHAT_MODE=notegpt still resolved to chat.deepseek.com/...).
+    webchatUrl: MC.pickStr('WEBCHAT_URL', 'webchat', 'url')
+        || MODE.url
+        || chat.url
+        || 'https://chat.deepseek.com',
     // Second-instance tab matching: when set, pick the tab whose URL CONTAINS
     // this substring instead of first-tab-with-matching-origin — lets two
     // instances share one browser, each pinned to its own thread.
