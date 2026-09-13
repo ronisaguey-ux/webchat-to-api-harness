@@ -86,15 +86,16 @@ from a webchat model's output. `sandbox.js` requires every one of them to resolv
 inside an explicit allowlist of roots.
 
 ```bash
-SANDBOX_ENABLED=true            # default true
-SANDBOX_ROOTS=/home/roni/Roni_workspace/oculus,/home/roni/Roni_Workspace/audits_plans
-SANDBOX_ALLOW_BASH=false        # run_bash stays blocked even if BASH_ALLOWED=true
-SANDBOX_LOG=true                # log every denial to stderr
+SANDBOX_ENABLED=true                 # default true
+SANDBOX_ROOTS=/path/to/project,/path/to/another   # comma-separated allowlist
+SANDBOX_ALLOW_BASH=false             # run_bash stays blocked even if BASH_ALLOWED=true
+SANDBOX_LOG=true                     # log every denial to stderr
 ```
 
-Defaults to the oculus-relevant paths. Adding a root is one comma-separated
-entry — no code change. Restart the gateway after editing `.env` (config is read
-once at process start).
+`SANDBOX_ROOTS` is also settable as `network.sandboxRoots` in
+`harness.config.json`. Adding a root is one comma-separated entry — no code
+change. Restart the gateway after editing (config is read once at process
+start).
 
 **How it resists escapes**
 
@@ -114,17 +115,25 @@ particular is checked by token inspection, not by a kernel sandbox — a
 sufficiently creative command can still do things the token scan does not
 recognise. Keep `SANDBOX_ALLOW_BASH=false` unless you need it.
 
+The same caveat applies to every other control in this harness: the sandbox, the
+selector allowlists and the anti-spiral detector are all in-process guardrails.
+Run the harness as a user whose files you are willing to lose.
+
 ## ⚠️ Safety gates (read before enabling)
 
-1. **`run_bash` is disabled by default.** The webchat model's output is parsed
-   and executed **verbatim** with no sandbox — a prompt-injected page or a
-   hostile response can run anything on this machine. Enable with
-   `BASH_ALLOWED=true` only when you trust the conversation content end-to-end.
-   `EXEC_TIMEOUT_MS` (10s default) bounds every command.
+1. **`run_bash` is disabled by default, and double-gated.** Even with
+   `BASH_ALLOWED=true` the command must also pass the path fence
+   (`SANDBOX_ALLOW_BASH=true`), which denies any command touching a path outside
+   `SANDBOX_ROOTS`. It is still a token scan, not a kernel jail — treat it as a
+   guardrail, not a boundary, and only enable it when you trust the conversation
+   content end-to-end. `EXEC_TIMEOUT_MS` (10s default) bounds every command.
 2. **Bind to localhost.** `HOST=127.0.0.1` default. If you expose the port,
    set `API_TOKEN` — every request then needs `Authorization: Bearer <token>`.
-3. **File tools are unsandboxed.** `read_file`/`write_file` accept absolute
-   paths. The model gets whatever path it asks for.
+3. **File tools are path-fenced, not jailed.** `read_file`/`write_file`/
+   `list_dir` may only touch paths that resolve inside `SANDBOX_ROOTS`
+   (`sandbox.js`, enabled by default). `..` traversal and symlinks out of a root
+   are rejected. This is a guardrail against a confused or prompt-injected
+   model, not a substitute for running the harness as an unprivileged user.
 4. **Automating webchats violates their ToS.** This is for automating chat
    sessions you own and are logged into. Accounts can get rate-limited or
    banned, and providers change their DOM (that's what the selector env vars
