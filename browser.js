@@ -633,6 +633,7 @@ async function typePrompt(text) {
         }
         return true;
     }, config.selectors.input);
+    let inserted = false;
     if (!alreadyEmpty) {
         // 09-13: clear the composer with REAL key events, not execCommand.
         // execCommand('selectAll'/'delete') works on DeepSeek and ChatGPT but
@@ -652,7 +653,16 @@ async function typePrompt(text) {
             ]) {
                 await cdp.send('Input.dispatchKeyEvent', t);
             }
+            // 09-13 (Kimi): insert the prompt in the SAME CDP session as the
+            // clear. Kimi restores its saved per-conversation draft on the next
+            // render, so clearing in one session and typing in another left a
+            // ~150 ms window in which the 6811-char draft came back — every
+            // send then appended after it (measured: composer 6812 chars, the
+            // prompt never the leading text, gateway wedged to the hard cap).
+            // Back-to-back in one session, the draft never gets the chance.
+            await cdp.send('Input.insertText', { text });
             await cdp.detach();
+            inserted = true;
         } catch (e) {
             console.log('⚠️ key-event clear failed, falling back to execCommand:', String(e).slice(0, 120));
             await page.evaluate((sels) => {
@@ -668,9 +678,11 @@ async function typePrompt(text) {
         }
         await sleep(150);
     }
-    const cdp = await page.createCDPSession();
-    await cdp.send('Input.insertText', { text });
-    await cdp.detach();
+    if (!inserted) {
+        const cdp = await page.createCDPSession();
+        await cdp.send('Input.insertText', { text });
+        await cdp.detach();
+    }
     // 09-13 (NoteGPT lane): CDP Input.insertText updates the DOM but does NOT
     // always reach a Vue/React v-model, so the SPA still believes the composer
     // is EMPTY — its send button stays disabled and every click is a no-op
