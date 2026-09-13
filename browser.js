@@ -903,7 +903,7 @@ async function sendMessage(input, text) {
                     // "Task completed" rendered). The gateway's mouse-first
                     // order therefore left the prompt sitting in the composer.
                     // SEND_INPAGE_ONLY skips the mouse click entirely.
-                    if (process.env.SEND_INPAGE_ONLY === 'true') {
+                    if (quirk('sendInPageOnly', process.env.SEND_INPAGE_ONLY === 'true')) {
                         const clicked = await page.evaluate((sels) => {
                             for (const sel of sels) {
                                 const el = document.querySelector(sel);
