@@ -1137,6 +1137,51 @@ async function isForeignBusy() {
     } catch { return false; }
 }
 
+// ── AUTO-CONTINUE (09-13) ───────────────────────────────────
+// DeepSeek (and zh UIs generally) render a "Continue" / "继续" button when a
+// generation is cut short — the server ends the stream mid-answer and the UI
+// offers to resume it. Until now the harness read that as "generation
+// finished", accepted the truncated text, and the caller got a half answer;
+// a human had to click Continue by hand and the request never completed
+// (owner's report from a user: "Deepseek times out all the time and I have to
+// click continue").
+// Click it and keep waiting — the answer is not finished, it is paused.
+// Only a VISIBLE, ENABLED control whose text is exactly continue-ish counts;
+// a substring match would hit prompt text (the gateway's own preamble
+// mentions "continues", which is why this is anchored, not /continue/i).
+async function clickContinueIfPresent() {
+    try {
+        const hit = await page.evaluate(() => {
+            const cont = (s) => {
+                s = (s || '').trim().toLowerCase().replace(/[.。…\s]+$/, '');
+                return s === 'continue' || s === 'continue generating'
+                    || s === 'continue generation' || s === 'resume'
+                    || s === '继续' || s === '继续生成' || s === '继续回答';
+            };
+            const isVisible = (el) => {
+                if (!el) return false;
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true'
+                    || el.getAttribute('disabled') !== null) return false;
+                if (el.getAttribute('aria-hidden') === 'true') return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden'
+                    || parseFloat(style.opacity || '1') === 0) return false;
+                return el.offsetParent !== null || el.getClientRects().length > 0;
+            };
+            for (const el of document.querySelectorAll('button, [role="button"]')) {
+                if ((cont(el.innerText) || cont(el.getAttribute('aria-label'))) && isVisible(el)) {
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                    el.click();
+                    return (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 24);
+                }
+            }
+            return null;
+        });
+        if (hit) console.log(`▶ generation was cut short — clicked "${hit}" and continuing`);
+        return !!hit;
+    } catch { return false; }
+}
+
 // ── SSE STREAM TEE (08-13) ──────────────────────────────────
 // DeepSeek 2.3.0's frontend stopped committing streamed responses to the
 // DOM in this headless environment — the completion XHR streams real tokens
@@ -1539,6 +1584,14 @@ async function waitForResponse(before, typedText) {
         // a reasoning-only pause. Fallback (count mode / older builds): the
         // raw-text check.
         const busy = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+        // 09-13: DeepSeek pauses a long generation behind a "Continue" button
+        // instead of finishing it. Resume the generation instead of accepting
+        // the truncated text as the answer.
+        if (await clickContinueIfPresent()) {
+            deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
+            await sleep(1200);
+            continue;
+        }
         if (state.mode === 'vl') {
             // Skip a "..."-only answer: it can be a streaming placeholder that
             // froze while the model cogitates — accepting it returns garbage.
@@ -1666,6 +1719,10 @@ async function waitForResponse(before, typedText) {
             // for 8 minutes at a time (observed outstandingMs 429-474s, repeatedly,
             // while the engine's own lane budget is 280s). Track progress instead.
             const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+            if (await clickContinueIfPresent()) {
+                await sleep(1500);
+                continue;
+            }
             const grewNow = (last.answer || '').length > lastAnswerLen;
             if (busyNow && grewNow) {
                 lastAnswerLen = (last.answer || '').length;
