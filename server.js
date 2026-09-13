@@ -34,6 +34,7 @@ try {
 // per-port so replies are not re-injected after a gateway restart. The
 // telegram responder skips "to"-tagged items (they are gateway-routed).
 const PATHS = require('./paths');
+const ANTI_SPIRAL = require('./anti_spiral');
 const MAIN_REPLY_FILE = PATHS.mainReplyFile();
 const MAIN_REPLY_SEEN_FILE = PATHS.mainReplySeenFile(process.env.PORT);
 let mainReplyLastSeen = '';
@@ -918,6 +919,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     let narrationNudged = false; // strict mode: send_message narration taught once per request
     let emptyAnswerNudged = false; // 08-16: empty submit_answer retried once before the placeholder
     let wrapUpSent = false; // 09-13: near the round budget, demand a final submit_answer
+    let spiralStrikes = 0; // 09-13: repeated reasoning loops in the tab
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
 
     for (let round = 0; round < config.maxToolRounds; round++) {
@@ -937,6 +939,25 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                 'Summarise the real work you completed and any step you could not finish. Do not start new work.',
                 toolDefs);
             continue;
+        }
+        // ── ANTI-SPIRAL (09-13) ────────────────────────────────────────────
+        // The model can collapse into a reasoning loop ("Let me go." x40) and
+        // burn every remaining round without doing work. Detect it here: the
+        // FIRST time, redirect the model back to the task; if it loops again,
+        // stop feeding the tab and hand the caller the warning at the top of the
+        // answer instead of a round-budget error.
+        if (ANTI_SPIRAL.enabled()) {
+            const spiral = ANTI_SPIRAL.detectSpiral(response);
+            if (spiral) {
+                spiralStrikes++;
+                console.log(`🛑 anti-spiral: ${ANTI_SPIRAL.describe(spiral)} (strike ${spiralStrikes}) round ${round + 1}`);
+                onProgress?.({ type: 'rejected', text: 'anti-spiral: generation paused — ' + ANTI_SPIRAL.describe(spiral) });
+                if (spiralStrikes >= 2) {
+                    return ANTI_SPIRAL.spiralBanner(spiral) + exhaustedMarker('', response);
+                }
+                response = await countedSend(ANTI_SPIRAL.spiralRedirect(spiral), toolDefs);
+                continue;
+            }
         }
         // Client disconnect (interrupt/close) — stop feeding the webchat tab.
         if (isAborted?.()) {
