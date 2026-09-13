@@ -203,7 +203,53 @@ recognise. Keep `SANDBOX_ALLOW_BASH=false` unless you need it.
 | `ANTI_SPIRAL_MIN_WORDS` | `40` | don't judge a reply shorter than this |
 | `NARRATION` | `false` | `true` lets the model narrate; also relaxes anti-spiral so narration is never mistaken for a loop |
 
-## 🌀 Anti-spiral (`ANTI_SPIRAL=true`)
+### Master config — `harness.config.json`
+
+Every feature can be turned on or off, and given a specific value, in **one
+file** at the repo root instead of hunting through systemd drop-ins:
+
+```json
+{
+  "features": {
+    "narration": false,
+    "antiSpiral": false,
+    "driftDetect": 2,
+    "contextHandoff": true,
+    "allowPlainText": false,
+    "bashAllowed": false,
+    "sandbox": true
+  },
+  "limits": {
+    "timeoutMs": 1800000,
+    "maxToolRounds": 40,
+    "contextHandoffThreshold": 2000000
+  },
+  "paths": {
+    "workspaceRoot": "",
+    "auditsPlansDir": ""
+  }
+}
+```
+
+**Precedence, highest first:**
+
+1. an environment variable — `ANTI_SPIRAL=true node server.js`
+2. `harness.config.json`
+3. the built-in default documented in the table above
+
+So the file is a baseline and a per-instance env var (or a systemd drop-in)
+still overrides it. Every key is optional; a missing or malformed
+`harness.config.json` is ignored and the harness behaves exactly as before.
+Point `HARNESS_CONFIG` at a different file to use a second config.
+
+An empty string (or `""`) in the file means "not configured" and falls back to
+the default — it never blanks out a real value.
+
+## 🧪 EXPERIMENTAL — Anti-spiral (`ANTI_SPIRAL=true`)
+
+> **Experimental.** Off by default and not enabled in the author's own
+> deployment — no genuine benefit has been observed there yet. Turn it on if you
+> are seeing reasoning loops. See also `harness.config.json`.
 
 A webchat model can collapse into a reasoning loop — the same sentence, line, or
 a short `Let me go.` / `Let me read.` tic repeated until the round budget runs

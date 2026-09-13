@@ -1,0 +1,75 @@
+{
+  "_README": [
+    "MASTER CONFIG — one place to turn every harness feature on or off.",
+    "",
+    "Precedence, highest first:",
+    "  1. environment variable   (e.g. ANTI_SPIRAL=true node server.js)",
+    "  2. a systemd drop-in      (Environment=ANTI_SPIRAL=true)",
+    "  3. this file              (the value below)",
+    "  4. the built-in default   (shown in README.md)",
+    "",
+    "So anything you set here is a baseline a per-instance env var can still",
+    "override. Values you leave out fall back to the built-in default. Every key",
+    "is optional.",
+    "",
+    "Features marked EXPERIMENTAL are off by default and have not been proven in",
+    "daily use — read the README section before enabling one."
+  ],
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "headless": false,
+    "modelName": "deepseek webchat"
+  },
+
+  "webchat": {
+    "url": "https://chat.deepseek.com",
+    "urlOverride": false,
+    "tabUrlSubstring": "",
+    "cdpWsUrl": "",
+    "viewportW": 0,
+    "viewportH": 0,
+    "loginWaitSeconds": 300,
+    "selectors": {
+      "input": "",
+      "send": "",
+      "message": ""
+    }
+  },
+
+  "features": {
+    "narration": false,
+    "antiSpiral": false,
+    "driftDetect": 2,
+    "contextHandoff": true,
+    "allowPlainText": false,
+    "bashAllowed": false,
+    "sandbox": true,
+    "sandboxAllowBash": false,
+    "blockedCss": false
+  },
+
+  "limits": {
+    "timeoutMs": 1800000,
+    "maxToolRounds": 40,
+    "toolContextWindow": 30000,
+    "contextHandoffThreshold": 2000000,
+    "antiSpiralMinWords": 40,
+    "execTimeoutMs": 10000
+  },
+
+  "paths": {
+    "workspaceRoot": "",
+    "auditsPlansDir": "",
+    "driftReportDir": "",
+    "mainInboxFile": "",
+    "handoffFile": "",
+    "cookieFile": ".cookies.json"
+  },
+
+  "network": {
+    "blockedUrlsExtra": [],
+    "sandboxRoots": []
+  }
+}
