@@ -26,6 +26,32 @@ a webchat session you own, with tool-call support (read/write files, bash, …).
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## What's in here
+
+- **Master config** — `harness.config.json` turns every feature on or off and
+  sets its value in one place. Env var > file > built-in default.
+- **Webchat modes** — `generic`, `deepseek`, `chatgpt`, `gemini`, `kimi`,
+  `notegpt`. Each carries its own selectors and submit quirks. `generic`
+  attempts any webchat outside that list.
+- **Configurable system prompt** — set it in the master config, globally or
+  per mode. The caller's own system message still wins.
+- **Configurable tool-call rounds** — `limits.maxToolRounds` plus
+  `limits.wrapUpRounds`, which is how many rounds before the cap the model is
+  stopped and asked to deliver its final answer.
+- **Auto-continue** — when a webchat pauses a long answer behind a
+  *Continue* / *继续* control, the harness clicks it and keeps waiting.
+- **Portable paths** — every path resolves from a workspace root or an env
+  override. No username, no drive letter, nothing machine-specific.
+- **Webchat-mode quirks** — per-site behaviour for the composer clear, the
+  submit path, empty phantom rows and busy detection, driven by the mode.
+- **Anti-spiral** *(experimental, off by default)* — detects a reasoning loop,
+  redirects the model back to the task, and puts a warning at the top of the
+  answer if it loops again. Narration-aware.
+- **Path-fenced file tools** — `sandbox.js` keeps `read_file`, `write_file`,
+  `list_dir` and `run_bash` inside an explicit allowlist of roots.
+- **Context handoff** — at the context threshold the model writes a handoff
+  document, a new chat opens in the same tab, and the document seeds it.
+
 ## Quick start
 
 ```bash
