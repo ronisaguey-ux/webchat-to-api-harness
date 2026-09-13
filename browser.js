@@ -618,13 +618,47 @@ async function typePrompt(text) {
         }
     }, config.selectors.input);
     await sleep(400);
-    await page.keyboard.down('Control');
-    await page.keyboard.press('KeyA');
-    await page.keyboard.up('Control');
-    await page.keyboard.press('Backspace');
+    // 09-13 (NoteGPT lane): Ctrl+A + Backspace on a contenteditable desyncs
+    // Vue's v-model — measured live, after this clear the composer held 7983
+    // chars while `button.bg-primary` stayed disabled:true, so every send
+    // click was a no-op. Only clear when there is actually something to clear;
+    // a fresh composer must be left untouched so the framework observes the
+    // Input.insertText that follows.
+    const alreadyEmpty = await page.evaluate((sels) => {
+        for (const sel of sels) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const t = (el.value !== undefined && el.value) || el.innerText || el.textContent || '';
+            return t.trim().length === 0;
+        }
+        return true;
+    }, config.selectors.input);
+    if (!alreadyEmpty) {
+        await page.keyboard.down('Control');
+        await page.keyboard.press('KeyA');
+        await page.keyboard.up('Control');
+        await page.keyboard.press('Backspace');
+    }
     const cdp = await page.createCDPSession();
     await cdp.send('Input.insertText', { text });
     await cdp.detach();
+    // 09-13 (NoteGPT lane): CDP Input.insertText updates the DOM but does NOT
+    // always reach a Vue/React v-model, so the SPA still believes the composer
+    // is EMPTY — its send button stays disabled and every click is a no-op
+    // (measured: 7983 chars in the composer, `button.bg-primary` disabled:true).
+    // Dispatching a real input event makes the framework observe the text.
+    await page.evaluate((sels) => {
+        for (const sel of sels) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true, cancelable: true, inputType: 'insertText', data: el.innerText || '',
+            }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return;
+        }
+    }, config.selectors.input);
+    await sleep(200);
 }
 
 // ── Send: Enter on the focused input, click-fallback if it stays full. ──
@@ -810,6 +844,24 @@ async function sendMessage(input, text) {
                         return null;
                     }, config.selectors.send);
                     if (!pos) throw new Error('send button vanished before click');
+                    // 09-13 (NoteGPT lane): its send button ignores a mouse
+                    // click at the measured centre AND a `scrollIntoView` +
+                    // mouse path, but a direct in-page `.click()` on the same
+                    // element DOES submit (verified by hand: composer cleared,
+                    // "Task completed" rendered). The gateway's mouse-first
+                    // order therefore left the prompt sitting in the composer.
+                    // SEND_INPAGE_ONLY skips the mouse click entirely.
+                    if (process.env.SEND_INPAGE_ONLY === 'true') {
+                        const clicked = await page.evaluate((sels) => {
+                            for (const sel of sels) {
+                                const el = document.querySelector(sel);
+                                if (el && el.getBoundingClientRect().width > 0) { el.click(); return true; }
+                            }
+                            return false;
+                        }, config.selectors.send);
+                        if (!clicked) throw new Error('in-page send click found no button (SEND_INPAGE_ONLY)');
+                        return;
+                    }
                     // 09-12 (owner screenshot): the prompt was typed and the send
                     // button was never clicked. The button can be laid out
                     // OFF-VIEWPORT — measured live on the DeepSeek composer, a
