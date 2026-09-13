@@ -2,6 +2,15 @@ const fs = require('fs');
 const puppeteer = require('puppeteer');
 const config = require('./config');
 
+// ── Webchat-mode quirks (09-13) ─────────────────────────────────────────────
+// config.quirks comes from the selected mode in harness.config.json. Every
+// getter below DEFAULTS TO THE PREVIOUS HARDCODED BEHAVIOUR when the flag is
+// absent, so `generic` and any unlisted webchat behave exactly as before.
+function quirk(name, dflt) {
+    const q = config.quirks || {};
+    return Object.prototype.hasOwnProperty.call(q, name) ? !!q[name] : dflt;
+}
+
 // 08-14 WEDGE ROOT-CAUSE guard: nothing legitimate is ever near this; it
 // exists to turn a runaway tool result into a loud client-visible error
 // instead of a silent gateway wedge (see sendPrompt).
@@ -794,8 +803,10 @@ async function sendMessage(input, text) {
                 }, config.selectors.input);
                 if (!landed) throw new Error('composer stayed empty after typing — send aborted (no empty sends)');
             }
-            await page.keyboard.press('Enter');
-            await sleep(1500);
+            if (quirk('enterSubmits', true)) {
+                await page.keyboard.press('Enter');
+                await sleep(1500);
+            }
             // If the text is still in the box, Enter didn't send — click the button.
             const stillFull = await page.evaluate((sels) => {
                 for (const sel of sels) {
@@ -1077,7 +1088,11 @@ async function snapshotChat() {
                 // node, so waitForResponse read "" for 12s and threw "response
                 // is empty after 12s" while the real answer sat in an earlier
                 // node. Only a text-bearing row may become the newest answer.
-                if (t.length > 0) lastEl = el;
+                if (quirk('skipEmptyMessageRows', false)) {
+                    if (t.length > 0) lastEl = el;
+                } else {
+                    lastEl = el;
+                }
             }
         }
         let rawTxt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
@@ -1602,7 +1617,7 @@ async function waitForResponse(before, typedText) {
         // 09-13: DeepSeek pauses a long generation behind a "Continue" button
         // instead of finishing it. Resume the generation instead of accepting
         // the truncated text as the answer.
-        if (await clickContinueIfPresent()) {
+        if (quirk('autoContinueButton', true) && await clickContinueIfPresent()) {
             deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
             await sleep(1200);
             continue;
@@ -1734,7 +1749,7 @@ async function waitForResponse(before, typedText) {
             // for 8 minutes at a time (observed outstandingMs 429-474s, repeatedly,
             // while the engine's own lane budget is 280s). Track progress instead.
             const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
-            if (await clickContinueIfPresent()) {
+            if (quirk('autoContinueButton', true) && await clickContinueIfPresent()) {
                 await sleep(1500);
                 continue;
             }
