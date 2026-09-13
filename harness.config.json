@@ -1,6 +1,7 @@
 {
   "_README": [
-    "MASTER CONFIG — one place to turn every harness feature on or off.",
+    "MASTER CONFIG — one place to turn every harness feature on or off and to",
+    "pick the webchat it is talking to.",
     "",
     "Precedence, highest first:",
     "  1. environment variable   (e.g. ANTI_SPIRAL=true node server.js)",
@@ -11,6 +12,14 @@
     "So anything you set here is a baseline a per-instance env var can still",
     "override. Values you leave out fall back to the built-in default. Every key",
     "is optional.",
+    "",
+    "WEBCHAT MODES: every webchat needs slightly different selectors and submit",
+    "behaviour. Set \"webchat.mode\" to one of the keys under \"webchatModes\"",
+    "below (generic, deepseek, chatgpt, gemini, kimi). The mode fills in the",
+    "selectors and quirks; anything you set explicitly still wins.",
+    "",
+    "If your webchat does not work with \"generic\", open an issue and it will get",
+    "a dedicated mode.",
     "",
     "Features marked EXPERIMENTAL are off by default and have not been proven in",
     "daily use — read the README section before enabling one."
@@ -24,7 +33,8 @@
   },
 
   "webchat": {
-    "url": "https://chat.deepseek.com",
+    "mode": "generic",
+    "url": "",
     "urlOverride": false,
     "tabUrlSubstring": "",
     "cdpWsUrl": "",
@@ -35,6 +45,98 @@
       "input": "",
       "send": "",
       "message": ""
+    }
+  },
+
+  "systemPrompt": {
+    "_comment": "Sent as the system message on every request. Leave \"text\" empty to use the harness's built-in prompt. Set \"mode\" to override it per webchat (generic/deepseek/chatgpt/gemini/kimi); a per-mode prompt, when present, wins over \"text\".",
+    "mode": "",
+    "text": "",
+    "perMode": {
+      "generic": "",
+      "deepseek": "",
+      "chatgpt": "",
+      "gemini": "",
+      "kimi": ""
+    }
+  },
+
+  "webchatModes": {
+    "generic": {
+      "_comment": "No assumptions. Use this if your webchat is not listed — if it does not work, open an issue and it gets its own mode.",
+      "url": "",
+      "tabUrlSubstring": "",
+      "selectors": { "input": "", "send": "", "message": "" }
+    },
+    "deepseek": {
+      "url": "https://chat.deepseek.com",
+      "tabUrlSubstring": "",
+      "selectors": {
+        "input": "textarea",
+        "send": "div[role=\"button\"].ds-button--primary, div[role=\"button\"].ds-button--filled, button[aria-label*=\"Send\" i]",
+        "message": ".ds-markdown, .message"
+      },
+      "quirks": {
+        "clearComposerWithKeyEvents": false,
+        "enterSubmits": false,
+        "clickFallbackOnFullComposer": true,
+        "autoContinueButton": true,
+        "skipEmptyMessageRows": false,
+        "ignoreStopButtonWhileBusy": false
+      }
+    },
+    "chatgpt": {
+      "url": "https://chatgpt.com",
+      "tabUrlSubstring": "chatgpt.com",
+      "selectors": {
+        "input": "#prompt-textarea",
+        "send": "button[data-testid=\"send-button\"], button[aria-label*=\"Send\" i]",
+        "message": "[data-message-author-role=\"assistant\"]"
+      },
+      "quirks": {
+        "clearComposerWithKeyEvents": false,
+        "enterSubmits": false,
+        "clickFallbackOnFullComposer": true,
+        "autoContinueButton": true,
+        "skipEmptyMessageRows": true,
+        "ignoreStopButtonWhileBusy": true
+      }
+    },
+    "gemini": {
+      "url": "https://gemini.google.com",
+      "tabUrlSubstring": "gemini.google.com",
+      "selectors": {
+        "input": "div[contenteditable=\"true\"], rich-textarea .ql-editor",
+        "send": "button[aria-label*=\"Send\" i], button.send-button",
+        "message": "model-response, .model-response-text"
+      },
+      "quirks": {
+        "clearComposerWithKeyEvents": false,
+        "enterSubmits": true,
+        "clickFallbackOnFullComposer": false,
+        "autoContinueButton": false,
+        "skipEmptyMessageRows": false,
+        "ignoreStopButtonWhileBusy": false,
+        "phantomStopButton": true
+      }
+    },
+    "kimi": {
+      "url": "https://www.kimi.ai/chat",
+      "tabUrlSubstring": "kimi.ai/chat",
+      "selectors": {
+        "input": ".chat-input-editor",
+        "send": "button[aria-label*=\"Send\" i], .send-button",
+        "message": ".chat-content-item-assistant"
+      },
+      "quirks": {
+        "clearComposerWithKeyEvents": true,
+        "enterSubmits": true,
+        "clickFallbackOnFullComposer": true,
+        "autoContinueButton": true,
+        "skipEmptyMessageRows": false,
+        "ignoreStopButtonWhileBusy": false,
+        "restoresSavedDraft": true
+      }
     }
   },
 
