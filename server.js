@@ -1612,26 +1612,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         if (stream) console.log('⚠️  stream requested — responding non-streamed');
 
-        if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
-            try {
-                await ensureConnected(); // lazy connect: attach on first request
-            } catch (e) {
-                console.log('⚠️ 503: connect failed:', e.message);
-                return res.status(503).json({
-                    error: `Webchat not connected: ${e.message} — run with HEADLESS=false, log in, then POST /connect`,
-                });
-            }
-        }
-
-        const systemMessage = (messages || []).find((m) => m.role === 'system');
-        const userMessage = [...(messages || [])].reverse().find((m) => m.role === 'user');
-        const prompt =
-            typeof userMessage?.content === 'string'
-                ? userMessage.content
-                : JSON.stringify(userMessage?.content ?? '');
-
-        const toolDefs = buildExecutableToolDefs();
-
         // 09-13: if this account is cooling from a "Messages too frequent"
         // throttle, answer 429 immediately with Retry-After instead of sending
         // into the throttle. A caller that retries into it burns its whole round
@@ -1652,6 +1632,26 @@ app.post('/v1/chat/completions', async (req, res) => {
                 });
             }
         }
+
+        if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
+            try {
+                await ensureConnected(); // lazy connect: attach on first request
+            } catch (e) {
+                console.log('⚠️ 503: connect failed:', e.message);
+                return res.status(503).json({
+                    error: `Webchat not connected: ${e.message} — run with HEADLESS=false, log in, then POST /connect`,
+                });
+            }
+        }
+
+        const systemMessage = (messages || []).find((m) => m.role === 'system');
+        const userMessage = [...(messages || [])].reverse().find((m) => m.role === 'user');
+        const prompt =
+            typeof userMessage?.content === 'string'
+                ? userMessage.content
+                : JSON.stringify(userMessage?.content ?? '');
+
+        const toolDefs = buildExecutableToolDefs();
 
         const text = await enqueue(() =>
             handleRequest(systemMessage?.content || '', prompt, toolDefs)
