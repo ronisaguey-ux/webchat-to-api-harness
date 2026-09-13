@@ -256,14 +256,25 @@ const processStartAt = Date.now();
 // single-threaded via needsSingleThread() above accidentally put it behind the
 // SAME filesystem lock as the three deepseek gateways — so a wedged deepseek
 // send held the lock and gemini queued forever ('deepseek mutex: queued' in the
-// gemini log, then RemoteDisconnected to the engine). Derive the lock from the
-// webchat host: the three deepseek gateways still share one lock (one account),
-// gemini gets its own. The lock name is kept for compatibility with any tooling.
+// gemini log, then RemoteDisconnected to the engine).
+// 09-12 (owner): the three deepseek webchats are THREE DIFFERENT ACCOUNTS — they
+// are meant to run CONCURRENTLY. Deriving the lock from the webchat HOST put all
+// three behind one lock and serialized accounts that have nothing to do with each
+// other, so three lanes behaved like one. Derive it from the ACCOUNT instead:
+// WEBCHAT_ACCOUNT if set, else the basename of WEBCHAT_PROFILE (each gateway has
+// its own profile dir), else the host as a last resort. One lock per account =
+// one message in flight per account, which is the real rule.
 const WEBCHAT_HOST = (() => {
     try { return new URL(String(config.webchatUrl || '')).host.replace(/[^a-z0-9.]/gi, '_'); }
     catch { return 'default'; }
 })();
-const DEEPSEEK_LOCK_DIR = process.env.WEBCHAT_LOCK_DIR || `/tmp/webchat_mutex_${WEBCHAT_HOST}`;
+const WEBCHAT_ACCOUNT = (() => {
+    const slug = (v) => String(v).replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (process.env.WEBCHAT_ACCOUNT) return slug(process.env.WEBCHAT_ACCOUNT);
+    if (process.env.WEBCHAT_PROFILE) return slug(path.basename(process.env.WEBCHAT_PROFILE));
+    return WEBCHAT_HOST;
+})();
+const DEEPSEEK_LOCK_DIR = process.env.WEBCHAT_LOCK_DIR || `/tmp/webchat_mutex_${WEBCHAT_ACCOUNT}`;
 const LOCK_STEAL_MS = 90000; // 3 heartbeats (30s each): a holder whose mtime stopped moving is dead
 const LOCK_HEARTBEAT_MS = 30000;
 const LOCK_ACQUIRE_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_LOCK_TIMEOUT_MS || '1800000', 10);
@@ -360,7 +371,7 @@ async function countedSend(msg, defs) {
     // `lastSendAt` is per-process, so three lane gateways each spaced themselves
     // and still hit the account together. Use a shared timestamp file so every
     // deepseek gateway honours the same gap.
-    const SHARED_SEND_FILE = process.env.SEND_SPACING_FILE || `/tmp/webchat_last_send_${WEBCHAT_HOST}`;
+    const SHARED_SEND_FILE = process.env.SEND_SPACING_FILE || `/tmp/webchat_last_send_${WEBCHAT_ACCOUNT}`;
     const sharedWaitMs = (() => {
         if (!needsSingleThread()) return 0;
         try {
