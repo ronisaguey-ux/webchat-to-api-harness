@@ -235,9 +235,6 @@ Run the harness as a user whose files you are willing to lose.
 | `HARNESS_CONFIG` | `./harness.config.json` | path to a different master config file |
 | `HANDOFF_FILE` | `<workspace>/handoff_to_new_chat.md` | where the handoff document is written |
 | `WORKSPACE_ROOT` | the harness's parent directory | base for every default path (audits, handoff, sibling repos) |
-| `AUDITS_PLANS_DIR` | `$WORKSPACE_ROOT/audits_plans` | where the inbox / outbox / drift reports live |
-| `DRIFT_REPORT_DIR` | `$AUDITS_PLANS_DIR/drift_reports` | drift report output |
-| `MAIN_INBOX_FILE` | `$AUDITS_PLANS_DIR/claude_inbox.json` | where the drift detector notifies main |
 | `ANTI_SPIRAL` | `false` | `true` enables reasoning-loop detection (see below) |
 | `ANTI_SPIRAL_MIN_WORDS` | `40` | don't judge a reply shorter than this |
 | `NARRATION` | `false` | `true` lets the model narrate; also relaxes anti-spiral so narration is never mistaken for a loop |
@@ -304,7 +301,6 @@ file** at the repo root instead of hunting through systemd drop-ins:
   "features": {
     "narration": false,
     "antiSpiral": false,
-    "driftDetect": 2,
     "contextHandoff": true,
     "allowPlainText": false,
     "bashAllowed": false,
@@ -487,7 +483,5 @@ when a stream dies mid-turn, the tab must be reloaded, not just the gateway.
 
 ## 🔗 Companion Repositories & Toolchain Dependencies
 
-1. **[`drift-clean`](https://github.com/ronisaguey-ux/drift-clean.git)**:
-   - Provides background session hygiene, stream drift monitoring, and multi-AI transcript cleanup.
 2. **[`Insane-Custum-Claude-Settings`](https://github.com/ronisaguey-ux/Insane-Custum-Claude-Settings.git)**:
    - Universal Claude Code settings, PreToolUse banned action hooks, and slash commands.
