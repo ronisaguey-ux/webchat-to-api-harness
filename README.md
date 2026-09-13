@@ -194,6 +194,9 @@ recognise. Keep `SANDBOX_ALLOW_BASH=false` unless you need it.
 | `BLOCKED_CSS` | `false` | `true` also blocks all `*.css*` (DeepSeek-only — other layouts break without stylesheets) |
 | `CONTEXT_HANDOFF_ENABLED` | `true` | auto-swap to a new chat at the context threshold |
 | `CONTEXT_HANDOFF_THRESHOLD` | `100000` | rough per-request context estimate that triggers the handoff (chars/4 ≈ tokens) |
+| `WEBCHAT_MODE` | `generic` | webchat mode: generic / deepseek / chatgpt / gemini / kimi |
+| `SYSTEM_PROMPT` | *(none)* | override the configured system prompt |
+| `HARNESS_CONFIG` | `./harness.config.json` | path to a different master config file |
 | `HANDOFF_FILE` | `<workspace>/handoff_to_new_chat.md` | where the handoff document is written |
 | `WORKSPACE_ROOT` | the harness's parent directory | base for every default path (audits, handoff, sibling repos) |
 | `AUDITS_PLANS_DIR` | `$WORKSPACE_ROOT/audits_plans` | where the inbox / outbox / drift reports live |
@@ -202,6 +205,48 @@ recognise. Keep `SANDBOX_ALLOW_BASH=false` unless you need it.
 | `ANTI_SPIRAL` | `false` | `true` enables reasoning-loop detection (see below) |
 | `ANTI_SPIRAL_MIN_WORDS` | `40` | don't judge a reply shorter than this |
 | `NARRATION` | `false` | `true` lets the model narrate; also relaxes anti-spiral so narration is never mistaken for a loop |
+
+### Webchat modes
+
+Every webchat needs slightly different selectors and submit behaviour. Pick one
+with `webchat.mode` in `harness.config.json`, or the `WEBCHAT_MODE` env var.
+
+| mode | site | input selector | message selector | notable quirks |
+|---|---|---|---|---|
+| `generic` | — | `(default)` | `(default)` | — |
+| `deepseek` | https://chat.deepseek.com | `textarea` | `.ds-markdown, .message` | clickFallbackOnFullComposer, autoContinueButton |
+| `chatgpt` | https://chatgpt.com | `#prompt-textarea` | `[data-message-author-role="assistant"]` | clickFallbackOnFullComposer, autoContinueButton, skipEmptyMessageRows, ignoreStopButtonWhileBusy |
+| `gemini` | https://gemini.google.com | `div[contenteditable="true"], rich-textarea .ql-editor` | `model-response, .model-response-text` | enterSubmits, phantomStopButton |
+| `kimi` | https://www.kimi.ai/chat | `.chat-input-editor` | `.chat-content-item-assistant` | clearComposerWithKeyEvents, enterSubmits, clickFallbackOnFullComposer, autoContinueButton, restoresSavedDraft |
+
+Anything you set explicitly still wins: an explicit `webchat.url`,
+`webchat.selectors.*` or the matching `SELECTOR_*` env var overrides the mode.
+An unknown mode name falls back to `generic` and logs a warning — it never
+crashes.
+
+If your webchat does not work with `generic`, open an issue and it will get a
+dedicated mode.
+
+### System prompt
+
+`harness.config.json` → `systemPrompt`:
+
+```json
+{
+  "systemPrompt": {
+    "mode": "",
+    "text": "",
+    "perMode": { "generic": "", "deepseek": "", "chatgpt": "", "gemini": "", "kimi": "" }
+  }
+}
+```
+
+- `perMode[mode]` wins over `text`.
+- An empty string means "use the harness's built-in prompt".
+- The `SYSTEM_PROMPT` env var overrides both.
+- A system message sent by the API caller still takes precedence — the caller's
+  own contract is never replaced.
+
 
 ### Master config — `harness.config.json`
 
