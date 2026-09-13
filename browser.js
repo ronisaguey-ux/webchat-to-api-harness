@@ -634,25 +634,38 @@ async function typePrompt(text) {
         return true;
     }, config.selectors.input);
     if (!alreadyEmpty) {
-        // 09-13 (NoteGPT lane): Ctrl+A selects the whole PAGE when focus is not
-        // already inside the composer, so Backspace cleared nothing and every
-        // retry APPENDED — measured live, the composer grew 2762 -> 7983 chars
-        // and NoteGPT's send button flipped to disabled:true, so every click was
-        // a silent no-op. Clear it in-page instead (verified: composer 0,
-        // button enabled again).
-        await page.evaluate((sels) => {
-            for (const sel of sels) {
-                const el = document.querySelector(sel);
-                if (!el) continue;
-                el.focus();
-                document.execCommand('selectAll', false, null);
-                document.execCommand('delete', false, null);
-                el.dispatchEvent(new InputEvent('input', {
-                    bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: '',
-                }));
-                return;
+        // 09-13: clear the composer with REAL key events, not execCommand.
+        // execCommand('selectAll'/'delete') works on DeepSeek and ChatGPT but
+        // does NOT clear Kimi's `.chat-input-editor` — measured live, its draft
+        // survived a full page reload at 1787 chars, so every send appended
+        // after it and the prompt was never the leading text. Ctrl+A + Backspace
+        // dispatched through CDP (modifiers:2 = Ctrl) DID clear it (1811 -> 1).
+        // Playwright's page.keyboard is unreliable on a CDP-attached page, so
+        // drive the keys over the raw protocol.
+        try {
+            const cdp = await page.createCDPSession();
+            for (const t of [
+                { type: 'keyDown', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 },
+                { type: 'keyUp', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 },
+                { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+                { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+            ]) {
+                await cdp.send('Input.dispatchKeyEvent', t);
             }
-        }, config.selectors.input);
+            await cdp.detach();
+        } catch (e) {
+            console.log('⚠️ key-event clear failed, falling back to execCommand:', String(e).slice(0, 120));
+            await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (!el) continue;
+                    el.focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('delete', false, null);
+                    return;
+                }
+            }, config.selectors.input);
+        }
         await sleep(150);
     }
     const cdp = await page.createCDPSession();
