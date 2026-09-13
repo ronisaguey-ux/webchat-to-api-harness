@@ -27,7 +27,11 @@
     "limits.maxToolRounds = the hard cap on tool-execution rounds per request.",
     "limits.wrapUpRounds  = how many rounds before that cap the harness stops the model and demands its final answer (default 3).",
     "",
-    "notegpt is TESTED but its composer holds a stale draft and resists both clear mechanisms; the lane is parked. The mode exists so a fix can be dropped in without touching code."
+    "notegpt is TESTED but its composer holds a stale draft and resists both clear mechanisms; the lane is parked. The mode exists so a fix can be dropped in without touching code.",
+    "",
+    "features.rateLimitCooldownSeconds = when a webchat answers 'Messages too frequent',",
+    "put that account on this many seconds of cooldown and answer 429 + Retry-After",
+    "to callers instead of retrying into the throttle (default 900 = 15 min)."
   ],
   "server": {
     "host": "127.0.0.1",
@@ -88,7 +92,8 @@
         "clickFallbackOnFullComposer": true,
         "autoContinueButton": true,
         "skipEmptyMessageRows": false,
-        "ignoreStopButtonWhileBusy": false
+        "ignoreStopButtonWhileBusy": false,
+        "rateLimitCooldown": true
       }
     },
     "chatgpt": {
@@ -105,7 +110,8 @@
         "clickFallbackOnFullComposer": true,
         "autoContinueButton": true,
         "skipEmptyMessageRows": true,
-        "ignoreStopButtonWhileBusy": true
+        "ignoreStopButtonWhileBusy": true,
+        "rateLimitCooldown": true
       }
     },
     "gemini": {
@@ -123,7 +129,8 @@
         "autoContinueButton": false,
         "skipEmptyMessageRows": false,
         "ignoreStopButtonWhileBusy": false,
-        "phantomStopButton": true
+        "phantomStopButton": true,
+        "rateLimitCooldown": true
       }
     },
     "kimi": {
@@ -141,7 +148,8 @@
         "autoContinueButton": true,
         "skipEmptyMessageRows": false,
         "ignoreStopButtonWhileBusy": false,
-        "restoresSavedDraft": true
+        "restoresSavedDraft": true,
+        "rateLimitCooldown": true
       }
     },
     "notegpt": {
@@ -160,7 +168,8 @@
         "skipEmptyMessageRows": false,
         "ignoreStopButtonWhileBusy": false,
         "sendInPageOnly": true,
-        "composerHoldsStaleDraft": true
+        "composerHoldsStaleDraft": true,
+        "rateLimitCooldown": true
       }
     }
   },
@@ -173,7 +182,8 @@
     "bashAllowed": false,
     "sandbox": true,
     "sandboxAllowBash": false,
-    "blockedCss": false
+    "blockedCss": false,
+    "rateLimitCooldownSeconds": 900
   },
   "limits": {
     "timeoutMs": 1800000,

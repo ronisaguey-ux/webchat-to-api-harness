@@ -150,6 +150,11 @@ const cfg = {
     // narration is never mistaken for a loop.
     antiSpiral: MC.pickBool('ANTI_SPIRAL', 'features', 'antiSpiral') === true,
 
+    // 09-13: a webchat that answers "Messages too frequent" is throttling us.
+    // Cool that account and answer 429 + Retry-After instead of retrying into
+    // the throttle. See rate_limit.js.
+    rateLimitCooldownSeconds: MC.pickNum('RATE_LIMIT_COOLDOWN_S', 'features', 'rateLimitCooldownSeconds') || 900,
+
     // Session persistence
     cookieFile: MC.pickStr('COOKIE_FILE', 'paths', 'cookieFile') || '.cookies.json',
 
