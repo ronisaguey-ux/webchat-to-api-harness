@@ -18,13 +18,6 @@ const {
     resetTeeForHandoff, takeThreadSwap, browserAlive, markShuttingDown,
 } = require('./browser');
 const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
-const { MultiSignalGatewayGate } = require('./drift_v2');
-
-let driftClean = null;
-try {
-    const driftPkg = require('../LLM-Drift-Detector');
-    driftClean = driftPkg.driftClean;
-} catch (e) { /* optional background layer */ }
 
 // ── Main-reply injection (08-14, user) ───────────────────────────────────
 // The webchat can message MAIN via the send_message_to_main tool. MAIN
@@ -456,10 +449,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-if (typeof driftClean === 'function') {
-    driftClean({ silent: true }).catch(() => {});
-}
-
 // ── Upstream passthrough ──────────────────────────────────────────────
 // The /model picker needs ONE base URL that offers BOTH models:
 //   anymodel             → drive the webchat tab (Gemini, whatever's in chat.js)
@@ -783,50 +772,6 @@ function greetingDirective(userPrompt) {
     return '';
 }
 
-// ── DRIFT DETECTOR v2 (owner 08-15: event-driven, judge-on-escalation) ──
-const DRIFT_DETECT = process.env.DRIFT_DETECT;
-const DRIFT_REPORT_DIR = PATHS.driftReportDir();
-const MAIN_INBOX_FILE = PATHS.mainInboxFile();
-const DRIFT_PAUSE_TEXT = '⚠️ [DRIFT-PAUSED] The drift detector flagged this exchange and the answer is HELD for main to adjudicate. A report was written to drift_reports/ and main was notified.';
-const driftGate = new MultiSignalGatewayGate({ mode: Number(DRIFT_DETECT || '2') });
-
-async function reportDrift(r) {
-    try {
-        fs.mkdirSync(DRIFT_REPORT_DIR, { recursive: true });
-        const fname = 'drift_' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
-        const fpath = path.join(DRIFT_REPORT_DIR, fname);
-        fs.writeFileSync(fpath, JSON.stringify({ ts: new Date().toISOString(), score: r.score, matches: r.matches, threshold: r.threshold, verdict: r.verdict, taskHint: String(r.userPrompt || '').slice(0, 1500), thinkExcerpt: String(r.thinkText || '').slice(-4000) }, null, 2));
-        fs.writeFileSync(path.join(DRIFT_REPORT_DIR, 'drift_report.json'), fs.readFileSync(fpath));
-        // 09-13: a missing/empty inbox used to throw ENOENT here and swallow the
-        // whole report ("A drift report write failed: ENOENT ... claude_inbox.json").
-        // The report file itself is already on disk; the inbox nudge is best-effort.
-        let inbox = [];
-        try {
-            const raw = fs.readFileSync(MAIN_INBOX_FILE, 'utf-8').trim();
-            if (raw) inbox = JSON.parse(raw);
-            if (!Array.isArray(inbox)) inbox = [];
-        } catch (ie) {
-            if (ie.code !== 'ENOENT') console.warn('⚠️ inbox read failed:', ie.message);
-            inbox = [];
-        }
-        inbox.push({ ts: new Date().toISOString(), from: 'drift-detector-v2', text: 'DRIFT DETECTED on webchat ' + (process.env.PORT || 8080) + ' (score ' + r.score + ') — report: ' + fpath });
-        fs.mkdirSync(path.dirname(MAIN_INBOX_FILE), { recursive: true });
-        fs.writeFileSync(MAIN_INBOX_FILE, JSON.stringify(inbox, null, 2));
-        console.log('🛡 DRIFT DETECTED (score ' + r.score + ') — exchange paused, reported to main');
-    } catch (e) { console.warn('⚠️ drift report write failed:', e.message); }
-}
-
-async function maybePauseForDrift(text, userPrompt) {
-    if (driftGate.mode === 0) return text;
-    let thinkText;
-    try { thinkText = await getAndClearThinkBuf(); } catch { return text; }
-    if (!thinkText || !thinkText.trim()) return text;
-    const result = await driftGate.feed(thinkText, userPrompt);
-    if (!result.paused) return text;
-    await reportDrift({ ...result.gate, verdict: result.verdict, thinkText, userPrompt });
-    return DRIFT_PAUSE_TEXT + (result.verdict && result.verdict.reason ? '\n\nJudge: ' + result.verdict.reason : '');
-}
-
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
     // PASSTHROUGH_FORMAT: the caller ships a complete, self-contained contract in
     // its system text (the oculus step engine's {"edits":[...]}). This gateway
@@ -1034,7 +979,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                     response = await countedSend(EMPTY_ANSWER_MSG, toolDefs);
                     continue;
                 }
-                return await maybePauseForDrift(final || '[webchat model completed the task]', userPrompt);
+                return final || '[webchat model completed the task]';
             }
             if (call.toolName !== 'send_message') {
                 onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
@@ -1132,7 +1077,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // reply directly in natural text / markdown without artificial tool nudges.
         if (config.allowPlainText) {
             const prose = cleanWebchatText(cleanProse(response));
-            return await maybePauseForDrift(finalAnswerFor(prose), userPrompt);
+            return finalAnswerFor(prose);
         }
 
         // Always-tool mode: ANY plain-text reply is a format error, yap or not.
@@ -1747,9 +1692,9 @@ app.post('/v1/messages', async (req, res) => {
                     : routedModel.startsWith('gemini')
                         ? { ...routedBody, model: 'gemini 3.7 flash webchat' }
                         : routedBody;
-            // 08-15 DRIFT-JUDGE FIX: OmniRoute 3.8.x serves its API under
+            // OmniRoute 3.8.x serves its API under
             // /api/v1/* — the old '/v1/messages' path returned the Next.js
-            // app shell (HTML) and the drift judge call hung on it.
+            // an app shell (HTML) rather than JSON.
             return proxyTo(
                 req, res, WEBCHAT_ROUTES[routedModel],
                 routedModel === 'omniroute' ? '/api/v1/messages' : '/v1/messages',
