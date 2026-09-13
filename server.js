@@ -33,9 +33,9 @@ try {
 // to the prompt so the webchat sees them in context. Seen-markers persist
 // per-port so replies are not re-injected after a gateway restart. The
 // telegram responder skips "to"-tagged items (they are gateway-routed).
-const MAIN_REPLY_FILE = '/home/roni/Roni_Workspace/audits_plans/claude_webchat_outbox.json';
-const MAIN_REPLY_SEEN_FILE =
-    '/home/roni/Roni_Workspace/audits_plans/.main_reply_seen_' + (process.env.PORT || 8080) + '.json';
+const PATHS = require('./paths');
+const MAIN_REPLY_FILE = PATHS.mainReplyFile();
+const MAIN_REPLY_SEEN_FILE = PATHS.mainReplySeenFile(process.env.PORT);
 let mainReplyLastSeen = '';
 try { mainReplyLastSeen = JSON.parse(fs.readFileSync(MAIN_REPLY_SEEN_FILE, 'utf-8')).ts || ''; } catch (e) { /* first run */ }
 
@@ -784,8 +784,8 @@ function greetingDirective(userPrompt) {
 
 // ── DRIFT DETECTOR v2 (owner 08-15: event-driven, judge-on-escalation) ──
 const DRIFT_DETECT = process.env.DRIFT_DETECT;
-const DRIFT_REPORT_DIR = process.env.DRIFT_REPORT_DIR || '/home/roni/Roni_Workspace/audits_plans/drift_reports';
-const MAIN_INBOX_FILE = process.env.MAIN_INBOX_FILE || '/home/roni/Roni_Workspace/audits_plans/claude_inbox.json';
+const DRIFT_REPORT_DIR = PATHS.driftReportDir();
+const MAIN_INBOX_FILE = PATHS.mainInboxFile();
 const DRIFT_PAUSE_TEXT = '⚠️ [DRIFT-PAUSED] The drift detector flagged this exchange and the answer is HELD for main to adjudicate. A report was written to drift_reports/ and main was notified.';
 const driftGate = new MultiSignalGatewayGate({ mode: Number(DRIFT_DETECT || '2') });
 
@@ -796,8 +796,20 @@ async function reportDrift(r) {
         const fpath = path.join(DRIFT_REPORT_DIR, fname);
         fs.writeFileSync(fpath, JSON.stringify({ ts: new Date().toISOString(), score: r.score, matches: r.matches, threshold: r.threshold, verdict: r.verdict, taskHint: String(r.userPrompt || '').slice(0, 1500), thinkExcerpt: String(r.thinkText || '').slice(-4000) }, null, 2));
         fs.writeFileSync(path.join(DRIFT_REPORT_DIR, 'drift_report.json'), fs.readFileSync(fpath));
-        const inbox = JSON.parse(fs.readFileSync(MAIN_INBOX_FILE, 'utf-8'));
-        inbox.push({ ts: new Date().toISOString(), from: 'drift-detector-v2', text: 'DRIFT DETECTED on webchat 8080 (score ' + r.score + ') — report: ' + fpath });
+        // 09-13: a missing/empty inbox used to throw ENOENT here and swallow the
+        // whole report ("A drift report write failed: ENOENT ... claude_inbox.json").
+        // The report file itself is already on disk; the inbox nudge is best-effort.
+        let inbox = [];
+        try {
+            const raw = fs.readFileSync(MAIN_INBOX_FILE, 'utf-8').trim();
+            if (raw) inbox = JSON.parse(raw);
+            if (!Array.isArray(inbox)) inbox = [];
+        } catch (ie) {
+            if (ie.code !== 'ENOENT') console.warn('⚠️ inbox read failed:', ie.message);
+            inbox = [];
+        }
+        inbox.push({ ts: new Date().toISOString(), from: 'drift-detector-v2', text: 'DRIFT DETECTED on webchat ' + (process.env.PORT || 8080) + ' (score ' + r.score + ') — report: ' + fpath });
+        fs.mkdirSync(path.dirname(MAIN_INBOX_FILE), { recursive: true });
         fs.writeFileSync(MAIN_INBOX_FILE, JSON.stringify(inbox, null, 2));
         console.log('🛡 DRIFT DETECTED (score ' + r.score + ') — exchange paused, reported to main');
     } catch (e) { console.warn('⚠️ drift report write failed:', e.message); }
@@ -905,9 +917,27 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
     let narrationNudged = false; // strict mode: send_message narration taught once per request
     let emptyAnswerNudged = false; // 08-16: empty submit_answer retried once before the placeholder
+    let wrapUpSent = false; // 09-13: near the round budget, demand a final submit_answer
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
 
     for (let round = 0; round < config.maxToolRounds; round++) {
+        // 09-13 WRAP-UP (reported: "webchat model did not submit a final answer
+        // within the round budget — happening almost every prompt"). Running out
+        // of rounds used to hand the caller a bare error marker and throw away
+        // all the work the model had done. Spend the LAST few rounds asking for
+        // the summary instead: the model has a complete task at this point, it
+        // only needs to be told to stop working and report.
+        if (!wrapUpSent && round >= config.maxToolRounds - 3) {
+            wrapUpSent = true;
+            console.log(`⏳ round budget nearly spent (${round}/${config.maxToolRounds}) — demanding the final submit_answer`);
+            onProgress?.({ type: 'rejected', text: 'round budget nearly spent — demanding the final answer now' });
+            response = await countedSend(
+                'You are out of time. STOP calling tools. Deliver your FINAL answer NOW as a single fenced ' +
+                '```json\n{"tool":"submit_answer","params":{"text":"<what you did, what you verified, and anything left undone>"}}\n``` ' +
+                'Summarise the real work you completed and any step you could not finish. Do not start new work.',
+                toolDefs);
+            continue;
+        }
         // Client disconnect (interrupt/close) — stop feeding the webchat tab.
         if (isAborted?.()) {
             console.log(`🔴 client disconnected — aborting webchat loop (round ${round + 1})`);
@@ -1401,7 +1431,7 @@ async function runContextHandoff({ toolDefs, onProgress, isAborted, userPrompt, 
 // verify) for the new pin to take effect; ensure() is idempotent and the gap is ~2s.
 function persistThreadSwap(oldId, newId, newUrl) {
     if (!oldId || !newId || !newUrl) return [];
-    const supervisor = '/home/roni/Roni_Workspace/oculus/scripts/stack_supervisor.sh';
+    const supervisor = process.env.STACK_SUPERVISOR || path.join(PATHS.workspaceRoot(), 'oculus', 'scripts', 'stack_supervisor.sh');
     const chatJs = path.join(__dirname, 'chat.js');
     const changed = [];
     try {
@@ -1464,7 +1494,7 @@ function restartSupervisor() {
     const launch = () => {
         // 08-13: log to the supervisor's own file — stdio:'ignore' spawned a
         // SILENT supervisor (pid 10652) whose loop failures were invisible.
-        const child = spawn('bash', ['-c', 'bash /home/roni/Roni_Workspace/oculus/scripts/stack_supervisor.sh >> /tmp/stack_supervisor.log 2>&1'], {
+        const child = spawn('bash', ['-c', 'bash "' + supervisor + '" >> /tmp/stack_supervisor.log 2>&1'], {
             detached: true,
             stdio: 'ignore',
         });

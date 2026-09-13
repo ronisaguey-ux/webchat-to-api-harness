@@ -74,7 +74,7 @@ const cfg = {
     // (context_length_exceeded → handoff) still catches any early cap.
     contextHandoffEnabled: process.env.CONTEXT_HANDOFF_ENABLED !== 'false',
     contextHandoffThreshold: parseInt(process.env.CONTEXT_HANDOFF_THRESHOLD) || 2000000,
-    handoffFile: process.env.HANDOFF_FILE || '/home/roni/Roni_workspace/handoff_to_new_chat.md',
+    handoffFile: require('./paths').handoffFile(),
 
     // Behaviour
     timeout: parseInt(process.env.TIMEOUT) || 1800000, // 08-13 EVENING: run-until-done tasks + 6s send spacing + narration exceed 180s routinely; the 180s cap timed out mid-task and its crash path killed the process (now guarded). 08-14: 10 min still too short — the webchat cogitated SILENTLY 11 min on 'add EVERYTHING' (08-13 22:5x) and BOTH the gateway timeout and the client stream-idle watchdog fired. 30 min default; the SSE keepalive (server.js) keeps clients alive through it.

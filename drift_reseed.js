@@ -1,3 +1,4 @@
+const path = require('path');
 // drift_reseed.js — main-side reseed after a VALID drift verdict (owner 08-15).
 // Flow (owner design): task → detector flags drift in thinking → PAUSE + report
 // to main → main adjudicates → VALID: run this script, then re-fire the task
@@ -11,12 +12,12 @@
 //   3. Seeds the sanitized brief as the first message (creates the thread).
 //   4. Prints the new thread URL for the re-fire.
 const fs = require('fs');
-const browserMod = require('/home/roni/Roni_Workspace/webchat-api/browser.js');
-const configMod = require('/home/roni/Roni_Workspace/webchat-api/config.js');
+const browserMod = require(path.join(__dirname,'browser.js'));
+const configMod = require(path.join(__dirname,'config.js'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const DEFAULT_URL = process.env.WEBCHAT_URL || 'https://chat.deepseek.com/a/chat/s/e480da5e-5904-4d25-8040-41ac1dd1c8d6';
-const DEFAULT_BRIEF = process.env.DRIFT_BRIEF_FILE || '/home/roni/Roni_Workspace/audits_plans/sanitized_expert_brief.md';
+const DEFAULT_BRIEF = process.env.DRIFT_BRIEF_FILE || path.join(require('./paths').auditsPlans(),'sanitized_expert_brief.md');
 
 (async () => {
   const threadUrl = process.argv[2] || DEFAULT_URL;

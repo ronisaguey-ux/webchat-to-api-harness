@@ -1,4 +1,6 @@
+const path = require('path');
 const fs = require('fs');
+const PATHS = require('./paths');
 const os = require('os');
 const { spawn } = require('child_process');
 const config = require('./config');
@@ -218,7 +220,7 @@ const TOOL_DEFINITIONS = [
                 // Log EVERY executed command (denied ones are NOT executed).
                 try {
                     fs.appendFileSync(
-                        "/home/roni/Roni_Workspace/webchat-api/bash_tool_log.jsonl",
+                        PATHS.bashToolLog(),
                         JSON.stringify({ ts: new Date().toISOString(), cmd }) + os.EOL
                     );
                 } catch (e) { /* logging must never block execution */ }
@@ -432,8 +434,8 @@ const TOOL_DEFINITIONS = [
             const read = (p) => {
                 try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch { return null; }
             };
-            const wf = read('/home/roni/Roni_Workspace/audits_plans/workflow_state.json');
-            const ad = read('/home/roni/Roni_Workspace/audits_plans/audit_state.json');
+            const wf = read(PATHS.workflowStateFile());
+            const ad = read(PATHS.auditStateFile());
             return {
                 success: true,
                 cycle: (wf && wf.cycle) ?? null,
@@ -471,9 +473,9 @@ const TOOL_DEFINITIONS = [
         },
         handler: async (args) => {
             const repos = {
-                oculus: '/home/roni/Roni_Workspace/oculus',
-                'webchat-api': '/home/roni/Roni_Workspace/webchat-api',
-                helpotron: '/home/roni/Roni_Workspace/helpotron',
+                oculus: path.join(PATHS.workspaceRoot(), 'oculus'),
+                'webchat-api': path.join(PATHS.workspaceRoot(), 'webchat-api'),
+                helpotron: path.join(PATHS.workspaceRoot(), 'helpotron'),
             };
             const dir = repos[String((args && args.repo) || 'oculus')];
             if (!dir) {
@@ -503,7 +505,7 @@ const TOOL_DEFINITIONS = [
             required: ['text'],
         },
         handler: async (args) => {
-            const OUTBOX = '/home/roni/Roni_Workspace/audits_plans/claude_outbox.json';
+            const OUTBOX = PATHS.outboxFile();
             let text = String((args && args.text) || '').trim();
             if (!text) return { success: false, error: 'empty text' };
             if (!/^webchat: /i.test(text)) text = 'webchat: ' + text;
@@ -537,7 +539,7 @@ const TOOL_DEFINITIONS = [
             required: ['text'],
         },
         handler: async (args, ctx) => {
-            const INBOX = '/home/roni/Roni_Workspace/audits_plans/claude_webchat_inbox.json';
+            const INBOX = PATHS.webchatInboxFile();
             const text = String((args && args.text) || '').trim();
             if (!text) return { success: false, error: 'empty text' };
             let out = [];
@@ -608,7 +610,8 @@ const TOOL_DEFINITIONS = [
             if (!text.toLowerCase().startsWith('webchat:')) {
                 text = `webchat: ${text}`;
             }
-            const sendScript = '/home/roni/Roni_workspace/oculus/scripts/telegram-monitor/bin/send-telegram.sh';
+            const sendScript = process.env.TELEGRAM_SEND_SCRIPT
+                || path.join(PATHS.workspaceRoot(), 'oculus', 'scripts', 'telegram_monitor', 'telegram-monitor', 'bin', 'send-telegram.sh');
             const envFile = `${os.homedir()}/.config/oculus/orchestrator.env`;
             const cmd = `set -a; [ -f "${envFile}" ] && source "${envFile}"; set +a; bash "${sendScript}" "${text.replace(/"/g, '\\"')}"`;
             return new Promise((resolve) => {
