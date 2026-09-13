@@ -1236,10 +1236,10 @@ async function installStreamTee() {
         // XHR/fetch interceptors below stay guarded — they are stateful and
         // must not double-install.
         window.__wsParseSse = function (body) {
-            // 08-15 DRIFT: `think` carries the model's PRIVATE THINKING (the
+            // `think` carries the model's PRIVATE THINKING (the
             // DeepThink reasoning streamed BEFORE the RESPONSE fragment is
             // declared, plus THINK fragment content) — readStreamedAnswer
-            // accumulates it into window.__wsThinkBuf for the drift detector.
+            // accumulates it into window.__wsThinkBuf so it can be read back.
             const out = { text: '', think: '', done: false, error: '' };
             // 08-13 DeepThink gate: with thinking_enabled the think block
             // streams FIRST as bare {"v":...} chunks + -1/content APPENDs,
@@ -1418,8 +1418,8 @@ async function getReqBodyChars() {
     try { return await page.evaluate(() => window.__wsTeeReqBodyChars || 0); } catch { return 0; }
 }
 
-// 08-15 DRIFT: read + reset the page's accumulated THINK (reasoning) text —
-// the drift detector's input for the exchange that just finished.
+// Read + reset the page's accumulated THINK (reasoning) text for the exchange
+// that just finished.
 async function getAndClearThinkBuf() {
     try {
         return await page.evaluate(() => {
@@ -1496,7 +1496,7 @@ async function readStreamedAnswer(startIndex) {
                 done = p.done;
                 error = p.error || error; // last error wins; empty stays empty
                 if (p.think) {
-                    // 08-15 DRIFT: the model's PRIVATE THINKING accumulates
+                    // The model's PRIVATE THINKING accumulates
                     // here (capped — scoring needs a window, not the whole
                     // session); the gateway reads + clears it via
                     // getAndClearThinkBuf at the end of each exchange.

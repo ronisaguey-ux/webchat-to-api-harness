@@ -6,8 +6,8 @@
 // which only exist on the author's machine. On any other box (Windows
 // especially) the same string resolves to C:\home\roni\... and every write
 // fails with ENOENT — a user reported exactly that:
-//   "A drift report write failed: ENOENT: no such file or directory, open
-//    'C:\\home\\roni\\Roni_Workspace\\audits_plans\\claude_inbox.json'"
+//   "ENOENT: no such file or directory, open
+//    'C:\\home\\roni\\...\\claude_inbox.json'"
 //
 // Resolution order, first hit wins:
 //   1. the explicit env var for that path (WORKSPACE_ROOT, AUDITS_PLANS_DIR, …)
@@ -39,7 +39,6 @@ const paths = {
     workspaceRoot,
     auditsPlans,
 
-    driftReportDir: () => envDir('DRIFT_REPORT_DIR') || path.join(auditsPlans(), 'drift_reports'),
     mainInboxFile: () => envDir('MAIN_INBOX_FILE') || path.join(auditsPlans(), 'claude_inbox.json'),
     mainReplyFile: () => envDir('MAIN_REPLY_FILE') || path.join(auditsPlans(), 'claude_webchat_outbox.json'),
     mainReplySeenFile: (port) => envDir('MAIN_REPLY_SEEN_FILE')
