@@ -1,6 +1,6 @@
 {
   "_README": [
-    "MASTER CONFIG — one place to turn every harness feature on or off and to",
+    "MASTER CONFIG \u2014 one place to turn every harness feature on or off and to",
     "pick the webchat it is talking to.",
     "",
     "Precedence, highest first:",
@@ -22,16 +22,17 @@
     "a dedicated mode.",
     "",
     "Features marked EXPERIMENTAL are off by default and have not been proven in",
-    "daily use — read the README section before enabling one."
+    "daily use \u2014 read the README section before enabling one.",
+    "",
+    "limits.maxToolRounds = the hard cap on tool-execution rounds per request.",
+    "limits.wrapUpRounds  = how many rounds before that cap the harness stops the model and demands its final answer (default 3)."
   ],
-
   "server": {
     "host": "127.0.0.1",
     "port": 8080,
     "headless": false,
     "modelName": "deepseek webchat"
   },
-
   "webchat": {
     "mode": "generic",
     "url": "",
@@ -47,7 +48,6 @@
       "message": ""
     }
   },
-
   "systemPrompt": {
     "_comment": "Sent as the system message on every request. Leave \"text\" empty to use the harness's built-in prompt. Set \"mode\" to override it per webchat (generic/deepseek/chatgpt/gemini/kimi); a per-mode prompt, when present, wins over \"text\".",
     "mode": "",
@@ -60,13 +60,16 @@
       "kimi": ""
     }
   },
-
   "webchatModes": {
     "generic": {
-      "_comment": "No assumptions. Use this if your webchat is not listed — if it does not work, open an issue and it gets its own mode.",
+      "_comment": "No assumptions. Use this if your webchat is not listed \u2014 if it does not work, open an issue and it gets its own mode.",
       "url": "",
       "tabUrlSubstring": "",
-      "selectors": { "input": "", "send": "", "message": "" }
+      "selectors": {
+        "input": "",
+        "send": "",
+        "message": ""
+      }
     },
     "deepseek": {
       "url": "https://chat.deepseek.com",
@@ -139,7 +142,6 @@
       }
     }
   },
-
   "features": {
     "narration": false,
     "antiSpiral": false,
@@ -151,16 +153,15 @@
     "sandboxAllowBash": false,
     "blockedCss": false
   },
-
   "limits": {
     "timeoutMs": 1800000,
     "maxToolRounds": 40,
     "toolContextWindow": 30000,
     "contextHandoffThreshold": 2000000,
     "antiSpiralMinWords": 40,
-    "execTimeoutMs": 10000
+    "execTimeoutMs": 10000,
+    "wrapUpRounds": 3
   },
-
   "paths": {
     "workspaceRoot": "",
     "auditsPlansDir": "",
@@ -169,7 +170,6 @@
     "handoffFile": "",
     "cookieFile": ".cookies.json"
   },
-
   "network": {
     "blockedUrlsExtra": [],
     "sandboxRoots": []

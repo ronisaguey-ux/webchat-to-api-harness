@@ -182,7 +182,8 @@ recognise. Keep `SANDBOX_ALLOW_BASH=false` unless you need it.
 | `HEADLESS` | `false` | visible browser for login |
 | `TIMEOUT` | `60000` | max wait for a response (ms) |
 | `TOOL_CONTEXT_WINDOW` | `8000` | cap on the tools section of the prompt (chars) |
-| `MAX_TOOL_ROUNDS` | `4` | max tool-execution rounds per request |
+| `MAX_TOOL_ROUNDS` | `40` | max tool-execution rounds per request (also `limits.maxToolRounds`) |
+| `WRAP_UP_ROUNDS` | `3` | rounds before that cap at which the model is stopped and told to deliver its final answer (also `limits.wrapUpRounds`) |
 | `LOGIN_WAIT_SECONDS` | `300` | how long to wait for manual login |
 | `API_TOKEN` | *(none)* | bearer token auth |
 | `BASH_ALLOWED` | `false` | enable `run_bash` |
