@@ -114,7 +114,7 @@ const cfg = {
     // 09-13: how many rounds BEFORE maxToolRounds the harness stops the model and
     // demands its final answer, so running out of rounds yields a summary instead
     // of an error. Configurable in harness.config.json (limits.wrapUpRounds).
-    wrapUpRounds: MC.pickNum('WRAP_UP_ROUNDS', 'limits', 'wrapUpRounds') || 3, // always-tool mode: feature work spans many rounds; yap-rejections burn 1-2 rounds per tool call (08-12: 20 ran out mid-task at read_file(App.jsx))
+    wrapUpRounds: MC.pickNum('WRAP_UP_ROUNDS', 'limits', 'wrapUpRounds') || 3,
     skipBrowser: MC.pickBool('SKIP_BROWSER', 'features', 'skipBrowser') === true,
 
     // Security
