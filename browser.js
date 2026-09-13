@@ -820,7 +820,18 @@ async function sendMessage(input, text) {
                     // the text just sits in the box. If the coordinates are still
                     // outside the viewport, dispatch the click in-page instead —
                     // it reaches the element regardless of layout.
-                    const vp = page.viewportSize() || { width: 0, height: 0 };
+                    // 09-13: a CDP-attached page (the ChatGPT lane connects to a
+                    // raw Chrome over CDP_WS_URL) has no Playwright
+                    // viewportSize(); calling it threw "page.viewportSize is not
+                    // a function" and killed the send before the click. Read the
+                    // viewport from the page itself, and treat "unknown" as
+                    // in-view so we still take the normal mouse-click path.
+                    let vp = { width: 0, height: 0 };
+                    try {
+                        vp = (typeof page.viewportSize === 'function' && page.viewportSize())
+                            || await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))
+                            || { width: 0, height: 0 };
+                    } catch { /* fall through with 0x0 */ }
                     const inView = pos.x >= 0 && pos.y >= 0 &&
                                    pos.x <= vp.width && pos.y <= vp.height;
                     if (inView) {
@@ -835,6 +846,34 @@ async function sendMessage(input, text) {
                             return false;
                         }, config.selectors.send);
                         if (!clicked) throw new Error('send button could not be clicked (off-viewport)');
+                    }
+                    // 09-13 (owner: "chatgbt prompt was never sent"): the mouse
+                    // click can land on a button that is visible and enabled and
+                    // still not submit — measured on the ChatGPT lane, the button
+                    // sat at (1414,461) inside a 1888px viewport, disabled=false,
+                    // and the whole 17K-char prompt stayed in the composer with no
+                    // assistant turn ever appearing. The in-page el.click() DID
+                    // submit it. So verify the send actually took: if the composer
+                    // still holds the prompt, dispatch the click on the element.
+                    await sleep(1200);
+                    const stillThere = await page.evaluate((sels) => {
+                        for (const sel of sels) {
+                            const el = document.querySelector(sel);
+                            const t = el && ((el.value !== undefined && el.value) || el.innerText || el.textContent || '');
+                            if (t && t.trim().length > 0) return true;
+                        }
+                        return false;
+                    }, config.selectors.input);
+                    if (stillThere) {
+                        console.log('🖱 prompt still in composer after the click — clicking the send button in-page');
+                        const clicked = await page.evaluate((sels) => {
+                            for (const sel of sels) {
+                                const el = document.querySelector(sel);
+                                if (el && el.getBoundingClientRect().width > 0) { el.click(); return true; }
+                            }
+                            return false;
+                        }, config.selectors.send);
+                        if (!clicked) console.log('⚠️ in-page send click found no button — falling through to Enter');
                     }
                     return;
                 }
@@ -999,6 +1038,13 @@ async function isForeignBusy() {
             for (const b of document.querySelectorAll('button')) {
                 if (stopish(b.innerText) && isVisible(b)) return true;
             }
+            // 09-13 (ChatGPT lane): ChatGPT's in-flight control is a
+            // data-testid, not an aria-label, so the aria/innerText scans above
+            // missed it — the harness could not tell "cogitating" from "done"
+            // and threw "response is empty after 12s" while the model was still
+            // thinking. The stop button IS the generation signal.
+            const sb = document.querySelector('[data-testid="stop-button"]');
+            if (isVisible(sb)) return true;
             return false;
         });
     } catch { return false; }
@@ -1460,7 +1506,11 @@ async function waitForResponse(before, typedText) {
         if (grew && state.text.length === 0) {
             // a new message element exists but has no text yet — if the chat
             // reports the response was stopped, that's a hard failure
-            emptySince += 1500;
+            // 09-13 (ChatGPT lane): ChatGPT mounts the assistant row the moment
+            // it starts and leaves it EMPTY while the model thinks, which can
+            // exceed 12s. An in-flight generation is not an empty answer, so a
+            // live stop control resets the grace instead of counting against it.
+            if (busy) emptySince = 0; else emptySince += 1500;
             if (state.body.includes('You stopped this response')) {
                 throw new Error('Webchat response was stopped (Stop button pressed while generating)');
             }
