@@ -1003,7 +1003,7 @@ async function sendMessage(input, text) {
 // = it keeps growing until stable. Falls back to count-mode on older
 // builds where the fixed selectors still exist.
 async function snapshotChat() {
-    return page.evaluate((sels) => {
+    return page.evaluate((sels, skipEmptyRows) => {
         const vl = document.querySelector('.ds-virtual-list');
         if (vl) {
             // Virtual list renders only what's in view — the newest message is
@@ -1088,7 +1088,7 @@ async function snapshotChat() {
                 // node, so waitForResponse read "" for 12s and threw "response
                 // is empty after 12s" while the real answer sat in an earlier
                 // node. Only a text-bearing row may become the newest answer.
-                if (quirk('skipEmptyMessageRows', false)) {
+                if (skipEmptyRows) {
                     if (t.length > 0) lastEl = el;
                 } else {
                     lastEl = el;
@@ -1103,7 +1103,7 @@ async function snapshotChat() {
             .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)?\n+/gi, '')
             .trim();
         return { mode: 'count', count: n, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
-    }, config.selectors.message);
+    }, config.selectors.message, quirk('skipEmptyMessageRows', false));
 }
 
 // STOP-glyph check (08-13, hoisted out of the wait loop): DeepSeek shows the
