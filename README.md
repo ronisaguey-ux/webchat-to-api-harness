@@ -228,11 +228,21 @@ with `webchat.mode` in `harness.config.json`, or the `WEBCHAT_MODE` env var.
 | `chatgpt` | https://chatgpt.com | `#prompt-textarea` | `[data-message-author-role="assistant"]` | clickFallbackOnFullComposer, autoContinueButton, skipEmptyMessageRows, ignoreStopButtonWhileBusy |
 | `gemini` | https://gemini.google.com | `div[contenteditable="true"], rich-textarea .ql-editor` | `model-response, .model-response-text` | enterSubmits, phantomStopButton |
 | `kimi` | https://www.kimi.ai/chat | `.chat-input-editor` | `.chat-content-item-assistant` | clearComposerWithKeyEvents, enterSubmits, clickFallbackOnFullComposer, autoContinueButton, restoresSavedDraft |
+| `notegpt` | https://notegpt.io/ai-chat | `div[contenteditable="true"]` | `.markdown-body` | send-in-page only; composer holds a stale draft |
 
 Anything you set explicitly still wins: an explicit `webchat.url`,
 `webchat.selectors.*` or the matching `SELECTOR_*` env var overrides the mode.
 An unknown mode name falls back to `generic` and logs a warning — it never
 crashes.
+
+These six are the TESTED modes: `deepseek`, `chatgpt`, `gemini`, `kimi`,
+`notegpt`, plus `generic`. Each one works differently — different composer,
+different send behaviour, different answer node — which is why they are modes
+and not one code path.
+
+`generic` attempts to work with any webchat outside that list: it uses broad
+selectors and the default submit behaviour. It will get you connected, but a
+site with a custom composer may need its own mode.
 
 If your webchat does not work with `generic`, open an issue and it will get a
 dedicated mode.

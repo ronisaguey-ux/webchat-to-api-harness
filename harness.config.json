@@ -25,7 +25,9 @@
     "daily use \u2014 read the README section before enabling one.",
     "",
     "limits.maxToolRounds = the hard cap on tool-execution rounds per request.",
-    "limits.wrapUpRounds  = how many rounds before that cap the harness stops the model and demands its final answer (default 3)."
+    "limits.wrapUpRounds  = how many rounds before that cap the harness stops the model and demands its final answer (default 3).",
+    "",
+    "notegpt is TESTED but its composer holds a stale draft and resists both clear mechanisms; the lane is parked. The mode exists so a fix can be dropped in without touching code."
   ],
   "server": {
     "host": "127.0.0.1",
@@ -57,7 +59,8 @@
       "deepseek": "",
       "chatgpt": "",
       "gemini": "",
-      "kimi": ""
+      "kimi": "",
+      "notegpt": ""
     }
   },
   "webchatModes": {
@@ -139,6 +142,25 @@
         "skipEmptyMessageRows": false,
         "ignoreStopButtonWhileBusy": false,
         "restoresSavedDraft": true
+      }
+    },
+    "notegpt": {
+      "url": "https://notegpt.io/ai-chat",
+      "tabUrlSubstring": "notegpt.io",
+      "selectors": {
+        "input": "div[contenteditable=\"true\"]",
+        "send": "button.bg-primary, button[aria-label*=\"Send\" i]",
+        "message": ".markdown-body, .prose, .message"
+      },
+      "quirks": {
+        "clearComposerWithKeyEvents": false,
+        "enterSubmits": false,
+        "clickFallbackOnFullComposer": true,
+        "autoContinueButton": false,
+        "skipEmptyMessageRows": false,
+        "ignoreStopButtonWhileBusy": false,
+        "sendInPageOnly": true,
+        "composerHoldsStaleDraft": true
       }
     }
   },
