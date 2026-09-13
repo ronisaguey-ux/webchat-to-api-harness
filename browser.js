@@ -1138,6 +1138,9 @@ async function isForeignBusy() {
 }
 
 // ── AUTO-CONTINUE (09-13) ───────────────────────────────────
+// NOTE: only the button-label path is implemented. If a site renders the
+// control as an icon with no text/aria-label, add its selector to
+// config.selectors and extend the loop below.
 // DeepSeek (and zh UIs generally) render a "Continue" / "继续" button when a
 // generation is cut short — the server ends the stream mid-answer and the UI
 // offers to resume it. Until now the harness read that as "generation
