@@ -277,7 +277,13 @@ const WEBCHAT_ACCOUNT = (() => {
 const DEEPSEEK_LOCK_DIR = process.env.WEBCHAT_LOCK_DIR || `/tmp/webchat_mutex_${WEBCHAT_ACCOUNT}`;
 const LOCK_STEAL_MS = 90000; // 3 heartbeats (30s each): a holder whose mtime stopped moving is dead
 const LOCK_HEARTBEAT_MS = 30000;
-const LOCK_ACQUIRE_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_LOCK_TIMEOUT_MS || '1800000', 10);
+// 09-12: a request queued behind another send on the SAME account must fail fast.
+// At 30 min a queued request sat silently while the engine's lane budget (400s)
+// expired, so the engine logged "timeout after 400s — lanes unavailable" even
+// though the account was healthy and serving the first request. 120s is longer
+// than one real send, short enough that the engine still gets an answer (an
+// error) and can hop to another lane.
+const LOCK_ACQUIRE_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_LOCK_TIMEOUT_MS || '120000', 10);
 let lockHeartbeat = null;
 let lockDepth = 0;
 
