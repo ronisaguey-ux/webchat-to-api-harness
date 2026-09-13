@@ -194,7 +194,59 @@ recognise. Keep `SANDBOX_ALLOW_BASH=false` unless you need it.
 | `BLOCKED_CSS` | `false` | `true` also blocks all `*.css*` (DeepSeek-only — other layouts break without stylesheets) |
 | `CONTEXT_HANDOFF_ENABLED` | `true` | auto-swap to a new chat at the context threshold |
 | `CONTEXT_HANDOFF_THRESHOLD` | `100000` | rough per-request context estimate that triggers the handoff (chars/4 ≈ tokens) |
-| `HANDOFF_FILE` | `/home/roni/Roni_workspace/handoff_to_new_chat.md` | where the handoff document is written |
+| `HANDOFF_FILE` | `<workspace>/handoff_to_new_chat.md` | where the handoff document is written |
+| `WORKSPACE_ROOT` | the harness's parent directory | base for every default path (audits, handoff, sibling repos) |
+| `AUDITS_PLANS_DIR` | `$WORKSPACE_ROOT/audits_plans` | where the inbox / outbox / drift reports live |
+| `DRIFT_REPORT_DIR` | `$AUDITS_PLANS_DIR/drift_reports` | drift report output |
+| `MAIN_INBOX_FILE` | `$AUDITS_PLANS_DIR/claude_inbox.json` | where the drift detector notifies main |
+| `ANTI_SPIRAL` | `false` | `true` enables reasoning-loop detection (see below) |
+| `ANTI_SPIRAL_MIN_WORDS` | `40` | don't judge a reply shorter than this |
+| `NARRATION` | `false` | `true` lets the model narrate; also relaxes anti-spiral so narration is never mistaken for a loop |
+
+## 🌀 Anti-spiral (`ANTI_SPIRAL=true`)
+
+A webchat model can collapse into a reasoning loop — the same sentence, line, or
+a short `Let me go.` / `Let me read.` tic repeated until the round budget runs
+out. The caller then gets `did not submit a final answer within the round budget`
+and all the work is lost.
+
+With `ANTI_SPIRAL=true` the gateway watches each reply for five loop signatures
+(ported from the opencode anti-spiral plugin v3, which was tuned against real
+spirals):
+
+1. the same sentence (>30 chars) twice in a row
+2. the same prose line (>= 6 words) three or more times
+3. the stall tic — a <= 4-word line (`Let me go.`, `OK.`) on its own, 4+ times
+4. n-gram dominance over the whole message
+5. tail dominance — the END of the message degenerated into one unit
+
+Code fences, tables and tool output are stripped before measuring, because those
+repeat lines legitimately.
+
+On the **first** detection the gateway stops feeding the tab and sends one
+redirect back into it — *stop repeating yourself, emit exactly one tool call*.
+On a **second** detection it stops the turn and returns the model's text with a
+warning at the top:
+
+```
+🛑 [ANTI-SPIRAL] Generation stopped: <what looped>. The loop was cut and the
+model was told to stop narrating and do the work. Partial work may be
+incomplete — re-send to continue.
+```
+
+### Narration is not a spiral
+
+If you drive this harness as an IDE agent you want narration — the model saying
+*"Let me run list_dir to inspect…"* before each tool call. That line repeats by
+design, once per tool call.
+
+So `NARRATION=true` also relaxes the detector: the `Let me …` tic fast-path is
+dropped, the repetition bars are raised, and the sentence check needs a much
+longer sentence. With narration **off** the model is meant to emit only tool
+JSON, so repeated prose is a loop and the sensitive thresholds apply.
+
+Verified: a real `Let me run list_dir…` loop trips in both modes; a 14-line
+narrated IDE session trips in neither.
 
 ## Performance & resource tuning (2026-08-14)
 
