@@ -30,13 +30,14 @@
 //     guardrail, not a jail — see the caveat in the README.
 
 const fs = require('fs');
+const PATHS = require('./paths');
 const path = require('path');
 
 // Roots that make sense for the oculus work this harness drives. Override with
 // SANDBOX_ROOTS. These are the ONLY defaults baked in.
 const OCULUS_RELEVANT_ROOTS = [
-    '/home/roni/Roni_workspace/oculus',
-    '/home/roni/Roni_Workspace/audits_plans',
+    path.join(PATHS.workspaceRoot(), 'oculus'),
+    PATHS.auditsPlans(),
 ];
 
 function parseList(raw) {
