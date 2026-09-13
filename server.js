@@ -946,8 +946,8 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         // FIRST time, redirect the model back to the task; if it loops again,
         // stop feeding the tab and hand the caller the warning at the top of the
         // answer instead of a round-budget error.
-        if (ANTI_SPIRAL.enabled()) {
-            const spiral = ANTI_SPIRAL.detectSpiral(response);
+        if (config.antiSpiral) {
+            const spiral = ANTI_SPIRAL.detectSpiral(response, { narration: config.narration });
             if (spiral) {
                 spiralStrikes++;
                 console.log(`🛑 anti-spiral: ${ANTI_SPIRAL.describe(spiral)} (strike ${spiralStrikes}) round ${round + 1}`);

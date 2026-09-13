@@ -34,8 +34,13 @@
 //   ANTI_SPIRAL_MIN_WORDS    don't judge text below this many words (default 40)
 
 const MIN_WORDS = Number(process.env.ANTI_SPIRAL_MIN_WORDS) || 40;
-// narrationOn is resolved per call so a running gateway picks up a config change.
-const narrationOn = () => String(process.env.NARRATION || 'false').toLowerCase() === 'true';
+// Resolved per call so a running gateway picks up a config change. `opts.narration`
+// (from the master config) wins when the caller passes it; otherwise the env var.
+let _narrationOpt;
+function narrationOn() {
+    if (_narrationOpt !== undefined) return _narrationOpt;
+    return String(process.env.NARRATION || 'false').toLowerCase() === 'true';
+}
 const TAIL_WORDS = 150;
 const TAIL_LINES = 12;
 
@@ -133,7 +138,8 @@ function detectTailLoop(text) {
 }
 
 // Returns null when the text is not a loop, otherwise the evidence.
-function detectSpiral(rawText) {
+function detectSpiral(rawText, opts) {
+    _narrationOpt = opts && typeof opts.narration === 'boolean' ? opts.narration : undefined;
     if (!rawText) return null;
     const text = stripNonProse(rawText);
     const words = normalizeWords(text);
