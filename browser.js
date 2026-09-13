@@ -634,10 +634,26 @@ async function typePrompt(text) {
         return true;
     }, config.selectors.input);
     if (!alreadyEmpty) {
-        await page.keyboard.down('Control');
-        await page.keyboard.press('KeyA');
-        await page.keyboard.up('Control');
-        await page.keyboard.press('Backspace');
+        // 09-13 (NoteGPT lane): Ctrl+A selects the whole PAGE when focus is not
+        // already inside the composer, so Backspace cleared nothing and every
+        // retry APPENDED — measured live, the composer grew 2762 -> 7983 chars
+        // and NoteGPT's send button flipped to disabled:true, so every click was
+        // a silent no-op. Clear it in-page instead (verified: composer 0,
+        // button enabled again).
+        await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                el.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: '',
+                }));
+                return;
+            }
+        }, config.selectors.input);
+        await sleep(150);
     }
     const cdp = await page.createCDPSession();
     await cdp.send('Input.insertText', { text });
