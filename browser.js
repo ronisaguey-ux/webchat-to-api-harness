@@ -1714,14 +1714,6 @@ async function waitForResponse(before, typedText) {
                     && /\}\s*$/.test(ctext);
                 if (!toolDone) { await sleep(1500); continue; }
             }
-            // 09-14: the count-mode accept returned a brace-imbalanced JSON
-            // fragment as the FINAL answer. The oculus engine's contract is
-            // `{"edits":[...],"notes":"..."}` and ChatGPT was answering
-            // `{"edits":[],"notes":"cannot` (27 chars, unclosed string,
-            // unbalanced braces) which the engine read as a terminal
-            // cannot-fix — so the lane looked broken while the model was
-            // actually still streaming. Keep polling on a truncated object.
-            if (looksLikeTruncatedAnswer(state.text)) { await sleep(1500); continue; }
             return state.text;
         }
         if (grew && state.text.length === 0) {
