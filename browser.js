@@ -669,7 +669,23 @@ async function typePrompt(text) {
             // send then appended after it (measured: composer 6812 chars, the
             // prompt never the leading text, gateway wedged to the hard cap).
             // Back-to-back in one session, the draft never gets the chance.
-            await cdp.send('Input.insertText', { text });
+            // 09-14 (Bob: "chat gbt does work, ur just sending it trunacated
+            // system prompts"): a single Input.insertText of a LONG prompt
+            // killed the ChatGPT renderer mid-insert — measured
+            // `TargetCloseError: Protocol error (Input.insertText): Target
+            // closed` on an 8,023-char prompt, after which the composer held
+            // only the prefix and the model answered the TRUNCATED contract
+            // (`{"edits":[],"notes":"cannot`). Insert in bounded chunks so the
+            // renderer never sees one oversized protocol frame.
+            const CHUNK = parseInt(process.env.INSERT_CHUNK_CHARS || '1500', 10);
+            if (text.length > CHUNK) {
+                for (let i = 0; i < text.length; i += CHUNK) {
+                    await cdp.send('Input.insertText', { text: text.slice(i, i + CHUNK) });
+                    await sleep(60);
+                }
+            } else {
+                await cdp.send('Input.insertText', { text });
+            }
             await cdp.detach();
             inserted = true;
         } catch (e) {
@@ -688,8 +704,21 @@ async function typePrompt(text) {
         await sleep(150);
     }
     if (!inserted) {
+        // 09-14: same chunking as the primary path — this FALLBACK is the one
+        // that was actually running (the key-event clear throws on ChatGPT, so
+        // `inserted` stays false) and a single oversized insertText killed the
+        // renderer mid-prompt, which is how the model ended up answering a
+        // truncated contract.
         const cdp = await page.createCDPSession();
-        await cdp.send('Input.insertText', { text });
+        const CHUNK2 = parseInt(process.env.INSERT_CHUNK_CHARS || '1500', 10);
+        if (text.length > CHUNK2) {
+            for (let i = 0; i < text.length; i += CHUNK2) {
+                await cdp.send('Input.insertText', { text: text.slice(i, i + CHUNK2) });
+                await sleep(60);
+            }
+        } else {
+            await cdp.send('Input.insertText', { text });
+        }
         await cdp.detach();
     }
     // 09-13 (NoteGPT lane): CDP Input.insertText updates the DOM but does NOT
