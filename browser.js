@@ -1731,9 +1731,18 @@ async function waitForResponse(before, typedText) {
         const seed = await snapshotChat();
         lastAnswerLen = (seed.answer || '').length;
     } catch { /* keep -1; the guard still fires once the answer is read */ }
+    // 09-14: the hard cap was only checked BETWEEN awaits, so a CDP call that never
+    // returns held the send forever — measured outstandingMs 511s against a 240s
+    // cap, and because sends are serialized that wedged the whole lane and the
+    // engine's batch with it. Race each poll against a deadline so the cap is
+    // actually enforceable: on a timeout the loop simply re-checks Date.now().
+    const withTimeout = (p, ms) => Promise.race([
+        p,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('cdp poll timeout')), ms)),
+    ]);
     while (Date.now() < hardCap) {
         try {
-            const tee = await readStreamedAnswer(teeStart);
+            const tee = await withTimeout(readStreamedAnswer(teeStart), 20000);
             if (tee.found && tee.text.trim().length > 0) {
                 console.log('⏱ timeout — rescuing the answer from the stream tee');
                 return tee.text;
