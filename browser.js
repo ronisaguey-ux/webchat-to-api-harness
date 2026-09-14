@@ -1179,7 +1179,26 @@ async function isForeignBusy() {
 // Only a VISIBLE, ENABLED control whose text is exactly continue-ish counts;
 // a substring match would hit prompt text (the gateway's own preamble
 // mentions "continues", which is why this is anchored, not /continue/i).
+// 09-14: DeepSeek renders a persistent "Continue" control that STAYS in the DOM
+// after it is clicked. The caller loops on this function and extends its deadline
+// on every hit, so a stuck Continue button produced a click every ~1s forever —
+// measured 175 clicks in 20 min on ds-gw2 — and the send never terminated, which
+// burned the engine's whole 400s lane budget and returned no edits. Bound it:
+// click at most once per CONTINUE_COOLDOWN_MS and at most CONTINUE_MAX_CLICKS
+// times per send, then report no-hit so the caller proceeds to accept/fail.
+const CONTINUE_COOLDOWN_MS = Number(process.env.CONTINUE_COOLDOWN_MS || 8000);
+const CONTINUE_MAX_CLICKS = Number(process.env.CONTINUE_MAX_CLICKS || 5);
+let _continueClicks = 0;
+let _continueLastAt = 0;
+
+function resetContinueBudget() {
+    _continueClicks = 0;
+    _continueLastAt = 0;
+}
+
 async function clickContinueIfPresent() {
+    if (_continueClicks >= CONTINUE_MAX_CLICKS) return false;
+    if (Date.now() - _continueLastAt < CONTINUE_COOLDOWN_MS) return false;
     try {
         const hit = await page.evaluate(() => {
             const cont = (s) => {
@@ -1207,7 +1226,12 @@ async function clickContinueIfPresent() {
             }
             return null;
         });
-        if (hit) console.log(`▶ generation was cut short — clicked "${hit}" and continuing`);
+        if (hit) {
+            _continueClicks += 1;
+            _continueLastAt = Date.now();
+            console.log(`▶ generation was cut short — clicked "${hit}" and continuing `
+                        + `(${_continueClicks}/${CONTINUE_MAX_CLICKS})`);
+        }
         return !!hit;
     } catch { return false; }
 }
