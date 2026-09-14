@@ -2025,19 +2025,47 @@ async function waitForResponse(before, typedText) {
 // server.js captures and pins for every respawn path.
 // 09-14 (owner): Freebuff pins its reasoning-effort menu to "Low" so the
 // thinking model (GLM 5.3 Flash) doesn't spend 4-5 min reasoning per reply.
+// The Radix popover does NOT open from an in-page el.click() (probed: the
+// [role=menuitemradio] nodes stay empty), so drive REAL CDP mouse events at
+// the measured coordinates — the same trick that makes the Kimi composer clear.
 async function setReasoningEffortLow() {
     try {
-        await page.evaluate(() => {
-            const btn = [...document.querySelectorAll('button')]
+        const cdp = await page.createCDPSession();
+        const clickAt = async (x, y) => {
+            await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+            await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+        };
+        const btnPos = await page.evaluate(() => {
+            const b = [...document.querySelectorAll('button')]
                 .find((b) => (b.getAttribute('aria-label') || '').includes('reasoning effort'));
-            if (btn) btn.click();
+            if (!b) return null;
+            const r = b.getBoundingClientRect();
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
         });
-        await sleep(1200);
-        await page.evaluate(() => {
+        if (!btnPos) return;
+        await clickAt(btnPos.x, btnPos.y);
+        await sleep(1500);
+        let lowPos = await page.evaluate(() => {
             const item = [...document.querySelectorAll('[role=menuitemradio]')]
                 .find((e) => (e.innerText || '').includes('Low'));
-            if (item) item.click();
+            if (!item) return null;
+            const r = item.getBoundingClientRect();
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
         });
+        if (!lowPos) {
+            // the popover can lag behind a fast click — reopen once and retry
+            await clickAt(btnPos.x, btnPos.y);
+            await sleep(1500);
+            lowPos = await page.evaluate(() => {
+                const item = [...document.querySelectorAll('[role=menuitemradio]')]
+                    .find((e) => (e.innerText || '').includes('Low'));
+                if (!item) return null;
+                const r = item.getBoundingClientRect();
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            });
+        }
+        if (!lowPos) { console.warn('⚠️ freebuff Low menu item not found after retry'); return; }
+        await clickAt(lowPos.x, lowPos.y);
         await sleep(500);
         console.log('🎚️ freebuff reasoning effort -> Low');
     } catch (e) {
