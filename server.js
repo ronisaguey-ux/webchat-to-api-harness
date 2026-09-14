@@ -403,7 +403,7 @@ async function countedSend(msg, defs) {
     const gap = usesDeepSeek() ? nextSendGapMs() : 0;
     const waitMs = Math.max(0, lastSendAt + gap - Date.now(), sharedWaitMs);
     if (waitMs > 0) {
-        console.log(`⏱ send gate: waiting ${waitMs}ms (random ${gap}ms gap this send, shared across lanes)`);
+        console.log(`⏱ send gate: waiting ${waitMs}ms (random ${gap}ms gap this send, per ACCOUNT ${WEBCHAT_ACCOUNT} — the DS lanes are separate accounts)`);
         await sleep(waitMs);
     }
     lastSendAt = Date.now();
