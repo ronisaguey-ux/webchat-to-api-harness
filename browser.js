@@ -587,6 +587,167 @@ async function selectExpertMode() {
 // contenteditable editors (Gemini, …) fall back to focused insertText.
 // ⚠️ NEVER use page.keyboard.type() for multi-line prompts: it translates
 // "\n" into Enter keypresses, which SENDS the partial message mid-prompt.
+// 09-14 (worker): host gate. browser.js is SHARED with the deepseek and gemini
+// lanes, so every ChatGPT-specific behaviour is gated exactly the way the
+// existing empty-grace gate is (see waitForResponse).
+function _isChatGptHost() {
+    try { return new URL(config.webchatUrl).host.includes('chatgpt'); }
+    catch (e) { return false; }
+}
+
+// 09-14 (worker, brief Part A): CARET-ANCHORED, VERIFIED CHUNKED INSERT.
+//
+// Root cause of the "blank screen / no message history" + empty-response
+// reports: `Input.insertText` inserts at the composer's CURRENT selection.
+// ChatGPT's composer is ProseMirror, which re-renders and REMAPS the selection
+// asynchronously whenever an inserted chunk contains newlines (each newline
+// becomes a new paragraph node). The old loop fired chunks 60ms apart with no
+// caret control, so a chunk that landed while ProseMirror was normalising went
+// in at a STALE offset. Measured live on the owner's tab: the user rows held
+// interleaved text — `M appe_scaffold.dart` (the middle of
+// `app/lib/widgets/responsive_scaffold.dart` overwritten) and
+// `RUN VERIFICATION NOW./lib/widgets/responsiv` (the END of the prompt sitting
+// BEFORE the middle of it). A scrambled prompt is why the model answered
+// `cannot-fix` / empty on a contract it could otherwise satisfy.
+//
+// Fix: collapse the selection to the END of the composer before EVERY chunk,
+// then VERIFY the composer actually holds the whole prompt by re-reading the
+// DOM. Bounded retry (never unbounded), and on ChatGPT a failure throws so the
+// engine hops the lane instead of sending scrambled text to the model.
+async function _collapseCaretToEnd(sels) {
+    return page.evaluate((s) => {
+        for (const sel of s) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            el.focus();
+            if (el.value !== undefined) {           // <textarea>/<input>
+                try { el.selectionStart = el.selectionEnd = el.value.length; } catch (e) {}
+                return true;
+            }
+            const range = document.createRange();   // contenteditable
+            range.selectNodeContents(el);
+            range.collapse(false);                  // false = to the END
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            return true;
+        }
+        return false;
+    }, sels);
+}
+
+async function _composerText(sels) {
+    return page.evaluate((s) => {
+        for (const sel of s) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            return (el.value !== undefined && el.value !== null)
+                ? String(el.value) : (el.innerText || el.textContent || '');
+        }
+        return '';
+    }, sels);
+}
+
+async function insertTextChunked(cdp, text, sels) {
+    const CHUNK = parseInt(process.env.INSERT_CHUNK_CHARS || '1500', 10);
+    if (text.length <= CHUNK) {
+        await _collapseCaretToEnd(sels);
+        await cdp.send('Input.insertText', { text });
+        return;
+    }
+    for (let i = 0; i < text.length; i += CHUNK) {
+        // Re-anchor before EVERY chunk: this is the whole fix. Without it a
+        // ProseMirror re-render between chunks drops the next one mid-document.
+        await _collapseCaretToEnd(sels);
+        await cdp.send('Input.insertText', { text: text.slice(i, i + CHUNK) });
+        await sleep(60);
+    }
+}
+
+// Insert, then PROVE the composer holds the prompt. Returns the final length.
+async function insertVerified(cdp, text, sels, { isChatGpt = false } = {}) {
+    const MAX_TRIES = 3;                       // bounded — never a retry loop
+    let lastLen = -1;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+        await insertTextChunked(cdp, text, sels);
+        await sleep(200);
+        const got = await _composerText(sels);
+        lastLen = got.length;
+        // Compare on WHITESPACE-NORMALISED text. A contenteditable reports
+        // innerText with its own block separators — ProseMirror adds one extra
+        // newline per paragraph node, so a correct 16,780-char prompt reads
+        // back as 17,011 chars (measured). Comparing raw text makes every long
+        // multi-line prompt look corrupt. What actually matters is that the
+        // CONTENT and its ORDER survived, so normalise runs of whitespace on
+        // both sides, then check length-within-tolerance AND the prompt's own
+        // tail — a scrambled insert moves the tail even when the length matches.
+        const norm = (x) => x.replace(/\s+/g, ' ').trim();
+        const nGot = norm(got);
+        const nWant = norm(text);
+        const tail = nWant.slice(-60);
+        const lenOk = Math.abs(nGot.length - nWant.length) <= Math.max(32, nWant.length * 0.02);
+        const tailOk = tail.length === 0 || nGot.endsWith(tail);
+        if (lenOk && tailOk) {
+            if (attempt > 1) console.log(`✅ composer verified on attempt ${attempt} (${got.length} chars)`);
+            return got.length;
+        }
+        console.log(`⚠️ composer mismatch (attempt ${attempt}/${MAX_TRIES}): `
+            + `want ${nWant.length} normalised chars ending ${JSON.stringify(tail.slice(-24))}, `
+            + `got ${nGot.length} ending ${JSON.stringify(nGot.slice(-24))} `
+            + `[lenOk=${lenOk} tailOk=${tailOk}]`);
+        if (attempt < MAX_TRIES) {
+            await clearComposerHard(cdp, sels);   // full reset, then retype
+            await sleep(150);
+        }
+    }
+    if (isChatGpt) {
+        throw new Error(`Composer verification failed after ${MAX_TRIES} attempts `
+            + `(want ${text.length} chars, got ${lastLen}) — refusing to send a scrambled prompt`);
+    }
+    console.log(`⚠️ proceeding with unverified composer (${lastLen}/${text.length} chars)`);
+    return lastLen;
+}
+
+// Hard clear: real CDP key events (Ctrl+A, Backspace) with an execCommand
+// fallback, then confirm by re-reading the DOM rather than trusting the call.
+async function clearComposerHard(cdp, sels) {
+    try {
+        await _collapseCaretToEnd(sels);
+        for (const t of [
+            { type: 'keyDown', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 },
+            { type: 'keyUp', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 },
+            { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+            { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+        ]) {
+            await cdp.send('Input.dispatchKeyEvent', t);
+        }
+    } catch (e) {
+        console.log('⚠️ key-event clear failed:', String(e).slice(0, 120));
+    }
+    await sleep(120);
+    let left = (await _composerText(sels)).trim().length;
+    if (left > 0) {
+        // execCommand path (works on DeepSeek/NoteGPT where key events desync)
+        await page.evaluate((s) => {
+            for (const sel of s) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                el.focus();
+                if (el.value !== undefined) { el.value = ''; }
+                else {
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('delete', false, null);
+                }
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward' }));
+                return;
+            }
+        }, sels);
+        await sleep(120);
+        left = (await _composerText(sels)).trim().length;
+    }
+    return left;
+}
+
 async function typePrompt(text) {
     // 08-12 23:30 handle-free (see sendMessage): query the LIVE element inside
     // the evaluate — no JSHandle args, nothing to detach when the SPA remounts
@@ -677,15 +838,9 @@ async function typePrompt(text) {
             // only the prefix and the model answered the TRUNCATED contract
             // (`{"edits":[],"notes":"cannot`). Insert in bounded chunks so the
             // renderer never sees one oversized protocol frame.
-            const CHUNK = parseInt(process.env.INSERT_CHUNK_CHARS || '1500', 10);
-            if (text.length > CHUNK) {
-                for (let i = 0; i < text.length; i += CHUNK) {
-                    await cdp.send('Input.insertText', { text: text.slice(i, i + CHUNK) });
-                    await sleep(60);
-                }
-            } else {
-                await cdp.send('Input.insertText', { text });
-            }
+            // 09-14 (worker): caret-anchored + VERIFIED. See insertVerified.
+            await insertVerified(cdp, text, config.selectors.input,
+                                 { isChatGpt: _isChatGptHost() });
             await cdp.detach();
             inserted = true;
         } catch (e) {
@@ -710,15 +865,11 @@ async function typePrompt(text) {
         // renderer mid-prompt, which is how the model ended up answering a
         // truncated contract.
         const cdp = await page.createCDPSession();
-        const CHUNK2 = parseInt(process.env.INSERT_CHUNK_CHARS || '1500', 10);
-        if (text.length > CHUNK2) {
-            for (let i = 0; i < text.length; i += CHUNK2) {
-                await cdp.send('Input.insertText', { text: text.slice(i, i + CHUNK2) });
-                await sleep(60);
-            }
-        } else {
-            await cdp.send('Input.insertText', { text });
-        }
+        // 09-14 (worker): this FALLBACK is the path that actually runs on
+        // ChatGPT (the key-event clear throws there), so it gets the same
+        // caret-anchored, verified insert.
+        await insertVerified(cdp, text, config.selectors.input,
+                             { isChatGpt: _isChatGptHost() });
         await cdp.detach();
     }
     // 09-13 (NoteGPT lane): CDP Input.insertText updates the DOM but does NOT
