@@ -859,6 +859,17 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     }
 
     let response = await countedSend(injectMainReplies(prompt), toolDefs);
+
+    // 09-14: PASSTHROUGH_FORMAT means the caller shipped a complete contract
+    // (the oculus step engine's {"edits":[...]}). Run the tool loop for it and
+    // the model is driven into interactive tool mode instead: measured live the
+    // DS lanes answered {"tool":"read_file",...} / {"tool":"list_dir",...} /
+    // {"tool":"submit_answer",...} for 13+ rounds, the engine read every one as
+    // "no edits", and step commits went 35/h -> 0/h for 90 minutes. A caller
+    // contract is answered ONCE, verbatim.
+    if (config.passthroughFormat) {
+        return response;
+    }
     // Growth baseline: captured AFTER the first send so a request whose body
     // starts large (fresh seed, big overhead) isn't seen as "grown" by it.
     let requestStartBody = lastReqBodyChars;
