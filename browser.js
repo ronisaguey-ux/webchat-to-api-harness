@@ -401,6 +401,12 @@ async function sendPrompt(prompt, toolDefinitions) {
     // DeepThink chip — Search is never touched). No-op for foreign webchats
     // (no such chips) and never throws.
     await ensureToggles();
+    // 09-14 (owner): Freebuff resets reasoning effort to "Max" on new chat; a
+    // reused tab keeps whatever it had. Pin it to "Low" before every send so the
+    // thinking model never cooks the timeout — cheap, idempotent, freebuff-only.
+    if (new URL(config.webchatUrl).host.includes('freebuff')) {
+        await setReasoningEffortLow();
+    }
     console.log(`📤 Sending prompt (${prompt.length} chars)`);
 
     // 08-13 FOREIGN-BUSY guard: a generation left running from a
@@ -2017,6 +2023,28 @@ async function waitForResponse(before, typedText) {
 // sends the document as the first message. Typing on the new-chat page is
 // what CREATES the thread; the tab's URL then carries the new /s/ id, which
 // server.js captures and pins for every respawn path.
+// 09-14 (owner): Freebuff pins its reasoning-effort menu to "Low" so the
+// thinking model (GLM 5.3 Flash) doesn't spend 4-5 min reasoning per reply.
+async function setReasoningEffortLow() {
+    try {
+        await page.evaluate(() => {
+            const btn = [...document.querySelectorAll('button')]
+                .find((b) => (b.getAttribute('aria-label') || '').includes('reasoning effort'));
+            if (btn) btn.click();
+        });
+        await sleep(1200);
+        await page.evaluate(() => {
+            const item = [...document.querySelectorAll('[role=menuitemradio]')]
+                .find((e) => (e.innerText || '').includes('Low'));
+            if (item) item.click();
+        });
+        await sleep(500);
+        console.log('🎚️ freebuff reasoning effort -> Low');
+    } catch (e) {
+        console.warn('⚠️ set reasoning effort Low failed:', e.message);
+    }
+}
+
 async function openNewChat() {
     // Fresh CDP session like every send (stale-session refresh).
     await initBrowser({ reconnect: true });
@@ -2053,6 +2081,12 @@ async function openNewChat() {
     if (new URL(config.webchatUrl).host.includes('deepseek')) {
         await selectExpertMode();
         await sleep(500);
+    }
+    // 09-14 (owner): Freebuff's reasoning-effort defaults to "Max (model default)"
+    // on every new chat, which makes GLM 5.3 Flash think 4-5 min per reply. Pin
+    // it to "Low" so the lane answers fast instead of cooking the timeout.
+    if (new URL(config.webchatUrl).host.includes('freebuff')) {
+        await setReasoningEffortLow();
     }
     return page;
 }
