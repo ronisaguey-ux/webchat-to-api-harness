@@ -692,6 +692,15 @@ const SUBMIT_TOOL_DEF = {
 // that existed but were never shown. The gateway's tools ARE the model's
 // actual capabilities; keep the list constant across all rounds.
 function buildExecutableToolDefs() {
+    // 09-14: PASSTHROUGH_FORMAT means the CALLER shipped a complete contract
+    // (the oculus step engine's {"edits":[...]}). Offering the interactive tool
+    // set on top of it is a competing instruction the model obeys: measured live
+    // the DS lane answered {"tool":"see_next_chunk",...} / {"tool":"read_file",...}
+    // for 13+ rounds and the engine read every one as "no edits", so no step could
+    // commit (throughput 43/h -> 0/h). With a caller-supplied contract there is
+    // nothing for the interactive tools to do — return an empty set so the model
+    // answers the contract directly.
+    if (config.passthroughFormat) return [];
     return [...getToolDefinitions(), SUBMIT_TOOL_DEF];
 }
 
