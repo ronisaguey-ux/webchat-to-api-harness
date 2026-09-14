@@ -1491,6 +1491,25 @@ function looksLikeTruncatedAnswer(text) {
     // Dangling tool-JSON tails (fenceless replies / partial render):
     if (/("tool"\s*:\s*"[^"]*"\s*,\s*"params"\s*:\s*\{)[^{}]*$/.test(text)) return true;
     if (/"params"\s*:\s*\{\s*$/.test(text)) return true;
+    // 09-14: a fenceless JSON reply cut MID-OBJECT was accepted as final. The
+    // oculus engine's contract is `{"edits":[...], "notes":"..."}` and ChatGPT
+    // was returning `{"edits":[],"notes":"cannot` — 36 chars, unclosed string,
+    // unbalanced braces — which the engine read as a terminal cannot-fix and
+    // the lane looked broken. Measured on the live tab: the DOM held exactly
+    // that truncated text. Catch any brace-imbalanced tail.
+    const t = text.trim();
+    if (t.startsWith('{') || t.startsWith('[')) {
+        let depth = 0, inStr = false, esc = false;
+        for (const ch of t) {
+            if (esc) { esc = false; continue; }
+            if (ch === '\\') { if (inStr) esc = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === '{' || ch === '[') depth++;
+            else if (ch === '}' || ch === ']') depth--;
+        }
+        if (depth > 0 || inStr) return true;   // truncated JSON object/array
+    }
     return false;
 }
 
