@@ -350,6 +350,11 @@ let lastReqBodyChars = 0;
 // Shared send path: rate-limit spacing + body refresh + one timeout retry.
 // Module scope so the handoff doc flow (runHandoff) uses the same gate.
 let sendRetriesLeft = 1;
+// 09-14 (owner): webchat tabs accumulate an unbounded thread and the renderer
+// eventually crashes (measured: chatgpt at 144 rows / 429KB DOM -> Target closed).
+// Open a fresh chat every N sends so the thread never grows that far.
+const NEW_CHAT_EVERY_SENDS = parseInt(process.env.NEW_CHAT_EVERY_SENDS || '5', 10);
+let sendCount = 0;
 // Post-swap grace: the first request after a handoff always reaches the
 // fresh thread (its seeded body can be ≥ threshold by itself — overhead +
 // doc — and must not re-trigger the pre-send handoff immediately).
@@ -359,6 +364,14 @@ let lastHandoffAt = 0;
 // at every handleRequest start and whenever a tool executes.
 let activeHandoffCtx = null;
 async function countedSend(msg, defs) {
+    // 09-14 (owner): open a fresh webchat thread every N sends so the tab never
+    // accumulates a renderer-crashing history (chatgpt measured 144 rows -> Target closed).
+    sendCount += 1;
+    if (sendCount >= NEW_CHAT_EVERY_SENDS) {
+        sendCount = 0;
+        console.log(`🆕 opening a fresh chat (every ${NEW_CHAT_EVERY_SENDS} sends)`);
+        try { await openNewChat(); } catch (e) { console.warn('⚠️ fresh-chat open failed:', e.message); }
+    }
     // 08-14 GLOBAL SEND MUTEX: wait for any other deepseek-tab gateway to
     // finish its generation before sending (owner rule: one in-flight
     // message per account). Held through the response; released in finally.
