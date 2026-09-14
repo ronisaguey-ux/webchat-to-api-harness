@@ -1695,6 +1695,31 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Error:', error);
+        // 09-13: the throttle does NOT always arrive as reply TEXT. DeepSeek throws
+        // it as a stream error ("DeepSeek stream error: Messages too frequent …
+        // rate_limit_reached"), which lands HERE as an exception — so the detection
+        // above never ran, no cooldown was set, and the account kept being hammered
+        // (measured 16 hits in 15 min, every one a 500 that looked like a gateway
+        // bug). Detect the throttle on the ERROR path too and cool the account.
+        if (RATE_LIMIT.enabled() && RATE_LIMIT.isRateLimitText(error?.message)) {
+            const { seconds } = RATE_LIMIT.startCooldown(
+                process.env.WEBCHAT_ACCOUNT || process.env.PORT,
+                config.rateLimitCooldownSeconds,
+            );
+            console.log(`🛑 webchat rate limit (stream error) — cooling this account ${seconds}s`);
+            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                res.set('Retry-After', String(seconds));
+                return res.status(429).json({
+                    error: {
+                        message: `Webchat account throttled ("Messages too frequent"). Retry in ${seconds}s.`,
+                        type: 'rate_limit_error',
+                        code: 'webchat_rate_limited',
+                        retry_after_seconds: seconds,
+                    },
+                });
+            }
+            return;
+        }
         // 08-13 EVENING: headersSent guard — a crashed-stream attempt here
         // threw ERR_HTTP_HEADERS_SENT and killed the process the same way.
         if (!res.headersSent && !res.writableEnded && !res.destroyed) {
