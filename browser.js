@@ -1186,6 +1186,16 @@ async function isForeignBusy() {
             // missed it — the harness could not tell "cogitating" from "done"
             // and threw "response is empty after 12s" while the model was still
             // thinking. The stop button IS the generation signal.
+            // 09-14: the stop control is not always `stop-button` — ChatGPT
+            // mounts the assistant row EMPTY while it thinks, and a missed stop
+            // control makes `busy` read false, so the 12s empty-grace expired
+            // and the send threw "empty after 12s" while the tab held the
+            // finished answer (measured: gateway 500 at 20.2s, tab had a
+            // 103-char answer). Match any stop-ish data-testid too.
+            for (const el of document.querySelectorAll('[data-testid]')) {
+                const tid = (el.getAttribute('data-testid') || '').toLowerCase();
+                if (tid.includes('stop') && isVisible(el)) return true;
+            }
             const sb = document.querySelector('[data-testid="stop-button"]');
             if (isVisible(sb)) return true;
             return false;
@@ -1737,8 +1747,16 @@ async function waitForResponse(before, typedText) {
             if (state.body.includes('You stopped this response')) {
                 throw new Error('Webchat response was stopped (Stop button pressed while generating)');
             }
-            if (emptySince > 12000) {
-                throw new Error('Webchat response is empty after 12s — stopped or aborted by the UI');
+            // 09-14 (ChatGPT): ChatGPT mounts the assistant row EMPTY the
+            // moment it starts and can stay empty well past 12s before the
+            // first token lands (measured: gateway threw at 20.2s, the tab
+            // then held a complete 103-char edits JSON). A mounted-but-empty
+            // newest row on chatgpt is a generation in flight, not an aborted
+            // answer — give it a chatgpt-sized grace instead of the generic
+            // 12s so a slow-but-real answer is never discarded.
+            const emptyGraceMs = new URL(config.webchatUrl).host.includes('chatgpt') ? 60000 : 12000;
+            if (emptySince > emptyGraceMs) {
+                throw new Error(`Webchat response is empty after ${emptyGraceMs / 1000}s — stopped or aborted by the UI`);
             }
         } else {
             emptySince = 0;
