@@ -179,7 +179,7 @@
       "selectors": {
         "input": "textarea[placeholder^=\"Ask\"]",
         "send": "button[aria-label^=\"Send\"]",
-        "message": "div.whitespace-pre-wrap.break-words"
+        "message": "div.chat-markdown"
       },
       "quirks": {
         "clearComposerWithKeyEvents": true,
