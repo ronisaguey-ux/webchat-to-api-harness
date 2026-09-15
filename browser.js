@@ -1228,6 +1228,50 @@ async function sendMessage(input, text) {
                         }, config.selectors.send);
                         if (!clicked) console.log('⚠️ in-page send click found no button — falling through to Enter');
                     }
+                    // 09-15: NOTHING verified that the prompt actually LEFT the
+                    // composer. Measured on gemini: '🖱 prompt still in composer
+                    // after the click — clicking the send button in-page' followed by
+                    // 5+ minutes of 'Waiting for response...' with the prompt still
+                    // sitting in the box unsent. The caller then waits out its whole
+                    // budget for an answer to a message that was never sent, and the
+                    // engine logs it as a lane failure. Confirm the submission here,
+                    // retry once in-page, and FAIL LOUDLY if it still will not send —
+                    // a fast honest error beats a silent hang.
+                    await sleep(700);
+                    const stillUnsent = await page.evaluate((sels) => {
+                        for (const sel of sels) {
+                            const el = document.querySelector(sel);
+                            if (!el) continue;
+                            const t = el && ((el.value !== undefined && el.value) || el.innerText || el.textContent || '');
+                            if (t && t.trim().length > 0) return true;
+                        }
+                        return false;
+                    }, config.selectors.input).catch(() => false);
+                    if (stillUnsent) {
+                        console.log('⚠️ prompt STILL in the composer after the in-page click — retrying once');
+                        const sent = await page.evaluate((sels) => {
+                            for (const sel of sels) {
+                                const el = document.querySelector(sel);
+                                if (el && el.getBoundingClientRect().width > 0) { el.click(); return true; }
+                            }
+                            return false;
+                        }, config.selectors.send).catch(() => false);
+                        await sleep(700);
+                        const stillUnsent2 = await page.evaluate((sels) => {
+                            for (const sel of sels) {
+                                const el = document.querySelector(sel);
+                                if (!el) continue;
+                                const t = el && ((el.value !== undefined && el.value) || el.innerText || el.textContent || '');
+                                if (t && t.trim().length > 0) return true;
+                            }
+                            return false;
+                        }, config.selectors.input).catch(() => false);
+                        if (stillUnsent2) {
+                            throw new Error('send failed: the prompt never left the composer after '
+                                + (sent ? 'two in-page clicks' : 'an unavailable send button')
+                                + ' — refusing to wait for an answer to a message that was never sent');
+                        }
+                    }
                     return;
                 }
                 await page.keyboard.press('Enter');
