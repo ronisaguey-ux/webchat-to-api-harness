@@ -1,6 +1,6 @@
 {
   "_README": [
-    "MASTER CONFIG — one place to turn every harness feature on or off and to",
+    "MASTER CONFIG \u2014 one place to turn every harness feature on or off and to",
     "pick the webchat it is talking to.",
     "",
     "Precedence, highest first:",
@@ -22,7 +22,7 @@
     "a dedicated mode.",
     "",
     "Features marked EXPERIMENTAL are off by default and have not been proven in",
-    "daily use — read the README section before enabling one.",
+    "daily use \u2014 read the README section before enabling one.",
     "",
     "limits.maxToolRounds = the hard cap on tool-execution rounds per request.",
     "limits.wrapUpRounds  = how many rounds before that cap the harness stops the model and demands its final answer (default 3).",
@@ -52,6 +52,12 @@
       "input": "",
       "send": "",
       "message": ""
+    },
+    "gemini": {
+      "selectors": {
+        "send": "button[aria-label=\"Send message\"]",
+        "input": "rich-textarea [contenteditable=\"true\"], div[contenteditable=\"true\"]"
+      }
     }
   },
   "systemPrompt": {
@@ -69,7 +75,7 @@
   },
   "webchatModes": {
     "generic": {
-      "_comment": "No assumptions. Use this if your webchat is not listed — if it does not work, open an issue and it gets its own mode.",
+      "_comment": "No assumptions. Use this if your webchat is not listed \u2014 if it does not work, open an issue and it gets its own mode.",
       "url": "",
       "tabUrlSubstring": "",
       "selectors": {
