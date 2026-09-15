@@ -55,9 +55,9 @@
     },
     "gemini": {
       "selectors": {
-        "send": "button[aria-label=\"Send message\"]",
-        "input": "rich-textarea [contenteditable=\"true\"], div[contenteditable=\"true\"]"
-      }
+        "input": "div[contenteditable=\"true\"]"
+      },
+      "mode": "deepseek"
     }
   },
   "systemPrompt": {
