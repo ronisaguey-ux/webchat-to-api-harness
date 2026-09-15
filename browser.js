@@ -503,7 +503,9 @@ async function sendPrompt(prompt, toolDefinitions) {
     await sendMessage(input, fullPrompt);
 
     console.log('⏳ Waiting for response...');
-    const text = await waitForResponse(before, fullPrompt);
+    const _budget = Math.max(60000, parseInt(process.env.HARD_CAP_MS) || (config.timeout || 300000));
+    const text = await withAbsoluteDeadline(
+        waitForResponse(before, fullPrompt), _budget + 15000, 'waitForResponse');
     console.log(`📥 Response received (${text.length} chars)`);
 
     // 08-14 EXPERT-SWAP PIN: the first send on a fresh thread is what creates
@@ -1795,6 +1797,24 @@ async function readStreamedAnswer(startIndex) {
 // is the exact prompt we typed — the user message rendering it must NOT
 // be accepted as the response (DeepSeek cogitates for seconds before its
 // answer replaces it as the last item).
+// 09-15: the hard cap inside waitForResponse is only checked BETWEEN awaits, so a
+// CDP read that never returns holds the send indefinitely - measured
+// /health {"wedged":true,"outstandingMs":1532785}, a send stuck for 25 MINUTES with
+// the finished answer sitting in the tab the whole time (the engine read every one
+// of those as 'empty response after 180s'). Race the whole call against an absolute
+// deadline so NOTHING inside it can outlive the budget, whichever await hangs.
+function withAbsoluteDeadline(promise, ms, label) {
+    let timer;
+    return Promise.race([
+        promise.finally(() => clearTimeout(timer)),
+        new Promise((_, rej) => {
+            timer = setTimeout(
+                () => rej(new Error(`${label} exceeded its absolute deadline after ${ms}ms`)),
+                ms);
+        }),
+    ]);
+}
+
 async function waitForResponse(before, typedText) {
     // 08-13 SSE-TEE: the completion XHR's streamed body is now the primary
     // answer source (the DOM stopped rendering responses in this env). Tee
@@ -2232,7 +2252,10 @@ async function sendFirstMessage(text) {
     console.log('⏳ Waiting for the new chat to acknowledge the handoff...');
     let reply = '';
     try {
-        reply = await waitForResponse(before, text);
+        reply = await withAbsoluteDeadline(
+            waitForResponse(before, text),
+            Math.max(60000, parseInt(process.env.HARD_CAP_MS) || (config.timeout || 300000)) + 15000,
+            'handoff waitForResponse');
     } catch (e) {
         // The thread exists the moment the message lands; a timed-out first
         // reply (long cogitation) must not abort the swap.
