@@ -364,6 +364,67 @@ async function waitForChatInput() {
 // ──────────────────────────────────────────────────────
 // 4. SEND PROMPT + GET RESPONSE
 // ──────────────────────────────────────────────────────
+// ── dead-tab self-heal (09-15) ─────────────────────────────────────────────
+// Ported from another agent's gateway-resilience guide, kept only where it fits
+// THIS harness (their `page.reload({waitUntil:'networkidle2'})` is Puppeteer —
+// Playwright has no networkidle2 — and their `.main_reply_seen_[PORT].json`
+// outbox markers do not exist here, so that step is dropped rather than faked).
+//
+// Why it exists: measured on the freebuff lane, a send sat for 9m21s while the
+// tab produced nothing at all, and because sends are serialized per account that
+// wedged the whole lane to the hard cap. The gateway had no way to tell "still
+// thinking" from "tab is dead" — it just waited.
+//
+// The discriminator is the same one the guide proposes: if the tab is NOT
+// generating (no stop control) AND no new text has arrived for a long while,
+// the tab is dead, not slow. Recover it instead of waiting out the cap.
+async function isTabGenerating() {
+    try {
+        const state = await Promise.race([
+            page.evaluate(() => {
+                const stop = document.querySelector(
+                    '[data-testid="stop-button"], button[aria-label*="Stop" i], [class*="stop"]');
+                return { stop: !!stop };
+            }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('cdp poll timeout')), 8000)),
+        ]);
+        return !!state.stop;
+    } catch {
+        return null;              // unknown — let the caller stay conservative
+    }
+}
+
+async function selfHealDeadTab(reason) {
+    console.log(`🩹 dead tab detected (${reason}) — reloading and waiting for the composer`);
+    try {
+        await Promise.race([
+            page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('reload timeout')), 50000)),
+        ]);
+    } catch (e) {
+        console.log(`🩹 reload failed: ${e.message}`);
+        return false;
+    }
+    // Poll for the composer rather than assuming the reload was enough.
+    const sel = config.selectors && config.selectors.input
+        ? config.selectors.input : 'textarea, div[contenteditable="true"]';
+    for (let i = 0; i < 20; i++) {
+        await sleep(1500);
+        try {
+            const ok = await page.evaluate((s) => {
+                const el = document.querySelector(s);
+                return !!(el && el.offsetParent !== null);
+            }, sel);
+            if (ok) {
+                console.log('✅ Chat input found — logged in.');
+                return true;
+            }
+        } catch { /* keep polling */ }
+    }
+    console.log('🩹 composer did not come back after reload');
+    return false;
+}
+
 async function sendPrompt(prompt, toolDefinitions) {
     // Test hook: bypass the browser entirely (used by smoke tests)
     if (process.env.TEST_FAKE_RESPONSE) {
@@ -1983,6 +2044,18 @@ async function waitForResponse(before, typedText) {
         p,
         new Promise((_, rej) => setTimeout(() => rej(new Error('cdp poll timeout')), ms)),
     ]);
+    // 09-15: before entering the long rescue wait, check whether the tab is dead
+    // rather than slow. A silent tab with no stop control will never produce
+    // anything; healing it here returns the lane to service instead of burning
+    // the full hard cap and cooling the lane behind it.
+    let healedForDeadTab = false;
+    {
+        // `lastSendAt` lives in server.js, NOT here — referencing it was a bug.
+        const generating = await isTabGenerating();
+        if (generating === false && lastAnswerLen < 0) {
+            healedForDeadTab = await selfHealDeadTab('no stream, no stop control');
+        }
+    }
     while (Date.now() < hardCap) {
         try {
             const tee = await withTimeout(readStreamedAnswer(teeStart), 20000);
