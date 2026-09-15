@@ -2027,23 +2027,32 @@ async function waitForResponse(before, typedText) {
     // (long cogitations on big tasks), keep waiting — bounded by the hard cap —
     // instead of throwing. A throw here is exactly what made webchat tasks
     // "stop mid task": the client saw an error while the tab was mid-thought.
+    const withTimeout = (p, ms) => Promise.race([
+        p,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('cdp poll timeout')), ms)),
+    ]);
     // Seed the progress baseline from the CURRENT answer length. lastAnswerLen is
     // -1 here (the main loop only sets it for 'vl' mode), so `grewNow` would be
     // true for any non-empty answer and the loop extended to the full hard cap
     // regardless — the stuck-send guard was a no-op (observed outstandingMs 383s).
+    // 09-15: `withTimeout` is defined below, so THIS call had no deadline at all.
+    // Measured: the chatgpt gateway wedged for 51 MINUTES
+    // (`outstandingMs 3100549` against a 310s cap) — the cap is only checked
+    // between awaits inside the loop below, so a CDP read that never returns on a
+    // dead browser held the send indefinitely and, because sends are serialized,
+    // took the whole lane down. Every pre-loop CDP call now has a deadline.
+    let seedFailed = false;
     try {
-        const seed = await snapshotChat();
+        const seed = await withTimeout(snapshotChat(), 20000);
         lastAnswerLen = (seed.answer || '').length;
-    } catch { /* keep -1; the guard still fires once the answer is read */ }
+    } catch {
+        seedFailed = true;   // dead browser — the caller must heal, not wait
+    }
     // 09-14: the hard cap was only checked BETWEEN awaits, so a CDP call that never
     // returns held the send forever — measured outstandingMs 511s against a 240s
     // cap, and because sends are serialized that wedged the whole lane and the
     // engine's batch with it. Race each poll against a deadline so the cap is
     // actually enforceable: on a timeout the loop simply re-checks Date.now().
-    const withTimeout = (p, ms) => Promise.race([
-        p,
-        new Promise((_, rej) => setTimeout(() => rej(new Error('cdp poll timeout')), ms)),
-    ]);
     // 09-15: before entering the long rescue wait, check whether the tab is dead
     // rather than slow. A silent tab with no stop control will never produce
     // anything; healing it here returns the lane to service instead of burning
@@ -2052,8 +2061,15 @@ async function waitForResponse(before, typedText) {
     {
         // `lastSendAt` lives in server.js, NOT here — referencing it was a bug.
         const generating = await isTabGenerating();
-        if (generating === false && lastAnswerLen < 0) {
-            healedForDeadTab = await selfHealDeadTab('no stream, no stop control');
+        // 09-15: this condition was DEAD CODE. lastAnswerLen is seeded to the
+        // current answer length a few lines above, so on any thread that already
+        // has messages it is >= 0 and the heal never ran — which is why the lane
+        // could sit wedged for 51 minutes. A dead browser (the seed TIMED OUT or
+        // an explicit not-generating tab with no baseline) must heal.
+        if (generating === false && (lastAnswerLen < 0 || seedFailed)) {
+            healedForDeadTab = await selfHealDeadTab(
+                seedFailed ? 'CDP read timed out — browser unresponsive'
+                           : 'no stream, no stop control');
         }
     }
     while (Date.now() < hardCap) {
