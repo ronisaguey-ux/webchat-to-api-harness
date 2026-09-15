@@ -1911,7 +1911,22 @@ async function waitForResponse(before, typedText) {
             // newest row on chatgpt is a generation in flight, not an aborted
             // answer — give it a chatgpt-sized grace instead of the generic
             // 12s so a slow-but-real answer is never discarded.
-            const emptyGraceMs = new URL(config.webchatUrl).host.includes('chatgpt') ? 60000 : 12000;
+            // 09-15: this was a flat `chatgpt ? 60s : 12s`, and it is the real
+            // reason both thinking-model lanes kept "failing (timeout)". Measured
+            // live with Playwright: an answer to an 18.7K prompt rendered in the
+            // tab at ~103s, but the 60s grace had already thrown
+            //   Webchat response is empty after 60s — stopped or aborted by the UI
+            // BEFORE the model produced its first token. freebuff was worse: not a
+            // chatgpt.com host, so it got the 12s default while GLM thinks for
+            // 4-5 minutes. The grace must outlast TIME-TO-FIRST-TOKEN, not the
+            // whole answer. Per-lane override via EMPTY_GRACE_MS, else by host.
+            const host = new URL(config.webchatUrl).host;
+            const emptyGraceOverride = parseInt(process.env.EMPTY_GRACE_MS || '0', 10);
+            const emptyGraceMs = emptyGraceOverride > 0
+                ? emptyGraceOverride
+                : host.includes('chatgpt') ? 180000
+                : host.includes('freebuff') ? 240000
+                : 12000;
             if (emptySince > emptyGraceMs) {
                 throw new Error(`Webchat response is empty after ${emptyGraceMs / 1000}s — stopped or aborted by the UI`);
             }
