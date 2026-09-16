@@ -1364,7 +1364,16 @@ async function snapshotChat(before = null) {
                 n++;
                 seen.add(el);
                 const rowId = (el.getAttribute && el.getAttribute('data-message-id')) || '';
-                if (rowId) ids.push(rowId);
+                // 09-16: only a row that ALREADY CARRIED AN ANSWER may seed priorIds.
+                // Pushing the id of an EMPTY row reintroduces the exact trap the index
+                // floor had, one layer down: ChatGPT keeps empty phantom assistant
+                // rows in the DOM, and if this send's answer is delivered into a row
+                // that was already there, that id is in priorIds and the REAL answer
+                // is filtered out forever - observed as `Webchat response is empty
+                // after 240s` while the tab held the reply. The stale-answer case is
+                // untouched: the PREVIOUS answer row is non-empty, so its id is still
+                // seeded and still rejected.
+                if (rowId && t.length > 0) ids.push(rowId);
                 // 09-16 STALE-ANSWER FIX (ChatGPT follow-up sends): ChatGPT mounts
                 // the new assistant row EMPTY and leaves it empty for the whole
                 // thinking window (measured on a 13,319-char send: 210s of
