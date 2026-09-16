@@ -261,7 +261,29 @@ async function connectToWebchatOnce(webchatUrl) {
         // TAB_URL_SUBSTRING mode (second instance, 08-12): match the tab whose
         // URL contains the pinned thread id, never an arbitrary deepseek tab —
         // two gateway instances share one browser, each driving its own thread.
-        if (config.tabUrlSubstring) {
+        if (config.tabId) {
+            // Exact target, for tabs that cannot be told apart by URL.
+            for (const p of pages) {
+                try {
+                    const s = await p.createCDPSession();
+                    const info = await s.send('Target.getTargetInfo');
+                    await s.detach();
+                    if (info && info.targetInfo && info.targetInfo.targetId === config.tabId) {
+                        page = p;
+                        break;
+                    }
+                } catch (_) {
+                    /* a page we cannot query is a page we cannot use */
+                }
+            }
+            if (page) {
+                console.log(`🎯 Pinned to tab id ${config.tabId}`);
+            } else {
+                console.log(`🆕 No tab with id ${config.tabId} — opening one`);
+                page = await browser.newPage();
+                await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            }
+        } else if (config.tabUrlSubstring) {
             page = pages.find((p) => p.url().includes(config.tabUrlSubstring));
             if (!page) {
                 console.log(`🆕 No tab matching ${config.tabUrlSubstring} — opening one`);
