@@ -59,6 +59,12 @@ const cfg = {
     // this substring instead of first-tab-with-matching-origin — lets two
     // instances share one browser, each pinned to its own thread.
     tabUrlSubstring: MC.pickStr('TAB_URL_SUBSTRING', 'webchat', 'tabUrlSubstring') || MODE.tabUrlSubstring || null,
+    // 09-16: TAB_ID pins the gateway to ONE CDP target. TAB_URL_SUBSTRING is not
+    // enough when two tabs carry the SAME url - Gemini resets every new chat to
+    // /app, so two gateways both matched both tabs, `pages.find` returned the
+    // first for each, and they typed into one composer: the prompt stayed put,
+    // the in-page click never committed, and each send burned the full deadline.
+    tabId: MC.pickStr('TAB_ID', 'webchat', 'tabId') || MODE.tabId || null,
     // Conversation mode (08-12): accept plain-text replies as the final answer
     // instead of demanding fenced tool JSON — for personal threads whose model
     // talks like a friend. Tool calls still work when the model makes them.
