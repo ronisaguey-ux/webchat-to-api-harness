@@ -127,7 +127,8 @@
         "autoContinueButton": true,
         "skipEmptyMessageRows": true,
         "ignoreStopButtonWhileBusy": true,
-        "rateLimitCooldown": true
+        "rateLimitCooldown": true,
+        "answerIdFloor": true
       }
     },
     "gemini": {
