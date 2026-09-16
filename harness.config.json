@@ -58,6 +58,16 @@
         "input": "div[contenteditable=\"true\"]"
       },
       "mode": "deepseek"
+    },
+    "modes": {
+      "gemini": {
+        "selectors": {
+          "input": "div[contenteditable=\"true\"], rich-textarea",
+          "send": "button[aria-label=\"Send message\"]",
+          "message": "model-response, .model-response-text, message-content"
+        },
+        "mode": "gemini"
+      }
     }
   },
   "systemPrompt": {
