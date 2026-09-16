@@ -1273,8 +1273,14 @@ async function sendMessage(input, text) {
 // LAST RENDERED message's text — a new response replaces it, and streaming
 // = it keeps growing until stable. Falls back to count-mode on older
 // builds where the fixed selectors still exist.
-async function snapshotChat() {
-    return page.evaluate((sels, skipEmptyRows) => {
+async function snapshotChat(before = null) {
+    // 09-16 (ChatGPT lane): `before` is the pre-send snapshot. With the
+    // answerIdFloor quirk on, the rows it already listed are, by definition,
+    // NOT this send's answer — see the priorIds filter below.
+    const priorIds = (quirk('answerIdFloor', false) && before && Array.isArray(before.ids))
+        ? before.ids
+        : null;
+    return page.evaluate((sels, skipEmptyRows, priorIds) => {
         const vl = document.querySelector('.ds-virtual-list');
         if (vl) {
             // Virtual list renders only what's in view — the newest message is
@@ -1335,6 +1341,10 @@ async function snapshotChat() {
         let n = 0;
         let lastEl = null;
         const seen = new Set();
+        const ids = [];
+        // 09-16: identity of a row, stable across re-renders. ChatGPT stamps a
+        // server-side uuid on every turn (measured: 8/8 rows carried one).
+        const prior = priorIds ? new Set(priorIds) : null;
         for (const s of sels) {
             for (const el of document.querySelectorAll(s)) {
                 // If el is contained inside an already seen container, skip nested duplicate
@@ -1353,6 +1363,22 @@ async function snapshotChat() {
 
                 n++;
                 seen.add(el);
+                const rowId = (el.getAttribute && el.getAttribute('data-message-id')) || '';
+                if (rowId) ids.push(rowId);
+                // 09-16 STALE-ANSWER FIX (ChatGPT follow-up sends): ChatGPT mounts
+                // the new assistant row EMPTY and leaves it empty for the whole
+                // thinking window (measured on a 13,319-char send: 210s of
+                // `<div aria-busy="true" class="result-streaming pulse"><span><pre></pre>`
+                // with innerText.length === 0). skipEmptyRows then keeps `lastEl`
+                // on the PREVIOUS answer, whose text never changes, so the wait
+                // loop accepted it as complete and the API returned the previous
+                // reply (measured: two different prompts, both "Response received
+                // (8410 chars)"). A row that already existed before this send can
+                // never be this send's answer — drop it by IDENTITY, not by index:
+                // the row COUNT is not monotonic (measured 8 rows -> 9 after a
+                // send that added 2), which is why the earlier index-floor attempt
+                // rejected every row forever and returned nothing.
+                if (prior && rowId && prior.has(rowId)) continue;
                 // 09-13 (ChatGPT lane): ChatGPT leaves EMPTY phantom assistant
                 // rows in the DOM (measured: 6 nodes, lens [22,4,54,0,0,0]).
                 // Taking the last match unconditionally made `lastEl` an empty
@@ -1373,8 +1399,8 @@ async function snapshotChat() {
             .replace(/^\s*JSON\s*\n+/gi, '')
             .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)?\n+/gi, '')
             .trim();
-        return { mode: 'count', count: n, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
-    }, config.selectors.message, quirk('skipEmptyMessageRows', false));
+        return { mode: 'count', count: n, ids, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
+    }, config.selectors.message, quirk('skipEmptyMessageRows', false), priorIds);
 }
 
 // STOP-glyph check (08-13, hoisted out of the wait loop): DeepSeek shows the
@@ -1885,7 +1911,7 @@ async function waitForResponse(before, typedText) {
         }
         let state;
         try {
-            state = await snapshotChat();
+            state = await snapshotChat(before);
         } catch (e) {
             // If the BROWSER died (Chrome crash — observed 08-12), polling to
             // the deadline just hangs the client for the full timeout. Fail
@@ -2085,7 +2111,7 @@ async function waitForResponse(before, typedText) {
     // took the whole lane down. Every pre-loop CDP call now has a deadline.
     let seedFailed = false;
     try {
-        const seed = await withTimeout(snapshotChat(), 20000);
+        const seed = await withTimeout(snapshotChat(before), 20000);
         lastAnswerLen = (seed.answer || '').length;
     } catch {
         seedFailed = true;   // dead browser — the caller must heal, not wait
@@ -2121,7 +2147,7 @@ async function waitForResponse(before, typedText) {
                 console.log('⏱ timeout — rescuing the answer from the stream tee');
                 return tee.text;
             }
-            const last = await snapshotChat();
+            const last = await snapshotChat(before);
             // 08-13: never rescue while a generation is still running — the
             // newest row may be a stale previous answer or a stream fragment
             // (observed: the 20197-char gemini request rescued a 22-char row).
