@@ -1963,6 +1963,7 @@ async function waitForResponse(before, typedText) {
     // growth stamps the progress clock, so the outer idle deadline cannot fire
     // either. A send that never produces content keeps the old behaviour exactly.
     let sawContent = false;
+    let _throttlePolls = 0; // 09-17: cadence for the page-throttle check below
     let _lastSeenLen = (before && typeof before.text === 'string') ? before.text.length : 0;
     const extendOnActivity = () => {
         const ext = Math.max(deadline, Date.now() + config.timeout);
@@ -2054,6 +2055,27 @@ async function waitForResponse(before, typedText) {
         const _tLen = (state && typeof state.text === 'string') ? state.text.length : 0;
         if (_tLen > _lastSeenLen) { _lastSeenLen = _tLen; sawContent = true; markProgress(); }
         const busy = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+        // 09-17 (BOB): a PAGE-rendered throttle must ABORT the send instead of sitting
+        // until the hard cap. DeepSeek renders "Messages too frequent. Try again later."
+        // in the page footer, NOT in the reply, so RATE_LIMIT.isRateLimitText() never saw
+        // it: the gateway kept sending to a throttled account, every send timed out, and
+        // that hammering is exactly what risks a ban. Measured live on :9229 - 3 sends /
+        // 0 responses while the notice sat above the composer.
+        // Check the TAIL of body.innerText (where the notice renders) and throw its own
+        // words - server.js's catch already recognises that text and turns it into the
+        // 900s account cooldown, so the engine hops instead of hammering.
+        // Deliberately NOT a body-wide pattern: the sidebar conversation title
+        // "Fix rate limiter test" matched a wide regex and produced a false positive.
+        // Only checked while no content has arrived yet - a throttled send never streams,
+        // and innerText on a huge page is not free.
+        if (!sawContent && (++_throttlePolls % 4) === 0) {
+            const notice = await page.evaluate(() => {
+                const t = (document.body.innerText || '').slice(-400);
+                const m = t.match(/Messages too frequent[^\n]*|Try again later[^\n]*/i);
+                return m ? m[0].trim() : '';
+            }).catch(() => '');
+            if (notice) throw new Error('Webchat rate limit: ' + notice);
+        }
         // 09-13: DeepSeek pauses a long generation behind a "Continue" button
         // instead of finishing it. Resume the generation instead of accepting
         // the truncated text as the answer.
