@@ -1923,6 +1923,14 @@ app.post('/v1/chat/completions', async (req, res) => {
                 ? userMessage.content
                 : JSON.stringify(userMessage?.content ?? '');
 
+        // STREAMING (09-16): an agent caller ASKS for stream:true and its SDK
+        // parses the reply as SSE. Answering with a plain JSON body satisfied
+        // curl but hung opencode forever — the SDK sat waiting for `data:`
+        // frames that never arrived (measured: request logged, zero output,
+        // 3-minute timeouts). Emit a real OpenAI-shaped SSE stream when asked
+        // for one: role delta, the content, then [DONE].
+        const wantsStream = !!(req.body && req.body.stream === true);
+
         const toolDefs = buildExecutableToolDefs();
 
         const text = await enqueue(() =>
@@ -1950,6 +1958,29 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         // a real answer clears any stale cooldown
         if (RATE_LIMIT.enabled()) RATE_LIMIT.clearCooldown(process.env.WEBCHAT_ACCOUNT || process.env.PORT);
+
+        if (wantsStream) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.flushHeaders?.();
+            const id = 'chatcmpl_' + Math.random().toString(36).slice(2, 12);
+            const chunk = (delta, finish) => ({
+                id,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: model || config.modelName,
+                choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+            });
+            res.write(`data: ${JSON.stringify(chunk({ role: 'assistant', content: '' }))}\n\n`);
+            // Chunked so a client's stream parser sees progress on a long answer.
+            for (let i = 0; i < text.length; i += 512) {
+                res.write(`data: ${JSON.stringify(chunk({ content: text.slice(i, i + 512) }))}\n\n`);
+            }
+            res.write(`data: ${JSON.stringify(chunk({}, 'stop'))}\n\n`);
+            res.write('data: [DONE]\n\n');
+            return res.end();
+        }
 
         res.json({
             id: 'chatcmpl_' + Math.random().toString(36).slice(2, 12),
