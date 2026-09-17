@@ -279,9 +279,21 @@ async function connectToWebchatOnce(webchatUrl) {
             if (page) {
                 console.log(`🎯 Pinned to tab id ${config.tabId}`);
             } else {
-                console.log(`🆕 No tab with id ${config.tabId} — opening one`);
-                page = await browser.newPage();
-                await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                // A stale pin must NOT spawn a tab: TAB_IDs die whenever the tab
+                // is re-created (Gemini resets a new chat to /app, so every
+                // re-pin looks like the same URL), and one new tab per request is
+                // how the browser ends up with six copies of the same thread.
+                // Fall back to the URL substring, then to any matching-origin
+                // tab, and only open one when the browser genuinely has none.
+                page = (config.tabUrlSubstring && pages.find((p) => p.url().includes(config.tabUrlSubstring)))
+                    || pages.find((p) => p.url().startsWith(new URL(webchatUrl).origin));
+                if (page) {
+                    console.log(`⚠️  no tab with id ${config.tabId} — reusing ${page.url()}`);
+                } else {
+                    console.log(`🆕 No tab for ${webchatUrl} — opening one`);
+                    page = await browser.newPage();
+                    await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                }
             }
         } else if (config.tabUrlSubstring) {
             page = pages.find((p) => p.url().includes(config.tabUrlSubstring));
@@ -2315,12 +2327,14 @@ function buildFullPrompt(userPrompt, toolDefinitions) {
 
     if (toolDefinitions && toolDefinitions.length > 0) {
         let section =
-            'You have access to the tools below. ALWAYS respond with exactly one JSON object ' +
-            '{"tool":"<name>","params":{...}} — never plain text, never prose (user rule 08-12). ' +
-            'ALWAYS wrap it in a markdown code fence (```json ... ```) so this chat cannot corrupt your backticks. ' +
-            'ONE tool call at a time. Use a real tool to perform work when the task needs it — you judge whether it ' +
-            'does. When the task is complete (or it was a simple question needing no tools), submit your final ' +
-            'plain-text answer via the submit_answer tool: {"tool":"submit_answer","params":{"text":"..."}}.\n\n';
+            'You have access to the tools below. Every reply is exactly ONE fenced tool call:\n' +
+            '```json\n{"tool":"<name>","params":{...}}\n```\n' +
+            'You may put ONE short 💬 line before the fence — it is shown to the user. Anything longer, or any ' +
+            'reply with no tool call at all, is rejected and sent back to you.\n' +
+            'The fence is MANDATORY: without it this chat renders your backticks as formatting and corrupts the JSON.\n' +
+            'Use a real tool to perform work when the task needs it — you judge whether it does. When the task is ' +
+            'complete (or it was a simple question needing no tools), submit your final answer via submit_answer:\n' +
+            '```json\n{"tool":"submit_answer","params":{"text":"..."}}\n```\n\n';
 
         const toolsByCategory = {};
         for (const tool of toolDefinitions) {
@@ -2347,11 +2361,13 @@ function buildFullPrompt(userPrompt, toolDefinitions) {
     fullPrompt += `### USER REQUEST\n\n${userPrompt}\n\n### RESPONSE\n`;
     // Absolute final slot, after everything: this is the strongest instruction
     // position, and it must reinforce the format for EVERY round (first message
-    // AND follow-ups) — DeepSeek's chat behavior is to pause after tool work
-    // and write a progress report, which the middle-of-prompt rules don't kill.
-    fullPrompt += 'REMINDER: your reply must be a fenced tool-call JSON (```json {"tool":"<name>","params":{...}} ```) ' +
-        'or a fenced submit_answer (```json {"tool":"submit_answer","params":{"text":"..."}} ```). ' +
-        'Plain text — including progress reports, summaries of what you did, and lists of "next steps" — is NEVER accepted.\n';
+    // AND follow-ups) — the model's habit is to pause after tool work and write
+    // a progress report, which the middle-of-prompt rules don't kill.
+    fullPrompt += 'REMINDER: your reply must contain exactly one fenced tool call ' +
+        '(```json {"tool":"<name>","params":{...}} ```), optionally preceded by ONE short 💬 line. ' +
+        'A reply with no tool call — including a progress report, a summary of what you did, or a list of ' +
+        '"next steps" — is rejected. Finish the task with a fenced ' +
+        '```json {"tool":"submit_answer","params":{"text":"..."}} ```.\n';
     return fullPrompt;
 }
 
