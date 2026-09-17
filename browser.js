@@ -1043,6 +1043,14 @@ async function sendMessage(input, text) {
             // of sending). A trusted mouse click on the composer activates
             // it; Enter then sends (verified 08-14 on the 9224 driver).
             // DeepSeek's composer handles focus() fine — keep its proven path.
+            //
+            // 09-16: do NOT replace this click with Emulation.setFocusEmulationEnabled.
+            // Tried it to stop the click raising the browser window; it makes the
+            // PAGE believe it is focused but leaves the composer element unfocused,
+            // so the Enter press lands nowhere, the prompt strands in the box and
+            // every request burns the full timeout (verified live on gemini: text
+            // still in the composer, only the PREVIOUS answer in the thread).
+            // The editor reacts to real activation, not to hasFocus().
             if (!new URL(config.webchatUrl).host.includes('deepseek')) {
                 const cRect = await page.evaluate((sels) => {
                     for (const sel of sels) {
@@ -1356,6 +1364,16 @@ async function snapshotChat() {
                 }
                 if (isNested) continue;
 
+                // 09-16 STALE-ROW FIX: a webchat SPA keeps the DOM nodes of a
+                // previous conversation mounted after you move to a new chat —
+                // measured on Gemini, 11 leftover <model-response> nodes still
+                // matched while the visible thread was empty. document order
+                // then puts one of THOSE last, and the gateway returns a reply
+                // from a conversation it is not even in (observed live: a
+                // greeting answered with a paragraph from the previous chat).
+                // Only a row the browser actually renders may be the answer.
+                if (el.getClientRects().length === 0) continue;
+
                 const t = (el.innerText || '').trim();
                 const isUserRow = el.tagName === 'USER-QUERY'
                     || (el.getAttribute && el.getAttribute('data-message-author-role') === 'user')
@@ -1414,7 +1432,7 @@ async function isGenerating() {
 // is still streaming — never accept or rescue it, never type into it.
 async function isForeignBusy() {
     try {
-        return await page.evaluate(() => {
+        return await page.evaluate((phantomStop) => {
             const stopish = (s) => {
                 s = (s || '').trim().toLowerCase();
                 return s === 'stop' || s === 'stop response' || s === 'stop generating'
@@ -1430,8 +1448,21 @@ async function isForeignBusy() {
                 return el.offsetParent !== null || el.getClientRects().length > 0;
             };
             for (const el of document.querySelectorAll('[aria-label]')) {
-                if (stopish(el.getAttribute('aria-label')) && isVisible(el)) return true;
+                if (!stopish(el.getAttribute('aria-label'))) continue;
+                if (!isVisible(el)) continue;
+                // PHANTOM-STOP (gemini): Gemini leaves its "Stop response"
+                // control mounted, visible, enabled and unclickable after the
+                // answer commits — verified live (aria-label "Stop response",
+                // rects 1, display flex, opacity 1, persists for minutes).
+                // Reading it as "cogitating" made the pre-send guard refuse
+                // every follow-up with "still generating from a previous
+                // request" AND made the accept gate never fire, so each send
+                // burned the full timeout. On a lane with this quirk the ONLY
+                // trusted completion signal is the answer text itself.
+                if (phantomStop) continue;
+                return true;
             }
+            if (phantomStop) return false;
             for (const b of document.querySelectorAll('button')) {
                 if (stopish(b.innerText) && isVisible(b)) return true;
             }
@@ -1453,7 +1484,7 @@ async function isForeignBusy() {
             const sb = document.querySelector('[data-testid="stop-button"]');
             if (isVisible(sb)) return true;
             return false;
-        });
+        }, quirk('phantomStopButton', false));
     } catch { return false; }
 }
 
