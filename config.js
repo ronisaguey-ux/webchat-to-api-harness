@@ -150,6 +150,11 @@ const cfg = {
     quirks: modeQuirks,
     // The system prompt the caller wants sent; '' means "use the built-in".
     systemPrompt: SYSTEM_PROMPT,
+    // When true the caller's own system message is dropped entirely and only the
+    // harness prompt is sent. For agent callers (opencode, Claude Code) whose
+    // system prompt is their own harness's rulebook and has no meaning in a
+    // webchat tab.
+    ignoreClientSystem: MC.pickBool('IGNORE_CLIENT_SYSTEM', 'features', 'ignoreClientSystem') === true,
 
     // 09-13 EXPERIMENTAL — reasoning-loop detection. Off by default; see the
     // README "Anti-spiral" section. NARRATION=true also relaxes the detector so
