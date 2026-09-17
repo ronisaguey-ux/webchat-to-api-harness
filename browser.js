@@ -666,14 +666,35 @@ async function selectExpertMode() {
             [...document.querySelectorAll('.ds-toggle-button')].some(
                 (el) => (el.textContent || '').trim() === 'Search'));
         if (searchPresent) {
-            console.log('⚠ expert select FAILED — Search option still present (thread is INSTANT, not expert)');
+            // 09-17: this used to be treated as a HARD failure, on the owner's old rule
+            // "if u see a search option that means its not expert". That rule described a
+            // UI that no longer exists. Probed live on the current composer:
+            //   radioGroups: 0   radios: []   ("Instant / Expert" tabs are GONE)
+            //   toggleChips: ["DeepThink","Search"]   deepThinkPressed: "true"
+            // There are no mode tabs to select, so this branch fires on EVERY swap and is
+            // a FALSE ALARM - the thread is fine, DeepThink (the reasoning signal that
+            // actually matters) is ON. Report the real state instead of a failure, so the
+            // log stops claiming ~30 sends/hour are non-expert when they are not.
+            const dtOn = await page.evaluate(() => {
+                const el = [...document.querySelectorAll('[aria-pressed]')]
+                    .find((x) => (x.textContent || '').trim() === 'DeepThink');
+                return el ? el.getAttribute('aria-pressed') === 'true' : null;
+            });
+            if (dtOn === true) {
+                console.log('🧠 DeepThink ON — mode tabs absent (current UI), thread is fine');
+                return true;
+            }
+            console.log('⚠ DeepThink is NOT on and no mode tabs exist — thread may be instant');
+            return false;
         } else {
             console.log(flipped && flipped.length
                 ? '🧠 new chat set to EXPERT mode (' + flipped.join(', ') + ') — Search absent, verified'
                 : '🧠 already expert (no Search option, DeepThink on)');
+            return true;
         }
     } catch (e) {
         console.log('⚠ selectExpertMode failed:', String(e.message).slice(0, 60));
+        return false;
     }
 }
 
@@ -1461,6 +1482,22 @@ async function isForeignBusy() {
             }
             for (const b of document.querySelectorAll('button')) {
                 if (stopish(b.innerText) && isVisible(b)) return true;
+            }
+            // 09-17 (Bob: "Chat gbt is likely fine, investigate" - HE WAS RIGHT):
+            // ChatGPT generates with NO stop control in the DOM at all. Measured on
+            // the live tab during a real generation:
+            //   stop-button: false   data-testid stop-ish: none   aria-label stop: none
+            //   assistant row aria-busy="true"  <- the ONLY signal, true for 360s
+            // So every stop-based scan above read "not busy", the empty grace expired
+            // at 180s mid-generation, and the send threw "Webchat response is empty
+            // after 180s" while the model was working. Polling the row for 360s showed
+            // it FILL with a real edit contract ({"edits":{"step":"...).
+            // The row's own aria-busy is the signal to trust.
+            for (const r of document.querySelectorAll('[data-message-author-role="assistant"][aria-busy="true"]')) {
+                if (isVisible(r)) return true;
+            }
+            for (const r of document.querySelectorAll('[data-message-author-role="assistant"]')) {
+                if (r.querySelector('[aria-busy="true"]') && isVisible(r)) return true;
             }
             // 09-13 (ChatGPT lane): ChatGPT's in-flight control is a
             // data-testid, not an aria-label, so the aria/innerText scans above
@@ -2345,7 +2382,22 @@ async function openNewChat() {
     // on the fresh new-chat composer BEFORE the first message creates the
     // thread (instant threads can never become expert afterwards).
     if (new URL(config.webchatUrl).host.includes('deepseek')) {
-        await selectExpertMode();
+        // 09-17: mode is LOCKED at thread creation and "instant threads can never become
+        // expert afterwards" (see the handoff note below). Measured ~30 sends/hour landing
+        // on INSTANT threads because the selection silently failed and we sent anyway.
+        // So: if the first attempt fails, open one more fresh chat and try again - bounded
+        // to a single retry, never a loop.
+        let _expert = await selectExpertMode();
+        if (!_expert) {
+            console.log('🔁 expert select failed — one fresh-chat retry');
+            await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await waitForChatInput();
+            await sleep(2500);
+            _expert = await selectExpertMode();
+            console.log(_expert
+                ? '🧠 expert mode recovered on the retry'
+                : '⚠ expert mode still not available after one retry — sending on this thread');
+        }
         await sleep(500);
     }
     // 09-14 (owner): Freebuff's reasoning-effort defaults to "Max (model default)"
