@@ -526,6 +526,10 @@ async function sendPrompt(prompt, toolDefinitions) {
 
     console.log('⏳ Waiting for response...');
     const _budget = Math.max(60000, parseInt(process.env.HARD_CAP_MS) || (config.timeout || 300000));
+    // 09-16 (owner): "js have the timer stop once a first stream is detected."
+    // Fresh progress stamp for THIS send, so the idle deadline below starts from
+    // now and cannot inherit the previous send's silence (or its progress).
+    markProgress();
     const text = await withAbsoluteDeadline(
         waitForResponse(before, fullPrompt), _budget + 15000, 'waitForResponse');
     console.log(`📥 Response received (${text.length} chars)`);
@@ -1852,6 +1856,18 @@ async function readStreamedAnswer(startIndex) {
 //    across two polls (streaming models keep growing it) ──
 // `before` is the snapshotChat() taken just before sending; `typedText`
 // is the exact prompt we typed — the user message rendering it must NOT
+// 09-16 (owner): "js have the timer stop once a first stream is detected."
+//
+// Progress clock. `_lastProgressAt` is stamped at the START of every send and again
+// every time the wait loop sees the answer GROW. withAbsoluteDeadline below then
+// measures SILENCE (`now - _lastProgressAt`), not elapsed time, so the moment a first
+// stream is detected the clock stops running against the send and cannot kill it.
+// A caller that makes no progress at all sees exactly the old behaviour: an absolute
+// timeout of `ms`. Without this, HARD_CAP_MS guillotined a long generation the tab
+// was still streaming - the timer kept running after the first token.
+let _lastProgressAt = Date.now();
+function markProgress() { _lastProgressAt = Date.now(); }
+
 // be accepted as the response (DeepSeek cogitates for seconds before its
 // answer replaces it as the last item).
 // 09-15: the hard cap inside waitForResponse is only checked BETWEEN awaits, so a
@@ -1860,15 +1876,24 @@ async function readStreamedAnswer(startIndex) {
 // the finished answer sitting in the tab the whole time (the engine read every one
 // of those as 'empty response after 180s'). Race the whole call against an absolute
 // deadline so NOTHING inside it can outlive the budget, whichever await hangs.
+// 09-16: that race is now an IDLE deadline - re-armed on every progress stamp - so it
+// still catches a wedged send but never cuts one that is still producing.
 function withAbsoluteDeadline(promise, ms, label) {
     let timer;
+    const idleDeadline = new Promise((_, rej) => {
+        const arm = () => {
+            const idleFor = Date.now() - _lastProgressAt;
+            if (idleFor >= ms) {
+                rej(new Error(`${label} made no progress for ${ms}ms (idle deadline)`));
+                return;
+            }
+            timer = setTimeout(arm, Math.max(250, Math.min(ms - idleFor, 15000)));
+        };
+        arm();
+    });
     return Promise.race([
         promise.finally(() => clearTimeout(timer)),
-        new Promise((_, rej) => {
-            timer = setTimeout(
-                () => rej(new Error(`${label} exceeded its absolute deadline after ${ms}ms`)),
-                ms);
-        }),
+        idleDeadline,
     ]);
 }
 
@@ -1895,6 +1920,17 @@ async function waitForResponse(before, typedText) {
     // gateway for 2x the timeout (observed outstandingMs 360-373s repeatedly).
     const hardCapMs = parseInt(process.env.HARD_CAP_MS) || (deadline + config.timeout);
     const hardCap = Math.max(deadline, hardCapMs);
+    // 09-16 (owner): "js have the timer stop once a first stream is detected."
+    // Before the first stream the send is bounded by the absolute cap; once the
+    // answer has CONTENT, activity extends the deadline with no cap at all and every
+    // growth stamps the progress clock, so the outer idle deadline cannot fire
+    // either. A send that never produces content keeps the old behaviour exactly.
+    let sawContent = false;
+    let _lastSeenLen = (before && typeof before.text === 'string') ? before.text.length : 0;
+    const extendOnActivity = () => {
+        const ext = Math.max(deadline, Date.now() + config.timeout);
+        deadline = sawContent ? ext : Math.min(hardCap, ext);
+    };
     let lastLen = -1; // forces at least two polls before accepting
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
@@ -1971,12 +2007,21 @@ async function waitForResponse(before, typedText) {
         // `answer` is empty while the model cogitates, so this never accepts
         // a reasoning-only pause. Fallback (count mode / older builds): the
         // raw-text check.
+        // 09-16 (owner): "js have the timer stop once a first stream is detected."
+        // FIRST-STREAM DETECTION. Any GROWTH of the answer text past the pre-send
+        // baseline means the model has started producing: latch sawContent (which
+        // lifts the absolute cap for the rest of this send) and stamp the progress
+        // clock (which re-arms the outer idle deadline). Deliberately keyed on TEXT
+        // GROWTH, never on `busy` - a tab that is merely busy with no new text is not
+        // a stream, and treating it as one is what let a wedged send run unbounded.
+        const _tLen = (state && typeof state.text === 'string') ? state.text.length : 0;
+        if (_tLen > _lastSeenLen) { _lastSeenLen = _tLen; sawContent = true; markProgress(); }
         const busy = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
         // 09-13: DeepSeek pauses a long generation behind a "Continue" button
         // instead of finishing it. Resume the generation instead of accepting
         // the truncated text as the answer.
         if (quirk('autoContinueButton', true) && await clickContinueIfPresent()) {
-            deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
+            extendOnActivity();
             await sleep(1200);
             continue;
         }
@@ -2077,7 +2122,7 @@ async function waitForResponse(before, typedText) {
         // poll cadence means this only fires on real changes, never the steady
         // state that the stability check above accepts.
         if (state.mode === 'vl' && lastText !== null && state.text !== lastText) {
-            deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
+            extendOnActivity();
         }
         // Silent-generation signal (08-12 23:55): with DeepThink off the model
         // cogitates SILENTLY — no text movement for minutes while the send
@@ -2089,7 +2134,7 @@ async function waitForResponse(before, typedText) {
         // is still streaming, so the deadline must not expire into a stale
         // rescue (gemini's 20197-char request rescued a 22-char stale row).
         if (busy) {
-            deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
+            extendOnActivity();
         }
         lastText = state.text;
         lastLen = state.text.length;
