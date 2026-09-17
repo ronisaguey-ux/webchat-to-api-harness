@@ -1903,6 +1903,20 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
 
         const systemMessage = (messages || []).find((m) => m.role === 'system');
+        // IGNORE_CLIENT_SYSTEM must apply on THIS path too: opencode and other
+        // openai-compatible agent callers ship their whole harness prompt as the
+        // system message here, and the Anthropic-path guard did not cover it —
+        // measured 118,900 chars of an agent's own rules landing in the tab.
+        const clientSystemText =
+            typeof systemMessage?.content === 'string'
+                ? systemMessage.content
+                : Array.isArray(systemMessage?.content)
+                  ? systemMessage.content.map((b) => (b?.type === 'text' ? b.text : '')).join('\n')
+                  : '';
+        const systemText = config.ignoreClientSystem ? config.systemPrompt : clientSystemText;
+        if (config.ignoreClientSystem && clientSystemText) {
+            console.log(`🚫 dropped the caller's system message (${clientSystemText.length} chars) — IGNORE_CLIENT_SYSTEM is on`);
+        }
         const userMessage = [...(messages || [])].reverse().find((m) => m.role === 'user');
         const prompt =
             typeof userMessage?.content === 'string'
@@ -1912,7 +1926,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         const toolDefs = buildExecutableToolDefs();
 
         const text = await enqueue(() =>
-            handleRequest(systemMessage?.content || '', prompt, toolDefs)
+            handleRequest(systemText, prompt, toolDefs)
         );
 
         // 09-13: the webchat can answer the throttle notice as its REPLY (a 200
