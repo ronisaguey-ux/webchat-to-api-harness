@@ -713,7 +713,24 @@ function buildExecutableToolDefs() {
     // commit (throughput 43/h -> 0/h). With a caller-supplied contract there is
     // nothing for the interactive tools to do — return an empty set so the model
     // answers the contract directly.
-    if (config.passthroughFormat) return [];
+    // 09-16 (owner): "their supposed to have a next chunk tool call."
+    //
+    // The engine hands a lane a TRUNCATED view of any file over 24000 chars
+    // (execute.file_text's size_cap). A lane that cannot call see_next_chunk can never
+    // reach the code the step names, so it answers "the file view ends mid-function" /
+    // "not present in the provided file contents" and burns its rounds into yellow.
+    // Measured on the yellow pile: 34 yellows say exactly that, 8 of them on target
+    // files of 31K-311K chars (engine.rs 311,277 / emulator.rs 140,166 / fill.rs 60,485)
+    // - structurally unfixable without this tool.
+    //
+    // So offer the CONTENT-FETCH tools even in passthrough mode. The 09-14 outage was
+    // not caused by tools existing: it was the model free-running through
+    // list_dir / write_file / submit_answer for 13+ rounds. Keep the set to the two
+    // read-only tools, and bound the loop at the call site below.
+    if (config.passthroughFormat) {
+        return getToolDefinitions().filter(
+            (t) => t.name === 'read_file' || t.name === 'see_next_chunk');
+    }
     return [...getToolDefinitions(), SUBMIT_TOOL_DEF];
 }
 
@@ -814,6 +831,25 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
     let prompt;
     if (config.passthroughFormat) {
         prompt = systemText ? `${systemText}\n\n${userPrompt}` : userPrompt;
+        // 09-16 (owner): "their supposed to have a next chunk tool call." Offering the
+        // tools in buildExecutableToolDefs() is NOT enough - the passthrough prompt is
+        // just system+user, with no tool preamble, so the model does not know they
+        // exist. Measured: asked to read a file past the engine's 24000-char cap, the
+        // lane answered "no see_next_chunk tool is available to me in this session".
+        // Name the two read tools and the exact call shape, and nothing else - the
+        // caller's edit contract stays the only thing the answer must satisfy.
+        if (parseInt(process.env.PASSTHROUGH_FETCH_ROUNDS || '3', 10) > 0) {
+            prompt += '\n\n### TOOLS\n'
+                + 'Large files are shown to you as windows with the omitted ranges marked, '
+                + 'so the code you need may be outside the window you were given. If that '
+                + 'happens, you may fetch more instead of giving up: reply with EXACTLY '
+                + 'one of these JSON objects and NOTHING else:\n'
+                + '{"tool":"see_next_chunk","params":{"path":"<the path you were given>"}}\n'
+                + '{"tool":"read_file","params":{"path":"<the path you were given>"}}\n'
+                + 'You will be given the content it returns, and then you must answer with '
+                + 'your edit contract. Only use this when the code you need is genuinely '
+                + 'not in the content above.';
+        }
     } else {
         const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
         prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
@@ -873,15 +909,65 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
 
     let response = await countedSend(injectMainReplies(prompt), toolDefs);
 
-    // 09-14: PASSTHROUGH_FORMAT means the caller shipped a complete contract
-    // (the oculus step engine's {"edits":[...]}). Run the tool loop for it and
-    // the model is driven into interactive tool mode instead: measured live the
-    // DS lanes answered {"tool":"read_file",...} / {"tool":"list_dir",...} /
-    // {"tool":"submit_answer",...} for 13+ rounds, the engine read every one as
-    // "no edits", and step commits went 35/h -> 0/h for 90 minutes. A caller
-    // contract is answered ONCE, verbatim.
+    // 09-14: a caller contract is answered verbatim, NOT driven through the
+    // interactive loop - the model free-ran through list_dir/submit_answer for 13+
+    // rounds, the engine read every one as "no edits", and step commits went
+    // 35/h -> 0/h for 90 minutes.
+    //
+    // 09-16 (owner): "their supposed to have a next chunk tool call." The exception is
+    // the CONTENT-FETCH tools: a lane handed a truncated file must be able to pull the
+    // next chunk. Bounded hard (PASSTHROUGH_FETCH_ROUNDS, default 3) and restricted to
+    // read_file / see_next_chunk, so every reply that is not a fetch is still returned
+    // verbatim and the 09-14 free-run cannot come back.
     if (config.passthroughFormat) {
-        return response;
+        const _fetchRounds = Math.max(0, parseInt(process.env.PASSTHROUGH_FETCH_ROUNDS || '3', 10));
+        let _text = response;
+        for (let _i = 0; _i < _fetchRounds; _i++) {
+            // parseToolCalls returns {prose, toolCalls: [{toolName, args}]} — an OBJECT,
+            // not an array. Measured by test: calling .find() on it threw
+            // "_calls.find is not a function" as a 500 on every passthrough request.
+            let _calls = [];
+            try { _calls = (parseToolCalls(_text) || {}).toolCalls || []; } catch { _calls = []; }
+            const _fetch = _calls.find((c) => c && (c.toolName === 'read_file' || c.toolName === 'see_next_chunk'));
+            if (!_fetch) return _text;
+            // The engine writes REPO-RELATIVE paths into its prompts
+            // ("execution/signals.py"), but sandbox.checkPath resolves a relative path
+            // against the GATEWAY's cwd (/home/roni/Roni_workspace/webchat-api) and
+            // denies it. Measured directly against the tool:
+            //   "execution/signals.py"                        -> DENIED, 268 chars
+            //   "/home/roni/.../oculus/execution/signals.py"  -> 20,000 chars of content
+            // So a lane that followed the TOOLS instructions verbatim would always be
+            // refused, and the tool would be useless to the exact caller it was built
+            // for. Resolve a relative path against the sandbox's allowed roots first.
+            let _args = _fetch.args || {};
+            try {
+                const _fs = require('fs');
+                const _path = require('path');
+                const _roots = require('./sandbox').roots || [];
+                if (_args.path && !_path.isAbsolute(_args.path)) {
+                    for (const _root of _roots) {
+                        const _cand = _path.join(_root, _args.path);
+                        if (_fs.existsSync(_cand)) { _args = { ..._args, path: _cand }; break; }
+                    }
+                }
+            } catch { /* fall through with the original args */ }
+            let _res;
+            try {
+                _res = await executeTool(_fetch.toolName, _args, { threadId: config.webchatUrl || null });
+            } catch (e) {
+                console.log(`⚠️ passthrough fetch (${_fetch.toolName}) failed: ${String(e).slice(0, 120)}`);
+                return _text;
+            }
+            const _payload = JSON.stringify(_res);
+            console.log(`📎 passthrough fetch ${_i + 1}/${_fetchRounds}: ${_fetch.toolName} -> ${_payload.length} chars`);
+            if (_payload.length <= 200) return _text;
+            _text = await countedSend(
+                'TOOL RESULT for ' + _fetch.toolName + ' (the real file content you asked for):\n'
+                + _payload.slice(0, 60000)
+                + '\n\nNow continue the original task and reply with the JSON edit contract, and nothing else.',
+                toolDefs);
+        }
+        return _text;
     }
     // Growth baseline: captured AFTER the first send so a request whose body
     // starts large (fresh seed, big overhead) isn't seen as "grown" by it.
