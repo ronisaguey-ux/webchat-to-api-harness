@@ -961,9 +961,32 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             const _payload = JSON.stringify(_res);
             console.log(`📎 passthrough fetch ${_i + 1}/${_fetchRounds}: ${_fetch.toolName} -> ${_payload.length} chars`);
             if (_payload.length <= 200) return _text;
+            // Never slice the JSON STRING: a byte cut lands mid-token and hands the
+            // lane invalid JSON it cannot parse. Measured: read_file on
+            // rust/execution/tests/matching_engine.rs (552240 chars) returns a
+            // 207109-char payload, and slicing that to 60000 chops it mid-object.
+            // Truncate the CONTENT field instead, and say so, so the result stays
+            // valid JSON the model can actually read.
+            let _body;
+            if (_res && typeof _res.content === 'string') {
+                const _raw = _res.content;
+                const _cut = _raw.slice(0, 60000);
+                _body = JSON.stringify({
+                    ..._res,
+                    content: _cut,
+                    truncated: _res.truncated || _cut.length < _raw.length,
+                    returnedChars: _cut.length,
+                    totalChars: _raw.length,
+                    ...(_cut.length < _raw.length
+                        ? { note: `content cut at ${_cut.length} of ${_raw.length} chars; fetch again for the next part` }
+                        : {}),
+                });
+            } else {
+                _body = _payload.slice(0, 60000);
+            }
             _text = await countedSend(
                 'TOOL RESULT for ' + _fetch.toolName + ' (the real file content you asked for):\n'
-                + _payload.slice(0, 60000)
+                + _body
                 + '\n\nNow continue the original task and reply with the JSON edit contract, and nothing else.',
                 toolDefs);
         }
