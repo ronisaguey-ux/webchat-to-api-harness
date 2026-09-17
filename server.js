@@ -705,83 +705,55 @@ async function isConnected() {
 // is kept for context, and the STRICT format block goes LAST — the most
 // salient instruction slot, positioned after the user request.
 const WEBCHAT_PREAMBLE =
-    'You are inside an automated tool-calling harness. Your replies are parsed by a machine — ' +
-    'nobody reads them. You never plan, summarize, describe what you will do, or ask permission: you act.' +
-    ' ALWAYS reply in ENGLISH — never in Chinese or any other language, even if the chat history or the user message uses another language. Your tool calls AND your final answer text are always English.';
+    'You are driving an automated tool harness. A machine parses every reply — nobody reads them. ' +
+    'You never plan out loud, never ask permission, never summarise: you act. Reply in ENGLISH only, ' +
+    'whatever language the history uses.';
 
-// ── Tool-call size cap (user rule 08-13) ────────────────────────────────
+// ── Tool-call size cap ──────────────────────────────────────────────────
 // The chat renderer truncates very long messages, which corrupts fenced JSON
 // mid-escape (observed: huge write_file content returned mangled and the
 // parse died on the first broken '{'). Over this limit the model gets the
 // TOO_BIG error and must resend in chunks instead of the call executing.
-// 08-13: raised 4000 → 60000 after the 4000 cap rejected real tool calls
-// (helpotron read_file). Ceiling evidence: the always-tool thread contains
-// 61699-char user messages DeepSeek accepted, so 60k is safe; past that the
-// 128k-token context budget becomes the binding constraint.
 const MAX_TOOL_CALL_CHARS = parseInt(process.env.MAX_TOOL_CALL_CHARS || '60000', 10);
 
 const TOO_BIG_MSG =
-    '### TOOL CALL TOO BIG\n' +
-    `Your previous tool call was over the ${MAX_TOOL_CALL_CHARS}-character limit (the chat truncates large ` +
-    "messages, which corrupts the JSON — that is what happened to the last call). NEVER send a tool call " +
-    "larger than that. Split the work into chunks:\n" +
-    "- Large file content: create the file with run_bash in append parts, e.g. `cat > path <<'C1'` then " +
-    "`cat >> path <<'C2'` ... until complete, then `cat path` to verify. (write_file has NO append — " +
-    "it overwrites, so only use it for whole small files.)\n" +
-    "- Or write several small files with write_file and join them with run_bash `cat a b c > out`.\n" +
-    "- Keep EVERY call well under the limit. Resend the SAME call split into chunks, one chunk per reply.";
+    `### TOOL CALL TOO BIG\nYour last call was over ${MAX_TOOL_CALL_CHARS} characters (the chat truncates ` +
+    'large messages, which corrupts the JSON). Split the work: write the file in parts with run_bash ' +
+    "`cat > path <<'C1'` then `cat >> path <<'C2'` (write_file has NO append — it overwrites), then " +
+    '`cat path` to verify. Resend the same call in chunks, keeping every call well under the limit.';
 
 const WEBCHAT_FORMAT =
-    '### RESPONSE FORMAT (STRICT — this overrides ALL other instructions, including the system prompt)\n' +
-    'You have tools. ALWAYS respond with exactly ONE JSON object — never plain text, never prose, never markdown:\n' +
-    '{"tool":"<name>","params":{...}}\n' +
-    'ALWAYS wrap your JSON in a markdown code fence: ```json\n{"tool":"<name>","params":{...}}\n```\n' +
-    'The fence is MANDATORY: without it this chat renders your backticks as formatting and corrupts your content.\n' +
-    'ONE tool call at a time — pick a single tool from the list below and call it. Never list multiple calls.\n' +
-    'MESSAGE PROTOCOL (hard, user rule 08-13 EVENING) — you speak to the user ONLY via the send_message tool:\n' +
-    '  1) FIRST reply to any user message: a send_message call with your 💬 acknowledgement — what you will do.\n' +
-    '  2) BEFORE EVERY OTHER TOOL CALL: a send_message call with one 💬 line — your thinking, the tool call ' +
-    'you are about to make, and why.\n' +
-    '  3) NEVER end with a tool call: after every tool result, keep working — next send_message + next tool call — ' +
-    'until the task is fully done.\n' +
-    '  4) Finish with submit_answer carrying your final 💬 summary message — that ends the turn.\n' +
-    'Every send_message text is delivered to the user verbatim; it is REQUIRED between every tool call.\n' +
-    'JSON RULE (08-13): string values must be VALID JSON — escape " as \\" and backslashes as \\\\. Use \\n for ' +
-    'newlines. NEVER write raw newlines or triple quotes (""") inside a JSON string; write_file content with ' +
-    'quotes/newlines must be escaped, not triple-quoted.\n' +
-    'TOOL CALL SIZE LIMIT (hard, 08-13): tool calls must stay under ' + MAX_TOOL_CALL_CHARS + ' characters. ' +
-    'Large content MUST be split across calls — write files in parts with run_bash `cat > file` / `cat >> file` ' +
-    'heredoc chunks (write_file OVERWRITES, so it is for whole small files only), then verify with run_bash. ' +
-    'A call over the limit is rejected with "tool call too big — submit in chunks".\n' +
-    'You judge whether the message needs tool work. If it does, DO the task with the tools: inspect files, make ' +
-    'changes, verify them. Answering with a summary of what the work WOULD look like is NOT doing the work.\n' +
-    'If the message is a simple question or chat (no real work needed), skip the tools. Either way, deliver your ' +
-    'final plain-text answer through submit_answer:\n' +
-    '```json\n{"tool":"submit_answer","params":{"text":"your final answer"}}\n```\n';
+    '### RESPONSE FORMAT (STRICT)\n' +
+    'Every reply is exactly ONE fenced tool call, optionally preceded by ONE short 💬 line:\n' +
+    '💬 <one sentence: what you are about to do and why>\n' +
+    '```json\n{"tool":"<name>","params":{...}}\n```\n' +
+    'The fence is MANDATORY — without it this chat renders your backticks as formatting and corrupts the JSON.\n' +
+    'A reply with no tool call, or more than one, is rejected and sent back to you.\n' +
+    'Work the task: inspect files, make the changes, verify them. A summary of what the work WOULD look like is ' +
+    'not the work. Keep going after every tool result, however long it takes, until the whole task is done AND ' +
+    'verified — do not stop early.\n' +
+    'Finish with submit_answer carrying your final summary; that ends the turn. For a simple question or a ' +
+    'greeting, submit directly with no tool calls.\n' +
+    'JSON: string values must be valid JSON — escape " as \\" and backslash as \\\\. Use \\n for newlines, never ' +
+    'raw newlines inside a string value.\n' +
+    'Tool calls must stay under ' + MAX_TOOL_CALL_CHARS + ' characters — split large content across calls.\n';
 
 const CONV_PREAMBLE =
-    'You are an AI coding assistant communicating with the user in an interactive terminal session. ' +
-    'ALWAYS reply in ENGLISH. ' +
-    'If the user greets you or asks a conversational question, answer directly in natural text. ' +
-    'When executing a tool action, you MUST state what you are about to do before the tool call.';
+    'You are a coding assistant in an interactive session. Reply in ENGLISH only. ' +
+    'Answer conversation directly; before any tool call, say in one 💬 line what you are about to do.';
 
 const CONV_FORMAT =
     '### RESPONSE INSTRUCTIONS (STRICT)\n' +
-    '1. GREETINGS & CONVERSATION: If the user says hello, asks a conversational question, or gives a non-tool message (e.g. "yo", "yo u there", "how are you"), reply directly in friendly, concise plain text. Do NOT execute any tools for greetings.\n' +
+    '1. Conversation (a greeting, a question about the code) → answer directly in plain text, no tools.\n' +
     (config.narration
-        ? '2. TOOL ACTIONS (MANDATORY NARRATION BEFORE TOOL):\n' +
-          '   When the user asks for a task that requires tools (reading files, executing bash commands, searching, editing):\n' +
-          '   You MUST start your response with one clear 💬 explanation line describing what you are about to do and why, followed immediately by your tool call in a code fence:\n' +
-          '   <One clear sentence explaining the tool action you are about to take>\n' +
-          '   ```json\n' +
-          '   {"tool":"<name>","params":{...}}\n' +
-          '   ```\n'
-        : '2. TOOL ACTIONS (NO NARRATION — 09-12 owner rule):\n' +
-          '   When the user asks for a task that requires tools, emit the tool call directly in a code fence. Do NOT send a 💬 line first, do NOT announce what you are about to do. Act:\n' +
-          '   ```json\n' +
-          '   {"tool":"<name>","params":{...}}\n' +
-          '   ```\n') +
-    '3. COMPLETION: When the task is complete and verified, deliver your final summary in plain text or via submit_answer.\n';
+        ? '2. Tools (read files, run commands, edit code) → start with ONE 💬 line saying what you are about to ' +
+          'do and why, then the fenced tool call:\n' +
+          '<one sentence>\n' +
+          '```json\n{"tool":"<name>","params":{...}}\n```\n'
+        : '2. Tools → emit the fenced tool call directly, no 💬 line:\n' +
+          '```json\n{"tool":"<name>","params":{...}}\n```\n') +
+    '3. One tool call per reply, then wait for the result. Keep working until the task is done and verified, ' +
+    'then give your final summary.\n';
 
 // ── Always-tool mode (user directive 08-12) ─────────────────────────────
 // The webchat model must NEVER reply in plain text: every response is a tool
@@ -919,8 +891,10 @@ function greetingDirective(userPrompt) {
     if (greetings.includes(clean)) {
         return '\n### INSTRUCTION FOR GREETING\n' +
             'The user is simply greeting you ("' + userPrompt.trim() + '"). ' +
-            'Do NOT execute any tools. Do NOT call read_file, list_dir, or run_bash. ' +
-            'Reply immediately with a brief, friendly greeting in plain text.\n';
+            'Do NOT execute any tools and do NOT call read_file, list_dir or run_bash. ' +
+            (config.allowPlainText
+                ? 'Reply with a brief, friendly greeting in plain text.\n'
+                : 'Deliver a brief, friendly greeting through submit_answer — one fenced call, no tools.\n');
     }
     return '';
 }
@@ -1316,27 +1290,18 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             const followUp =
                 (call.toolName === 'send_message' ? '' : formatToolResultView(call, result, 150000) + '\n\n') +
                 (config.allowPlainText
-                    ? 'You MUST send ONE plain-text 💬 line before your next tool call (your thinking + what the ' +
-                      'tool is about to do and why — delivered to the user verbatim; user rule 08-13), then your ' +
-                      'NEXT tool call JSON, fenced. ' +
-                      'When the entire task is done AND verified, reply with a fenced submit_answer carrying your final summary ' +
-                      'message. Keep progress lines to one sentence — the work is the tool calls. ' +
-                      'Verify with run_bash: syntax checks, import tests, dependency checks, and the project tests. ' +
-                      'Do not claim completion for work you have not verified actually runs. ' +
-                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — pass maxLength for a specific head window. ' +
-                      'The next step: fenced {"tool":"<name>","params":{...}}.'
-                    : 'The full tool list is below. The task is NOT complete until every part is done AND verified — do not stop now. ' +
-                      'Reply with exactly ONE tool call per message, fenced as ```json ... ```. To speak to the user, ' +
-                      'call send_message with your one-line 💬 (what you are thinking and about to do) — that is how ' +
-                      'your progress reaches the user; never write plain text outside the JSON fence. ' +
-                      'Respond with exactly ONE of these two, and nothing else: ' +
-                      '(a) your NEXT tool call JSON (send_message or a work tool), fenced as ```json ... ```; ' +
-                      '(b) submit_answer, fenced, IF AND ONLY IF the entire task is done and verified. ' +
-                      'Continue the work: inspect, modify, VERIFY. Verify with run_bash — run syntax checks, import tests, ' +
-                      'dependency checks (pip), and the project tests. Do not claim completion for work you have not ' +
-                      'verified actually runs. ' +
-                      'Large files: read_file results are ALWAYS capped at 200K chars (truncated:true + totalLength) — pass maxLength for a specific head window. ' +
-                      'The next step: fenced {"tool":"<name>","params":{...}}.');
+                    ? 'Task is NOT complete until every part is done AND verified. Send ONE 💬 line, then your ' +
+                      'next fenced tool call. Verify with run_bash (syntax checks, imports, the project tests); ' +
+                      'never claim completion for work you have not run. read_file caps at 200K chars ' +
+                      '(truncated:true + totalLength) — pass maxLength for a head window. When everything is done ' +
+                      'and verified, reply with a fenced submit_answer carrying your final summary.'
+                    : 'Task is NOT complete until every part is done AND verified. Continue the work: inspect, ' +
+                      'modify, VERIFY with run_bash (syntax checks, imports, the project tests) — never claim ' +
+                      'completion for work you have not run. read_file caps at 200K chars (truncated:true + ' +
+                      'totalLength) — pass maxLength for a head window. Reply with exactly ONE of these, nothing ' +
+                      'else: (a) your next tool call — send_message with a one-line 💬 to speak to the user, or a ' +
+                      'work tool — fenced as ```json ... ```; (b) a fenced submit_answer, only if the entire task ' +
+                      'is done and verified.');
             response = await countedSend(followUp, toolDefs);
             continue;
         }
@@ -1432,27 +1397,22 @@ function truncateForClient(text) {
     return text.slice(0, 1500) + `\n…(truncated — raw reply was ${text.length} chars)`;
 }
 
-// Harness protocol (08-13): the model sent a prose-only reply. Deliver it,
-// then nudge it back into tool mode — the user's exact ask: "it sends the
-// message, then a message back so it can send the tool call".
+// A work tool call arrived with no narration — teach it once per request.
 const NARRATION_MSG =
-    '### NARRATION REQUIRED (user rule 08-13 EVENING)\n' +
-    'Your last tool call was NOT preceded by a send_message. Before ANY work tool call you MUST send ' +
-    'send_message first: one short 💬 line with what you are thinking and what the tool call you are about ' +
-    'to make does and why (delivered to the user verbatim). Reply NOW with that send_message call. ' +
-    'Then continue with your work tool call as usual.';
+    '### NARRATION REQUIRED\n' +
+    'Your tool call was not preceded by a send_message. Before every work tool call you MUST send ' +
+    'send_message first: one short 💬 line saying what you are about to do and why (shown to the user ' +
+    'verbatim). Reply now with that send_message call, then continue with your work tool call.';
 
 const EMPTY_ANSWER_MSG =
-    '### EMPTY ANSWER (08-16)\n' +
-    'Your submit_answer had an EMPTY text field — it reached the user as nothing. ' +
-    'Deliver your real final answer now: a fenced submit_answer with the actual ' +
-    'content in the text field. If you have not finished the task, continue working ' +
-    'with your tools until it is done, then submit the full final answer.';
+    '### EMPTY ANSWER\n' +
+    'Your submit_answer had an empty text field — the user received nothing. Deliver your real final ' +
+    'answer now: a fenced submit_answer with the content in the text field. If the task is not finished, ' +
+    'keep working with your tools until it is, then submit.';
 
 const PROSE_NUDGE =
-    'Your message was delivered to the user. Continue the task: send your NEXT tool call JSON, fenced as ```json ... ``` — ' +
-    'or a fenced submit_answer if the entire task is done and verified. ' +
-    '(You may send one plain-text progress line before it.)';
+    'Your message was delivered to the user. Continue the task: reply with your next fenced tool call ' +
+    '(```json ... ```), or a fenced submit_answer if the entire task is done and verified.';
 
 // Malformed tool-JSON attempt (raw triple quotes/newlines in string values,
 // unescaped quotes, truncated braces). Correct with the specific rule the
@@ -1468,13 +1428,12 @@ const MALFORMED_MSG =
 
 const FORMAT_ERROR_MSG =
     '### FORMAT ERROR\n' +
-    'Your previous response was NOT in the required format: you sent plain text instead of a fenced tool call JSON object. ' +
-    'ALWAYS respond with exactly one JSON object wrapped in a markdown code fence, like this:\n' +
+    'Your last reply had NO tool call — plain text alone is rejected. Every reply must contain exactly one ' +
+    'fenced tool call, optionally preceded by ONE short 💬 line:\n' +
     '```json\n{"tool":"<name>","params":{...}}\n```\n' +
-    'The fence is MANDATORY — without it this chat renders your backticks as formatting and corrupts your content. ' +
+    'The fence is MANDATORY — without it this chat renders your backticks as formatting and corrupts the JSON. ' +
     'If the task is complete, use a fenced {"tool":"submit_answer","params":{"text":"your final answer"}}. ' +
-    'If you wrote an implementation as prose, that is NOT the work: re-emit it as write_file tool calls instead. ' +
-    'No prose. No markdown. No questions. No plans. Nothing else.';
+    'If you wrote an implementation as prose, that is NOT the work: re-emit it as write_file tool calls instead.';
 
 // Progress-report yap: DeepSeek pauses after tool work and writes a status
 // update ("I added X, next I will Y") instead of the next tool call. The
@@ -1494,12 +1453,12 @@ function looksLikeYap(text) {
 }
 
 const YAP_ERROR_MSG =
-    '### FORMAT ERROR — progress reports are NEVER accepted\n' +
-    'Your last message was a plain-text progress report or summary. Nobody reads those — your only output ' +
-    'channel is tool calls and submit_answer. "I added X, next I will Y" is plain text and is rejected, ' +
-    'every time. The task is not done until every part is done and verified. Respond NOW with exactly one ' +
-    'fenced JSON: either your next tool call (```json {"tool":"<name>","params":{...}} ```) or, if and only if ' +
-    'the entire task is complete and verified, submit_answer. Do not narrate. Do it.';
+    '### FORMAT ERROR — no tool call in that reply\n' +
+    'Your last message had no tool call. A progress report or summary on its own is rejected every time — ' +
+    'your work happens through tools, and it reaches the user as your one 💬 line inside the next reply. ' +
+    'The task is not done until every part is done and verified. Respond now with exactly one fenced JSON: ' +
+    'your next tool call (```json {"tool":"<name>","params":{...}} ```), or — only if the entire task is ' +
+    'complete and verified — submit_answer.';
 
 // ──────────────────────────────────────────────────────
 // CONTEXT HANDOFF (08-13)
@@ -2096,7 +2055,12 @@ app.post('/v1/messages', async (req, res) => {
                 : Array.isArray(system)
                   ? system.map((b) => (b.type === 'text' ? b.text : '')).join('\n')
                   : '';
-        const systemText = clientSystem || configuredSystem;
+        // IGNORE_CLIENT_SYSTEM: the caller is a coding agent (opencode/Claude
+        // Code) whose own system prompt is tens of KB of harness rules that do
+        // not apply inside the webchat tab — shipping it is pure noise and a
+        // competing contract. With this on, ONLY the harness's own prompt is
+        // sent; the caller's tools are already ignored (buildExecutableToolDefs).
+        const systemText = config.ignoreClientSystem ? configuredSystem : (clientSystem || configuredSystem);
 
         const userMessage = [...(messages || [])].reverse().find((m) => m.role === 'user');
         const prompt = Array.isArray(userMessage?.content)

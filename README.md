@@ -271,6 +271,7 @@ Run the harness as a user whose files you are willing to lose.
 | `CONTEXT_HANDOFF_THRESHOLD` | `100000` | rough per-request context estimate that triggers the handoff (chars/4 ≈ tokens) |
 | `WEBCHAT_MODE` | `generic` | webchat mode: generic / deepseek / chatgpt / gemini / kimi |
 | `SYSTEM_PROMPT` | *(none)* | override the configured system prompt |
+| `IGNORE_CLIENT_SYSTEM` | `false` | drop the caller's own system message entirely — only the harness prompt is sent (see below) |
 | `HARNESS_CONFIG` | `./harness.config.json` | path to a different master config file |
 | `HANDOFF_FILE` | `<workspace>/handoff_to_new_chat.md` | where the handoff document is written |
 | `WORKSPACE_ROOT` | the harness's parent directory | base for every default path (audits, handoff, sibling repos) |
@@ -330,6 +331,29 @@ dedicated mode.
 - The `SYSTEM_PROMPT` env var overrides both.
 - A system message sent by the API caller still takes precedence — the caller's
   own contract is never replaced.
+
+#### `IGNORE_CLIENT_SYSTEM` — for agent callers (2026-09-16)
+
+Callers differ in what their system message is worth. A raw API client sends a
+task contract the model should follow. A **coding agent** (opencode, Claude
+Code, Aider) sends *its own* system prompt — tens of KB of rules about its own
+tools, its own permission model and its own output format, none of which exist
+inside a webchat tab. It does not just waste tokens: it is a second, competing
+contract, and the model follows whichever it read last.
+
+With `features.ignoreClientSystem: true` (or `IGNORE_CLIENT_SYSTEM=true`) the
+caller's system message is dropped and **only** the harness prompt is sent.
+The caller's tool list is already ignored — `buildExecutableToolDefs()`
+substitutes the harness's own tools — so this closes the last channel through
+which an agent's harness leaks into the webchat.
+
+```json
+{ "features": { "ignoreClientSystem": true } }
+```
+
+Pairs with a `systemPrompt.text` carrying whatever the worker should actually
+be told. Verified: sending a system message containing a marker string leaves
+no trace of it in the tab.
 
 
 ### Master config — `harness.config.json`
