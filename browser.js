@@ -2111,7 +2111,19 @@ async function waitForResponse(before, typedText) {
                 : host.includes('freebuff') ? 240000
                 : 12000;
             if (emptySince > emptyGraceMs) {
-                throw new Error(`Webchat response is empty after ${emptyGraceMs / 1000}s — stopped or aborted by the UI`);
+                // 09-16: carry the PAGE TEXT into the error. The account can be
+                // throttled - DeepSeek then renders "Messages too frequent, try again
+                // later" ON THE PAGE and never produces a reply, so the sender times
+                // out at the full hard cap (measured: outstandingMs 463719, repeated
+                // 330s timeouts) while the harness sees nothing to inspect. The
+                // rate-limit detector in server.js keys on the MESSAGE
+                // (RATE_LIMIT.isRateLimitText(error.message), server.js:1737), so
+                // quoting the page here is what lets it recognise the throttle, cool
+                // the account for 900s, and stop burning a full budget per send.
+                // Measured: ds-gw(9229) and ds-gw2(9225) both read tooFrequent=true
+                // while ds-gw4(9227) read false - and only ds-gw4 was answering.
+                throw new Error(`Webchat response is empty after ${emptyGraceMs / 1000}s — stopped or aborted by the UI.`
+                    + ` Page said: ${String(state.body || state.text || '').replace(/\s+/g, ' ').slice(0, 400)}`);
             }
         } else {
             emptySince = 0;
