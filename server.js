@@ -968,9 +968,19 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             // Truncate the CONTENT field instead, and say so, so the result stays
             // valid JSON the model can actually read.
             let _body;
+            // The fetch feedback is INJECTED into a re-prompt, so its size lands
+            // straight on top of the caller's own prompt budget. Measured 09-18 on
+            // the three deepseek webchats: read_file returned 38-141K chars, the
+            // re-prompt went out at 42,494 / 62,202 / 62,059 chars against a lane
+            // cap of 20000, and the DS tab HUNG on every one of those sends (4
+            // engine timeouts at exactly its budget in a 15-min window, 32
+            // worker-minutes burned on ONE lane). The whole point of chunking is
+            // that a lane can fetch AGAIN for the next part, so a smaller default
+            // is strictly better here.
+            const _fetchMax = Math.max(2000, parseInt(process.env.PASSTHROUGH_FETCH_MAX_CHARS || '12000', 10));
             if (_res && typeof _res.content === 'string') {
                 const _raw = _res.content;
-                const _cut = _raw.slice(0, 60000);
+                const _cut = _raw.slice(0, _fetchMax);
                 _body = JSON.stringify({
                     ..._res,
                     content: _cut,
@@ -982,7 +992,7 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
                         : {}),
                 });
             } else {
-                _body = _payload.slice(0, 60000);
+                _body = _payload.slice(0, _fetchMax);
             }
             _text = await countedSend(
                 'TOOL RESULT for ' + _fetch.toolName + ' (the real file content you asked for):\n'
