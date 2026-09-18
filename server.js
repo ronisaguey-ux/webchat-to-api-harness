@@ -2121,6 +2121,26 @@ app.post('/newchat', async (req, res) => {
         if (!pg || pg.isClosed()) {
             return res.status(503).json({ error: 'no live webchat page — POST /connect first' });
         }
+        // 09-18 RACE-FREE GUARD. openNewChat() NAVIGATES the tab, so a reset landing while
+        // a send is in flight destroys that send's page context and the call can never
+        // return. The engine's own pre-check (/health, see _post_if_idle in execute.py)
+        // races by construction: it can read idle and post a millisecond later, just as a
+        // worker starts a send. Measured on oculus-ds-gw2: reconnect + /newchat churn,
+        // then a send stuck at outstandingMs 1597892 (26.6 min) with its send count fallen
+        // to 7 against 40/42 on its siblings.
+        // The gateway knows its own in-flight state with no race, so the check belongs
+        // HERE. A deferred reset is housekeeping, not lost work - the engine's counter
+        // keeps ticking and the next cycle lands as soon as the send ends.
+        const _started = typeof processStartAt === 'number' ? processStartAt : 0;
+        const _busySince = (typeof lastSendAt === 'number' && lastSendAt > _started)
+            ? Date.now() - lastSendAt : 0;
+        if (_busySince > 0) {
+            console.log(`⏸ /newchat deferred — a send is in flight (outstandingMs=${_busySince})`);
+            return res.status(409).json({
+                ok: false, deferred: true, outstandingMs: _busySince,
+                error: 'a send is in flight — retry when idle',
+            });
+        }
         await openNewChat();
         console.log('🆕 /newchat — fresh thread opened');
         res.json({ ok: true, message: 'fresh chat opened', page: getPage() ? getPage().url() : null });
