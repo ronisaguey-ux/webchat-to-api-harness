@@ -2377,9 +2377,31 @@ async function openNewChat() {
     // conversation stays safe server-side).
     if (!page && config.cdpWsUrl) {
         const pages = await browser.pages();
-        page = config.tabUrlSubstring
-            ? pages.find((p) => p.url().includes(config.tabUrlSubstring))
-            : pages.find((p) => p.url().startsWith(new URL(config.webchatUrl).origin));
+        const _match = (p) => (config.tabUrlSubstring
+            ? p.url().includes(config.tabUrlSubstring)
+            : p.url().startsWith(new URL(config.webchatUrl).origin));
+        page = pages.find(_match);
+        // 09-18 SURPLUS-TAB SWEEP. A SECOND page matching the lane's substring is a
+        // documented silent lane-killer: selectors come from pages.find() = the FIRST
+        // match, so the gateway can attach to a stale corpse while the good tab sits
+        // unused. Measured here: every DS chrome accumulated an old conversation plus a
+        // fresh /a/chat/new, and the gateway on :8080 - whose chrome held TWO matching
+        // pages - was the one burning 5 x 480s (40 worker-minutes) while its sibling
+        // :8083 answered 42/42 with zero timeouts.
+        // Prune in the one place the gateway already enumerates pages, so the
+        // accumulation self-heals on the next reset instead of needing a manual sweep.
+        // Only OTHER matching pages are closed - never the one just chosen, never a
+        // non-matching tab the user may have open.
+        try {
+            if (page) {
+                for (const _sp of pages.filter((p) => p !== page && _match(p))) {
+                    try {
+                        await _sp.close();
+                        console.log('🧹 closed a surplus matching tab:', _sp.url().slice(0, 60));
+                    } catch { /* already gone - harmless */ }
+                }
+            }
+        } catch { /* pruning is best-effort, never block the attach */ }
         if (!page) {
             page = await browser.newPage();
             await page.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
