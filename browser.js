@@ -1965,10 +1965,30 @@ async function waitForResponse(before, typedText) {
     let sawContent = false;
     let _throttlePolls = 0; // 09-17: cadence for the page-throttle check below
     let _lastSeenLen = (before && typeof before.text === 'string') ? before.text.length : 0;
+    // 09-18 OWNER RULE, enforced: "theres not supposed to be any limit on task
+    // completion, only limits on last seen token stream." extendOnActivity() re-arms
+    // the window on every growth and is UNBOUNDED once content is seen - which is
+    // correct for a working task, but it also means a STUCK page that merely holds
+    // text (e.g. the prompt echoed into a stale row) can hold the send forever: the
+    // `while (Date.now() < deadline)` loop keeps being extended, so the process-level
+    // cap never fires and the callers' budget becomes the only bound.
+    // Measured 09-18: engine reported 14 `timeout after 480s` in 90 min while the
+    // gateways logged ZERO `Timed out after` lines - i.e. the gateway never gave up,
+    // the engine's per-lane budget did. Median DS send is 5s (p90 20-25s), so a send
+    // with no growth for a whole extra idle window is stalled, not slow.
+    let lastGrowthAt = Date.now();
     const extendOnActivity = () => {
+        lastGrowthAt = Date.now();
         const ext = Math.max(deadline, Date.now() + config.timeout);
         deadline = sawContent ? ext : Math.min(hardCap, ext);
     };
+    // Abort a stalled send instead of holding a worker until the caller's budget runs
+    // out. Scoped to AFTER first content: the pre-content empty-row grace
+    // (EMPTY_GRACE_MS) already covers the thinking window, and this must never
+    // guillotine a slow-but-working generation.
+    const idleAbortMs = Math.max(
+        30000,
+        parseInt(process.env.IDLE_ABORT_MS || '0', 10) || config.timeout);
     let lastLen = -1; // forces at least two polls before accepting
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
@@ -2206,6 +2226,10 @@ async function waitForResponse(before, typedText) {
         // rescue (gemini's 20197-char request rescued a 22-char stale row).
         if (busy) {
             extendOnActivity();
+        }
+        if (sawContent && Date.now() - lastGrowthAt > idleAbortMs) {
+            throw new Error(`Webchat stalled: no new output for ${Math.round(idleAbortMs / 1000)}s ` +
+                `(last seen token stream, per the owner's rule) — aborting so the caller can retry`);
         }
         lastText = state.text;
         lastLen = state.text.length;
