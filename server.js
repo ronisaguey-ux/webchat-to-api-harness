@@ -1704,8 +1704,21 @@ app.get('/health', (req, res) => {
     // makes the watchdog restart a healthy gateway. Only a timestamp that is
     // actually within this process's lifetime counts as an outstanding send.
     const started = typeof processStartAt === 'number' ? processStartAt : 0;
-    const busySince =
-        typeof lastSendAt === 'number' && lastSendAt > started ? Date.now() - lastSendAt : 0;
+    // 09-18 BUG: `lastSendAt` is set at send START and NEVER cleared (the comment
+    // below claimed sendPrompt refreshes it at completion - it does NOT; grep proves
+    // the only write is the start). So `Date.now() - lastSendAt` grew without bound,
+    // and three consumers read it as "a send is in flight":
+    //   - /health read `wedged:true` + HTTP 503 on a HEALTHY IDLE gateway once the
+    //     value passed 3x TIMEOUT (spurious restarts, lying probes);
+    //   - /newchat (below) 409-deferred the 5-step context reset forever;
+    //   - the engine's _post_if_idle skipped the reset forever.
+    // The value cannot be cleared there, because the send GATE uses lastSendAt as a
+    // timestamp for spacing. Instead, bound it: the gateway aborts any send at
+    // TIMEOUT, so a value older than TIMEOUT + margin is definitionally NOT in flight.
+    const inFlightMax = (config.timeout || 300000) + 60000;
+    const _since = typeof lastSendAt === 'number' && lastSendAt > started
+        ? Date.now() - lastSendAt : 0;
+    const busySince = _since > 0 && _since < inFlightMax ? _since : 0;
     // The wedge threshold MUST exceed the request timeout, or the watchdog kills
     // the gateway while a legitimate long send is still running: gemini takes
     // 150-260s per reply and the gemini unit sets TIMEOUT=300000, so a flat 240s
@@ -2132,8 +2145,14 @@ app.post('/newchat', async (req, res) => {
         // HERE. A deferred reset is housekeeping, not lost work - the engine's counter
         // keeps ticking and the next cycle lands as soon as the send ends.
         const _started = typeof processStartAt === 'number' ? processStartAt : 0;
-        const _busySince = (typeof lastSendAt === 'number' && lastSendAt > _started)
+        // Same bound as /health: a lastSendAt older than TIMEOUT + margin is a
+        // finished send, not an in-flight one. Without this the 409 deferred EVERY
+        // reset after the first send, which silently disabled the 5-step context
+        // clear on all three DS lanes (Bob's design).
+        const _inFlightMax = (config.timeout || 300000) + 60000;
+        const _since = (typeof lastSendAt === 'number' && lastSendAt > _started)
             ? Date.now() - lastSendAt : 0;
+        const _busySince = _since > 0 && _since < _inFlightMax ? _since : 0;
         if (_busySince > 0) {
             console.log(`⏸ /newchat deferred — a send is in flight (outstandingMs=${_busySince})`);
             return res.status(409).json({
