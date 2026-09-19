@@ -2089,7 +2089,19 @@ async function waitForResponse(before, typedText) {
         // GROWTH, never on `busy` - a tab that is merely busy with no new text is not
         // a stream, and treating it as one is what let a wedged send run unbounded.
         const _tLen = (state && typeof state.text === 'string') ? state.text.length : 0;
-        if (_tLen > _lastSeenLen) { _lastSeenLen = _tLen; sawContent = true; markProgress(); }
+        // 09-19: a USER row appearing is NOT the model streaming. `state.text` is the
+        // raw last-row text, so the moment the just-sent prompt rendered it grew - and
+        // latching sawContent on that growth made an UNANSWERED send look like one that
+        // had started, so the idle abort then fired on a send the model had not begun.
+        // Measured after the echo guard landed: 2 of 9 stalls were still prompt+39, i.e.
+        // the guard stopped the echo being RETURNED as the answer but the send still
+        // stalled on it. Only assistant-row growth counts as the first stream; a user row
+        // leaves the progress clock alone so the EMPTY grace (not the idle abort) ends a
+        // send the model never started.
+        if (_tLen > _lastSeenLen) {
+            _lastSeenLen = _tLen;
+            if (!userRow) { sawContent = true; markProgress(); }
+        }
         const busy = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
         // 09-17 (BOB): a PAGE-rendered throttle must ABORT the send instead of sitting
         // until the hard cap. DeepSeek renders "Messages too frequent. Try again later."
