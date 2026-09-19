@@ -2046,8 +2046,24 @@ async function waitForResponse(before, typedText) {
         // check missed them, and the last row after a send is often the
         // gateway's own tool-preamble USER row, which the DOM path could
         // accept as the answer. Guard on hash OR the preamble prefix.
+        // 09-19 ECHO GUARD (the real cause of "deepseek wedged"): DeepSeek rotates
+        // its row hashes, and the hash list above goes stale with every rotation -
+        // when it did, the reader accepted the just-sent USER row as the answer.
+        // Measured over 6h on the three ds gateways: of 57 stalls, 40 carried a
+        // "partial answer" whose length was the PROMPT length +39 or +24 chars -
+        // i.e. the prompt echoed back - and since an echoed prompt never grows, the
+        // send sat to the idle abort and retried, which the engine saw as a 480-720s
+        // wedge. DeepSeek had answered fine: `⏱ stall: no growth for 120s` on a row
+        // that was never the answer at all.
+        // The hash check cannot be trusted as the only gate, so ALSO reject a
+        // candidate whose size IS the prompt's size: the assistant's reply is a
+        // small edits-contract JSON, never a copy of a 300+-char prompt.
+        const _ansLen = (state.answer || '').length;
+        const _typedLen = typeof typedText === 'string' ? typedText.length : 0;
+        const echoOfPrompt = _typedLen > 300 && _ansLen > 0 && Math.abs(_ansLen - _typedLen) < 150;
         const userRow = (state.lastCls || '').split(/\s+/).includes(USER_ROW_CLS)
             || (state.lastCls || '').split(/\s+/).includes('_81e7b5e')
+            || echoOfPrompt
             || /^You have access to the tools below/.test(state.answer || '');
         // Growth via ROW COUNT (08-13): the text-inequality check alone never
         // trips when the new answer renders IDENTICAL to the previous one —
