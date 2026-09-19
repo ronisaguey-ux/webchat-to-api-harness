@@ -442,9 +442,17 @@ async function countedSend(msg, defs) {
             }
             throw e;
         }
-        if (sendRetriesLeft > 0 && /Timed out/.test(String(e.message))) {
+        // 09-19: key on the CLASS of failure, not on the wording of the message.
+        // This gate used to test /Timed out/ alone, but a stall throws
+        // "Webchat stalled: no new output for 120s ..." - a string with no "Timed out" in it -
+        // so the retry was UNREACHABLE for the exact failure it exists for. Measured over 12h:
+        // 18 stalls on :8080 against 12 retry banners, and the engine burned its full 480s
+        // budget on every stall the retry never reached. browser.js now tags the error;
+        // the message test stays as a fallback for any other site that throws.
+        const _retryable = !!e.retryable || /Timed out|stalled: no new output/i.test(String(e.message));
+        if (sendRetriesLeft > 0 && _retryable) {
             sendRetriesLeft--;
-            console.log('⏱ send timed out — resending with a RETRY banner');
+            console.log(`⏱ send timed out${e.partialAnswerChars != null ? ` (partial answer was ${e.partialAnswerChars} chars)` : ''} — resending with a RETRY banner`);
             const r = await sendPrompt(
                 '### RETRY (the previous message may not have reached you — here it is again)\n' + msg,
                 defs

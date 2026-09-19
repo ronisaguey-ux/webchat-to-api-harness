@@ -2228,8 +2228,21 @@ async function waitForResponse(before, typedText) {
             extendOnActivity();
         }
         if (sawContent && Date.now() - lastGrowthAt > idleAbortMs) {
-            throw new Error(`Webchat stalled: no new output for ${Math.round(idleAbortMs / 1000)}s ` +
+            // 09-19: record the STATE at the stall, not just the timeout. Without it a stalled
+            // send could not be told apart from one that never produced a first token, so the
+            // cause could only be guessed at - three theories were tested that way and all
+            // three failed their controls. These two numbers settle it on the next stall.
+            const _partial = String(state.answer || state.text || '').trim();
+            console.warn(`⏱ stall: no growth for ${Math.round((Date.now() - lastGrowthAt) / 1000)}s`
+                + ` — partial answer=${_partial.length} chars, sawContent=${sawContent}`);
+            const _stallErr = new Error(`Webchat stalled: no new output for ${Math.round(idleAbortMs / 1000)}s ` +
                 `(last seen token stream, per the owner's rule) — aborting so the caller can retry`);
+            // A stall is precisely the case the caller's retry exists for, so tag the CLASS of
+            // failure. server.js keys on this flag instead of on the wording above - a reworded
+            // message must never be able to silently disable the retry again.
+            _stallErr.retryable = true;
+            _stallErr.partialAnswerChars = _partial.length;
+            throw _stallErr;
         }
         lastText = state.text;
         lastLen = state.text.length;
