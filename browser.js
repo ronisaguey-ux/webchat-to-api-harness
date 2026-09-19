@@ -2204,6 +2204,28 @@ async function waitForResponse(before, typedText) {
                 throw new Error(`Webchat response is empty after ${emptyGraceMs / 1000}s — stopped or aborted by the UI.`
                     + ` Page said: ${String(state.body || state.text || '').replace(/\s+/g, ' ').slice(0, 400)}`);
             }
+        } else if (!sawContent) {
+            // 09-19 DEAD-SEND FIX: a send where NO new message row ever appears
+            // (`grew` false forever) used to fall into `else { emptySince = 0 }`,
+            // so the emptiness timer NEVER accumulated and the send ran to the
+            // full TIMEOUT — measured on :8080/:8081 as a 403s attempt that
+            // produced nothing at all, then a browser reconnect, then a retry
+            // that streamed 20,692 chars and stalled 120s more. The engine saw
+            // the whole ~525s chain and called it a timeout. DeepSeek answers in
+            // a 5s median, so 400s of silence is a dead send, not a slow one:
+            // it must abort on the SAME empty grace (and carry the page text,
+            // so the rate-limit detector can recognise a rendered throttle).
+            emptySince += 1500;
+            const _graceMs = parseInt(process.env.EMPTY_GRACE_MS || '0', 10);
+            const _host = new URL(config.webchatUrl).host;
+            const _limit = _graceMs > 0 ? _graceMs
+                : _host.includes('chatgpt') ? 180000
+                : _host.includes('freebuff') ? 240000
+                : 12000;
+            if (emptySince > _limit) {
+                throw new Error(`Webchat response is empty after ${_limit / 1000}s — no new message row appeared (the send never committed or the model never started).`
+                    + ` Page said: ${String(state.body || state.text || '').replace(/\s+/g, ' ').slice(0, 400)}`);
+            }
         } else {
             emptySince = 0;
         }
