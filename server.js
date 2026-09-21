@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const express = require('express');
@@ -269,7 +270,12 @@ const WEBCHAT_ACCOUNT = (() => {
     if (process.env.WEBCHAT_PROFILE) return slug(path.basename(process.env.WEBCHAT_PROFILE));
     return WEBCHAT_HOST;
 })();
-const DEEPSEEK_LOCK_DIR = process.env.WEBCHAT_LOCK_DIR || `/tmp/webchat_mutex_${WEBCHAT_ACCOUNT}`;
+// os.tmpdir() rather than a hardcoded /tmp: on Windows "/tmp" resolves to
+// C:\tmp, which usually does not exist, so mkdirSync threw ENOENT on the very
+// first send and the old catch treated it as "another gateway holds the lock" -
+// every request then waited out the full lock timeout and looked like a hang.
+const DEEPSEEK_LOCK_DIR = process.env.WEBCHAT_LOCK_DIR
+    || path.join(os.tmpdir(), `webchat_mutex_${WEBCHAT_ACCOUNT}`);
 const LOCK_STEAL_MS = 90000; // 3 heartbeats (30s each): a holder whose mtime stopped moving is dead
 const LOCK_HEARTBEAT_MS = 30000;
 // 09-12: a request queued behind another send on the SAME account must fail fast.
@@ -301,13 +307,37 @@ async function acquireDeepSeekLock() {
     // Reentrant: context-handoff / retry flows send nested messages from
     // within an already-locked request (same process) — depth-count them.
     if (lockDepth > 0) { lockDepth++; return; }
+    // Create the lock PARENT before the retry loop. mkdirSync(lockDir) without
+    // {recursive:true} fails with ENOENT when the parent is missing, and the
+    // old blanket catch read that as "held by another gateway" — so the loop
+    // spun for the whole LOCK_ACQUIRE_TIMEOUT_MS and the caller saw a hang.
+    // A missing/unwritable parent is a configuration fault and must be loud.
+    const lockParent = path.dirname(DEEPSEEK_LOCK_DIR);
+    try {
+        fs.mkdirSync(lockParent, { recursive: true });
+    } catch (e) {
+        throw new Error(
+            `webchat mutex: cannot create lock parent ${lockParent} `
+            + `(${e.code || 'UNKNOWN'}: ${e.message})`
+        );
+    }
     const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
     let waited = false;
     while (true) {
         try {
             fs.mkdirSync(DEEPSEEK_LOCK_DIR);
             break; // acquired
-        } catch (e) { /* held by another gateway */ }
+        } catch (e) {
+            // ONLY EEXIST means another gateway genuinely holds it. Every other
+            // errno (ENOENT, EACCES, EPERM, ENOSPC, EROFS, ENOTDIR) is a real
+            // filesystem fault and must surface instead of being waited out.
+            if (e.code !== 'EEXIST') {
+                throw new Error(
+                    `webchat mutex: cannot create lock ${DEEPSEEK_LOCK_DIR} `
+                    + `(${e.code || 'UNKNOWN'}: ${e.message})`
+                );
+            }
+        }
         if (!waited) {
             waited = true;
             console.log('🔒 deepseek mutex: queued — waiting for the in-flight message (one at a time)');
@@ -318,7 +348,16 @@ async function acquireDeepSeekLock() {
                 fs.rmdirSync(DEEPSEEK_LOCK_DIR); // dead holder → steal
                 continue;
             }
-        } catch (e) { /* stolen between stat+rmdir; retry */ }
+        } catch (e) {
+            // ENOENT = stolen between stat+rmdir by a sibling gateway; retry.
+            // Anything else is a real fault - surface it rather than spin.
+            if (e.code && e.code !== 'ENOENT') {
+                throw new Error(
+                    `webchat mutex: cannot inspect lock ${DEEPSEEK_LOCK_DIR} `
+                    + `(${e.code}: ${e.message})`
+                );
+            }
+        }
         if (Date.now() > deadline) {
             throw new Error('DeepSeek send mutex: another chat is mid-generation (lock timeout)');
         }
@@ -353,8 +392,20 @@ let sendRetriesLeft = 1;
 // 09-14 (owner): webchat tabs accumulate an unbounded thread and the renderer
 // eventually crashes (measured: chatgpt at 144 rows / 429KB DOM -> Target closed).
 // Open a fresh chat every N sends so the thread never grows that far.
+//
+// 09-21 BUGFIX (reported): the reset used to fire from countedSend(), which is
+// called for EVERY internal send — including tool-loop corrections, tool-result
+// follow-ups and repair nudges. A multi-tool Claude Code request could therefore
+// hit N sends MID-RESPONSE, call openNewChat(), navigate the tab away from the
+// live conversation and break the tool loop (surface as "Server error
+// mid-response"). The reset is now ONLY performed at a request boundary, before
+// a new client request starts, never during one. Set NEW_CHAT_EVERY_SENDS=0 to
+// disable automatic resets entirely (manual POST /newchat still works).
 const NEW_CHAT_EVERY_SENDS = parseInt(process.env.NEW_CHAT_EVERY_SENDS || '5', 10);
 let sendCount = 0;
+// True while handleRequest() is running. The reset is refused whenever this is
+// set, so a tool-loop send can never navigate the tab out from under itself.
+let requestInFlight = false;
 // Post-swap grace: the first request after a handoff always reaches the
 // fresh thread (its seeded body can be ≥ threshold by itself — overhead +
 // doc — and must not re-trigger the pre-send handoff immediately).
@@ -363,15 +414,26 @@ let lastHandoffAt = 0;
 // handoff from the ERROR path — see the CONTEXT_FULL catch below). Refreshed
 // at every handleRequest start and whenever a tool executes.
 let activeHandoffCtx = null;
-async function countedSend(msg, defs) {
-    // 09-14 (owner): open a fresh webchat thread every N sends so the tab never
-    // accumulates a renderer-crashing history (chatgpt measured 144 rows -> Target closed).
-    sendCount += 1;
-    if (sendCount >= NEW_CHAT_EVERY_SENDS) {
-        sendCount = 0;
-        console.log(`🆕 opening a fresh chat (every ${NEW_CHAT_EVERY_SENDS} sends)`);
-        try { await openNewChat(); } catch (e) { console.warn('⚠️ fresh-chat open failed:', e.message); }
+// Called ONCE per client request, before the conversation starts. Never from
+// inside the tool loop. Returns true when it swapped the thread.
+async function maybeResetThreadAtBoundary(reason) {
+    if (!(NEW_CHAT_EVERY_SENDS > 0)) return false;   // 0 = disabled
+    if (requestInFlight) return false;               // never mid-response
+    if (sendCount < NEW_CHAT_EVERY_SENDS) return false;
+    sendCount = 0;
+    console.log(`🆕 opening a fresh chat (every ${NEW_CHAT_EVERY_SENDS} sends, at a request boundary${reason ? ` — ${reason}` : ''})`);
+    try {
+        await openNewChat();
+        return true;
+    } catch (e) {
+        console.warn('⚠️ fresh-chat open failed:', e.message);
+        return false;
     }
+}
+async function countedSend(msg, defs) {
+    // Counted here, ACTED ON only at a request boundary (see
+    // maybeResetThreadAtBoundary) — a tool-loop send must never navigate the tab.
+    sendCount += 1;
     // 08-14 GLOBAL SEND MUTEX: wait for any other deepseek-tab gateway to
     // finish its generation before sending (owner rule: one in-flight
     // message per account). Held through the response; released in finally.
@@ -385,7 +447,8 @@ async function countedSend(msg, defs) {
     // `lastSendAt` is per-process, so three lane gateways each spaced themselves
     // and still hit the account together. Use a shared timestamp file so every
     // deepseek gateway honours the same gap.
-    const SHARED_SEND_FILE = process.env.SEND_SPACING_FILE || `/tmp/webchat_last_send_${WEBCHAT_ACCOUNT}`;
+    const SHARED_SEND_FILE = process.env.SEND_SPACING_FILE
+        || path.join(os.tmpdir(), `webchat_last_send_${WEBCHAT_ACCOUNT}`);
     const sharedWaitMs = (() => {
         if (!needsSingleThread()) return 0;
         try {
@@ -820,7 +883,28 @@ function greetingDirective(userPrompt) {
     return '';
 }
 
+// 09-21 BUGFIX (reported): the fresh-chat reset is performed at the REQUEST
+// BOUNDARY only, by this wrapper, and never from inside the tool loop.
+// Counting happens in countedSend(); acting on the count happens here, once per
+// client request, before the conversation starts. requestInFlight is raised for
+// the whole request (cleared in finally on every path) so a nested attempt can
+// never navigate the tab out from under a live response - which is what broke
+// multi-tool Claude Code requests ("Server error mid-response").
 async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
+    requestInFlight = true;
+    try {
+        try {
+            await maybeResetThreadAtBoundary('request start');
+        } catch (e) {
+            console.warn('⚠️ boundary fresh-chat open failed:', e.message);
+        }
+        return await handleRequestInner(systemText, userPrompt, toolDefs, onProgress, isAborted);
+    } finally {
+        requestInFlight = false;
+    }
+}
+
+async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, isAborted) {
     // PASSTHROUGH_FORMAT: the caller ships a complete, self-contained contract in
     // its system text (the oculus step engine's {"edits":[...]}). This gateway
     // must then add NOTHING — every block it used to wrap around it was a
@@ -2221,4 +2305,30 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     });
 }
 
-main();
+// Boot only when run directly. Requiring this module (the regression tests in
+// tests/) must not bind a port or connect a browser.
+if (require.main === module) {
+    main();
+}
+
+// ──────────────────────────────────────────────────────
+// TEST SEAM (09-21)
+// Exposed so tests/ can exercise the mutex and the fresh-chat boundary logic
+// against the REAL implementation instead of a re-implementation. Loading this
+// module as a library does not start the server (see require.main above).
+// ──────────────────────────────────────────────────────
+module.exports = {
+    acquireDeepSeekLock,
+    releaseDeepSeekLock,
+    countedSend,
+    maybeResetThreadAtBoundary,
+    DEEPSEEK_LOCK_DIR,
+    NEW_CHAT_EVERY_SENDS,
+    needsSingleThread,
+    __test: {
+        setRequestInFlight: (v) => { requestInFlight = !!v; },
+        getRequestInFlight: () => requestInFlight,
+        setSendCount: (n) => { sendCount = Number(n) || 0; },
+        getSendCount: () => sendCount,
+    },
+};

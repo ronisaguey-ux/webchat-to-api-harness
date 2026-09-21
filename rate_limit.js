@@ -22,6 +22,7 @@
 // three DeepSeek accounts never cool each other.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const COOLDOWN_S = Number(process.env.RATE_LIMIT_COOLDOWN_S
@@ -63,7 +64,10 @@ function isRateLimitError(err) {
 // Cooldown store. One JSON file per account so the three DeepSeek gateways do
 // not need to share memory, and a restart does not forget a live throttle.
 function storePath(account) {
-    const dir = process.env.RATE_LIMIT_STATE_DIR || '/tmp';
+    // os.tmpdir() rather than a hardcoded '/tmp': on Windows '/tmp' resolves to
+    // C:\tmp, which usually does not exist, so the cooldown file could never be
+    // written and a live throttle was forgotten on every restart.
+    const dir = process.env.RATE_LIMIT_STATE_DIR || os.tmpdir();
     const key = String(account || process.env.WEBCHAT_ACCOUNT || process.env.PORT || 'default')
         .replace(/[^A-Za-z0-9._-]/g, '_');
     return path.join(dir, `.webchat_ratelimit_${key}.json`);

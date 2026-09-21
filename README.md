@@ -189,10 +189,46 @@ Run the harness as a user whose files you are willing to lose.
   Upstream credentials live in `.env` (`UPSTREAM_ANTHROPIC_BASE_URL`,
   `UPSTREAM_ANTHROPIC_AUTH_TOKEN`, `UPSTREAM_OPENAI_BASE_URL`). Streaming
   requests pass through untouched (`Readable.fromWeb`), so Claude Code's
-  required SSE works on both routes. `/v1/models` advertises both ids. To
-  surface a custom id as a row in the Claude Code picker, set
-  `ANTHROPIC_CUSTOM_MODEL_OPTION=anymodel` (+ `_NAME`/`_DESCRIPTION`) —
-  discovery via `/v1/models` is off by default in Claude Code.
+  required SSE works on both routes. `/v1/models` advertises both ids.
+- **Custom model row in the Claude Code `/model` picker** (updated 2026-09-21).
+  `ANTHROPIC_CUSTOM_MODEL_OPTION` is the older knob and newer Claude Code
+  builds reject an unknown model id from it unless the row declares what it
+  behaves as. The current, supported shape is `modelPicker` in **user**
+  settings (`~/.claude/settings.json`) — it is deliberately NOT read from a
+  project checkout, and only the highest-precedence source that defines it is
+  used (no merging):
+
+  ```json
+  {
+    "modelPicker": {
+      "options": [
+        {
+          "model": "anymodel",
+          "label": "Webchat (this machine)",
+          "description": "Drives the open webchat tab through the harness",
+          "behavesAs": "claude-opus-4-8"
+        }
+      ],
+      "replaceBuiltInOptions": false
+    }
+  }
+  ```
+
+  - `model` is taken **verbatim** — an alias (`opus`), an Anthropic model id,
+    or a provider-format id (gateway/Bedrock/Vertex). Same values `--model`
+    accepts.
+  - `label` / `description` are the row title and subtitle (both optional).
+  - `behavesAs` names a model **this build of Claude Code already knows**
+    (e.g. `claude-opus-4-8`). Its client-side handling — prompt profile,
+    capability and effort defaults — is applied to your id. It changes neither
+    the row's label nor the model id sent, so the gateway still receives
+    `anymodel`. **Without `behavesAs`, a custom row for a model the build does
+    not know is not offered at all**, which is the failure the old advice hit.
+  - `replaceBuiltInOptions: true` shows only your rows; `false` appends them to
+    the built-ins.
+  - Discovery via `/v1/models` is off by default in Claude Code, so a row is
+    still the reliable way to make the model selectable.
+
 - **One tab = one conversation.** Requests are serialized through a queue;
   concurrent conversations need separate instances (different `PORT` +
   `WEBCHAT_URL`, own directory).
@@ -355,14 +391,57 @@ Now the gateway:
 
 The cooldown is per **account** (the same lock key the gateway already uses), so
 the DeepSeek accounts never cool each other. It is persisted to a small JSON file
-in `RATE_LIMIT_STATE_DIR` (default `/tmp`), so a gateway restart does not forget
-a live throttle. A real answer clears it.
+in `RATE_LIMIT_STATE_DIR` (default: the OS temp dir, `os.tmpdir()`), so a gateway
+restart does not forget a live throttle. A real answer clears it.
 
 Detection is deliberately tight: only the notice's own words
 (`messages too frequent`, `too many requests`, `rate_limit_reached`,
 `free_rate_limited`, `发送太频繁`), only in the first 160 characters, and only in
 a reply under 300 characters. A loose `/rate limit/i` matched a genuine answer
 about rate-limiting middleware, which is why it is anchored.
+
+## Concurrency, locking and the fresh-chat reset (updated 2026-09-21)
+
+**Lock files are built with `os.tmpdir()`, not a hardcoded `/tmp`.** On Windows
+`/tmp` resolves to `C:\tmp`, which usually does not exist — `mkdirSync` then
+failed with `ENOENT`, the old blanket `catch` read *any* failure as "another
+gateway holds the lock", and every request waited out the full
+`DEEPSEEK_LOCK_TIMEOUT_MS` before erroring. That looked exactly like a hang:
+nothing ever reached the composer.
+
+The mutex now:
+
+1. creates the lock **parent** first (`mkdirSync(dirname, {recursive:true})`), so
+   a missing parent can never be mistaken for a held lock;
+2. treats **only `EEXIST`** as "someone else holds it" — `ENOENT`, `EACCES`,
+   `EPERM`, `ENOSPC`, `EROFS` and `ENOTDIR` all raise a named error immediately
+   (`webchat mutex: cannot create lock <path> (<code>: <message>)`) instead of
+   being waited out;
+3. does the same for the shared send-spacing file.
+
+Override the location with `WEBCHAT_LOCK_DIR` / `SEND_SPACING_FILE` /
+`RATE_LIMIT_STATE_DIR` if the temp dir is not where you want them.
+
+**The automatic fresh-chat reset now only runs at a request boundary.** The
+thread has to be recycled eventually — an unbounded webchat thread grows until
+the renderer dies (measured on chatgpt: 144 rows / ~429 KB of DOM → `Target
+closed`). But the counter used to be incremented *and acted on* inside
+`countedSend()`, which fires for every internal send: tool-loop corrections,
+tool-result follow-ups, format repairs. A multi-tool request could therefore hit
+the threshold **mid-response**, call `openNewChat()`, navigate the tab away from
+the live conversation and break the tool loop — surfacing in Claude Code as
+`API Error: Server error mid-response`.
+
+So the count is still taken on every send, but the swap happens once, before the
+next client request starts, and never while one is in flight. The tradeoff: a
+single very long request (many tool rounds) will no longer be broken up by a
+reset, so the thread can grow larger within one request than it used to. In
+exchange the tab is never navigated out from under a running tool loop. Set
+`NEW_CHAT_EVERY_SENDS=0` to disable automatic resets entirely (the manual
+`POST /newchat` still works); the context-handoff flow is unaffected either way.
+
+Regression tests for both behaviours live in `harness_tests/mutex_and_reset.test.js`
+(Node's built-in runner, no extra dependencies) and are run with `npm test`.
 
 ## 🧪 EXPERIMENTAL — Anti-spiral (`ANTI_SPIRAL=true`)
 
