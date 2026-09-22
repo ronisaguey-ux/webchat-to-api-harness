@@ -57,29 +57,70 @@ a webchat session you own, with tool-call support (read/write files, bash, …).
 
 ## Quick start
 
+Three commands. No editing.
+
 ```bash
-npm install
-cp .env.example .env
-cp chat.js.example chat.js   # chat.js is gitignored — it holds YOUR thread URL
-# ⭐ edit chat.js — paste the URL of your webchat tab there. That's it.
-./start.sh                    # visible browser opens → log in once
+./setup.sh                    # asks which webchat, picks a free port, writes .env
+./start.sh                    # the browser opens MINIMISED
+./launch-agent.sh opencode    # or claude | codex | aider | hermes | any
 ```
 
-First request connects lazily; with `HEADLESS=false` a browser window opens and
-you log in manually (session cookies are saved to `.cookies.json` and reused on
-later starts). The server polls for the chat input box instead of blocking on
-stdin, so it works fine under systemd/tmux.
+That is the whole setup. `setup.sh` is safe to re-run and backs up your `.env`
+rather than clobbering it.
 
-**Optionally reuse the tab you already have open**: launch your browser with
-`--remote-debugging-port=9223`, put the printed ws URL in `chat.js` under
-`cdpWsUrl`, and the server drives *your existing tab* — no login at all.
+**To sign in the first time.** The browser opens minimised on purpose — it is a
+real headed browser (headless gets signed out and is a fingerprint tell), just
+kept out of your way. Raise it once, sign in, drop it back:
 
 ```bash
-curl http://localhost:8080/status
+./show-window.sh raise      # or: ./show-window.sh raise && … && ./show-window.sh drop
+```
+
+If you already have a browser open with a signed-in webchat tab, you can attach
+to it instead and skip the login entirely:
+
+```bash
+./setup.sh --attach ws://127.0.0.1:9222/devtools/browser/<id>
+# (find that id at http://127.0.0.1:9222/json/version)
+```
+
+**Check it is alive:**
+
+```bash
+curl http://localhost:8080/            # lists every endpoint
+curl http://localhost:8080/status      # what tab it is driving
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Write a short essay about the history of Rome."}]}'
+  -d '{"model":"gemini-webchat","messages":[{"role":"user","content":"Say hi."}]}'
 ```
+
+### Pointing a coding agent at it
+
+`launch-agent.sh` does not proxy, fork or wrap your agent. It exports the base
+URL and model name that the agent's own provider config already reads, then
+`exec`s it — so the agent is a completely normal agent whose "model" happens to
+be your logged-in tab.
+
+| Agent | Command | How it is wired |
+|---|---|---|
+| OpenCode | `./launch-agent.sh opencode` | writes `./opencode.json` (gitignored) and runs from here |
+| Claude Code | `./launch-agent.sh claude` | `ANTHROPIC_BASE_URL` → `/v1/messages` |
+| Codex | `./launch-agent.sh codex` | `OPENAI_BASE_URL` |
+| Aider | `./launch-agent.sh aider` | `--openai-api-base` passed explicitly |
+| Hermes | `./launch-agent.sh hermes` | exported env |
+| anything else | `./launch-agent.sh any` | prints the four variables; that is the whole surface |
+
+The integration surface is four environment variables:
+
+```
+OPENAI_BASE_URL      http://127.0.0.1:8080/v1
+OPENAI_API_KEY       any non-empty string (unless you set API_TOKEN)
+ANTHROPIC_BASE_URL   http://127.0.0.1:8080
+HARNESS_MODEL_NAME   the `model` value from GET /
+```
+
+Any tool that lets you set an OpenAI-compatible base URL will work with those.
+If your agent is not in the table, `./launch-agent.sh any` prints them.
 
 ## Endpoints
 
