@@ -1842,6 +1842,52 @@ app.get('/health', (req, res) => {
     });
 });
 
+// ── GET / — what this gateway can do ────────────────────────────────────────
+// There was no discovery surface at all: a new user had to read the source to
+// learn the endpoint names, and even a running gateway answered "Cannot GET /".
+// Machine-readable (Accept: application/json) and human-readable in a browser.
+app.get('/', (req, res) => {
+    const wantsJson = String(req.headers.accept || '').includes('application/json');
+    const info = {
+        service: 'webchat-to-api harness',
+        mode: config.webchatMode,
+        model: config.modelName,
+        base_url: `http://${config.host}:${config.port}`,
+        openai_compatible: `http://${config.host}:${config.port}/v1`,
+        endpoints: {
+            'GET  /': 'this document',
+            'GET  /health': 'browser + in-flight status (200 healthy, 503 wedged)',
+            'GET  /status': 'connected tab, model, tool count',
+            'GET  /v1/models': 'model list, OpenAI-shaped',
+            'POST /v1/chat/completions': 'chat; the webchat tab is the model',
+            'POST /v1/messages': 'Anthropic Messages shape, for Claude Code',
+            'POST /connect': 'attach to the browser',
+            'POST /newchat': 'open a fresh, EMPTY thread',
+            'POST /handoff': 'open a fresh thread AND seed it (body: {content})',
+            'POST /__shutdown': 'stop the gateway',
+        },
+        notes: [
+            'The browser opens minimised on purpose. To sign in, run: ./launch-agent.sh any',
+            'Point any coding agent here with: ./launch-agent.sh <opencode|claude|codex|aider|hermes>',
+            'A model sent to /v1/chat/completions must equal the `model` above.',
+        ],
+    };
+    if (wantsJson) return res.json(info);
+    const lines = [
+        `webchat-to-api harness — ${info.mode} (${info.model})`,
+        '',
+        `  base URL   ${info.base_url}`,
+        `  OpenAI     ${info.openai_compatible}`,
+        '',
+        '  endpoints',
+        ...Object.entries(info.endpoints).map(([k, v]) => `    ${k.padEnd(26)} ${v}`),
+        '',
+        '  ' + info.notes.join('\n  '),
+        '',
+    ];
+    res.type('text/plain').send(lines.join('\n'));
+});
+
 app.get('/v1/models', (req, res) => {
     // 08-14 GATEWAY PICKER: Claude Code's model discovery
     // (CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) only keeps ids
