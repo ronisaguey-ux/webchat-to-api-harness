@@ -56,7 +56,14 @@ MODEL="${MODEL:-deepseek webchat}"
 KEY="${HARNESS_API_KEY:-${API_TOKEN:-webchat-local}}"
 
 # ── is it up? ────────────────────────────────────────────────────────────────
-if ! curl -sf -m 3 "$BASE/health" >/dev/null 2>&1; then
+# Read the BODY, not the status code. /health answers 503 whenever the browser is
+# not attached yet, and 503 still means "the gateway is up and will attach on the
+# first request" — using `curl -f` here refused to launch an agent against a
+# perfectly healthy server that had simply not opened its tab yet.
+HEALTH="$(curl -s -m 4 "$BASE/health" 2>/dev/null || true)"
+case "$HEALTH" in
+  *'"ok"'*|*'browserAlive'*|*'wedged'*) : ;;   # up (attached or not)
+  *)
   cat >&2 <<MSG
 
   ⚠️  No gateway answering at $BASE
@@ -69,7 +76,8 @@ if ! curl -sf -m 3 "$BASE/health" >/dev/null 2>&1; then
 
 MSG
   exit 1
-fi
+  ;;
+esac
 
 # ── the one integration surface ──────────────────────────────────────────────
 # These four variables are all a client needs. Print them in `any` mode and for
