@@ -62,10 +62,24 @@ function resolveRoots(raw) {
     });
 }
 
-const ENABLED = String(process.env.SANDBOX_ENABLED ?? 'true') !== 'false';
-const ALLOW_BASH = String(process.env.SANDBOX_ALLOW_BASH ?? 'false') === 'true';
-const LOG = String(process.env.SANDBOX_LOG ?? 'true') !== 'false';
-const ROOTS = resolveRoots(process.env.SANDBOX_ROOTS);
+// 09-22: the config file is the MASTER config and it already carries
+// features.sandbox / features.sandboxAllowBash / network.sandboxRoots — but this
+// module read the environment only, so setting them there was an INERT CONTROL:
+// the runbook said bash was permitted, the config agreed, and every run_bash was
+// still refused. Prefer config, fall back to env, keep the safe defaults.
+const _cfg = (() => { try { return require('./config'); } catch { return null; } })();
+const _cfgSandbox = (_cfg && _cfg.sandbox) || {};
+const _envBool = (name, dflt) => (process.env[name] === undefined ? dflt : String(process.env[name]) !== 'false');
+const ENABLED = _cfgSandbox.enabled !== undefined
+    ? !!_cfgSandbox.enabled
+    : _envBool('SANDBOX_ENABLED', true);
+const ALLOW_BASH = (_cfgSandbox.allowBash === true) || String(process.env.SANDBOX_ALLOW_BASH ?? 'false') === 'true';
+const LOG = _cfgSandbox.log !== undefined
+    ? !!_cfgSandbox.log
+    : _envBool('SANDBOX_LOG', true);
+const ROOTS = (_cfgSandbox.roots && _cfgSandbox.roots.length)
+    ? resolveRoots(_cfgSandbox.roots.join(','))
+    : resolveRoots(process.env.SANDBOX_ROOTS);
 
 function logDenial(kind, value, why) {
     if (!LOG) return;

@@ -183,6 +183,27 @@ const cfg = {
             .split(',').map((s) => s.trim()).filter(Boolean),
         message: ((MC.raw.webchat && MC.raw.webchat.selectors && MC.raw.webchat.selectors.message) || modeSel.message || 'model-response, [data-message-author-role="model"], .model-response-text, .response, .ds-markdown, .message, .chat-message')
             .split(',').map((s) => s.trim()).filter(Boolean),
+        // The site's OWN "new chat" control. A fresh chat must be opened by
+        // PRESSING this, not by navigating: Gemini redirects /app straight back to
+        // the last conversation (verified - the URL stayed /app/<thread> and the old
+        // rows were still rendered), so a goto silently reuses the old thread and
+        // poisons both the model's context and the DOM read. See openNewChat().
+        newChat: ((MC.raw.webchat && MC.raw.webchat.selectors && MC.raw.webchat.selectors.newChat) || modeSel.newChat || 'a[aria-label*="New chat" i], button[aria-label*="New chat" i], [data-test-id*="new-chat" i], [data-testid*="new-chat" i]')
+            .split(',').map((s) => s.trim()).filter(Boolean),
+        // What a CREATED conversation URL looks like for this mode, as a regex string.
+        // Used to confirm a new chat actually got a thread. This must be per-mode: a
+        // hardcoded DeepSeek shape (/a/chat/s/) was applied to every host and threw on
+        // Gemini, where a fresh thread is /app/<hex> - so /handoff failed AFTER it had
+        // already created and seeded the thread, and the gateway's own context handoff
+        // was broken on Gemini the same way. Empty = unknown mode, judged generically.
+        threadPattern: ((MC.raw.webchat && MC.raw.webchat.threadPattern) || modeSel.threadPattern || ''),
+        // How long a mounted-but-EMPTY assistant row may stay empty before the send is
+        // declared aborted. This is a TIME-TO-FIRST-TOKEN budget, not a whole-answer
+        // budget. Gemini was falling through to the 12s default and failing mid-
+        // generation: measured live, the tab rendered a complete run_bash tool call
+        // while the harness had already thrown "response is empty after 12s". Gemini is
+        // a thinking model like chatgpt/freebuff, which already had 180s/240s here.
+        emptyGraceMs: (MC.pickNum('EMPTY_GRACE_MS', 'limits', 'emptyGraceMs') || modeSel.emptyGraceMs || 0),
     },
 };
 

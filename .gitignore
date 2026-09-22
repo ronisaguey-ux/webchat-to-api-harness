@@ -60,3 +60,9 @@ docs/execution_layer_injection_audit.md
 docs/master_oculus_plan_7_29.md
 docs/plan_oculus.md
 docs/rollback_policy.md
+
+# --- this worker's own runtime layout (2026-09-22) ---
+state/
+/harness.config.json
+/harness-config.json
+chrome-profile/
