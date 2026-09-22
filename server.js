@@ -1808,10 +1808,16 @@ app.get('/health', (req, res) => {
     // The value cannot be cleared there, because the send GATE uses lastSendAt as a
     // timestamp for spacing. Instead, bound it: the gateway aborts any send at
     // TIMEOUT, so a value older than TIMEOUT + margin is definitionally NOT in flight.
-    const inFlightMax = (config.timeout || 300000) + 60000;
-    const _since = typeof lastSendAt === 'number' && lastSendAt > started
+    // 09-22: the bounding above was the best available proxy at the time, but a real
+    // flag has existed all along — `requestInFlight` is raised at handleRequest()
+    // entry and cleared in its `finally`, so it is authoritative and self-healing.
+    // The proxy was wrong in BOTH directions: it reported busy for TIMEOUT+60s after
+    // every FINISHED send (the compaction reset was deaf for 31 minutes), and a
+    // genuine send that outran TIMEOUT+60s reported idle — exactly the case the
+    // guard exists to protect. Read the flag; keep lastSendAt only to age the send.
+    const _since = requestInFlight && typeof lastSendAt === 'number' && lastSendAt > started
         ? Date.now() - lastSendAt : 0;
-    const busySince = _since > 0 && _since < inFlightMax ? _since : 0;
+    const busySince = _since;
     // The wedge threshold MUST exceed the request timeout, or the watchdog kills
     // the gateway while a legitimate long send is still running: gemini takes
     // 150-260s per reply and the gemini unit sets TIMEOUT=300000, so a flat 240s
@@ -2292,11 +2298,14 @@ app.post('/newchat', async (req, res) => {
         // finished send, not an in-flight one. Without this the 409 deferred EVERY
         // reset after the first send, which silently disabled the 5-step context
         // clear on all three DS lanes (Bob's design).
-        const _inFlightMax = (config.timeout || 300000) + 60000;
-        const _since = (typeof lastSendAt === 'number' && lastSendAt > _started)
+        // 09-22: read the authoritative flag, not the lastSendAt proxy. The proxy
+        // made this endpoint deaf for TIMEOUT+60s (31 min) after every finished
+        // send, which silently disabled the compaction reset the tool-budget plugin
+        // drives. A finished send leaves requestInFlight false immediately.
+        const _since = requestInFlight && (typeof lastSendAt === 'number' && lastSendAt > _started)
             ? Date.now() - lastSendAt : 0;
-        const _busySince = _since > 0 && _since < _inFlightMax ? _since : 0;
-        if (_busySince > 0) {
+        const _busySince = _since;
+        if (requestInFlight) {
             console.log(`⏸ /newchat deferred — a send is in flight (outstandingMs=${_busySince})`);
             return res.status(409).json({
                 ok: false, deferred: true, outstandingMs: _busySince,
@@ -2308,6 +2317,41 @@ app.post('/newchat', async (req, res) => {
         res.json({ ok: true, message: 'fresh chat opened', page: getPage() ? getPage().url() : null });
     } catch (e) {
         console.log('⚠️ /newchat failed:', String(e.message).slice(0, 90));
+        res.status(500).json({ error: String(e.message) });
+    }
+});
+
+// ── POST /handoff {content} — swap to a fresh thread AND seed it ─────────────
+// /newchat swaps the thread and leaves it EMPTY. A caller that swaps mid-session
+// therefore loses the conversation unless it can seed the new thread in the same
+// breath — and openNewChatAndSeed(text) has done exactly that all along for the
+// gateway's own context handoff. This exposes it, so an external compactor can
+// produce a summary and land it in one atomic call instead of swapping bare and
+// hoping its summary arrives before the next send.
+//
+// Guarded by requestInFlight (the real flag), NOT the lastSendAt proxy: the swap
+// NAVIGATES the tab, so a reset landing mid-send destroys that send's page
+// context. Reading the true flag means an idle gateway is never refused.
+app.post('/handoff', async (req, res) => {
+    try {
+        if (!getPage()) {
+            return res.status(503).json({ error: 'no live webchat page — POST /connect first' });
+        }
+        if (requestInFlight) {
+            return res.status(409).json({
+                ok: false, deferred: true,
+                error: 'a send is in flight — retry when idle',
+            });
+        }
+        const content = (req.body && (req.body.content || req.body.text)) || '';
+        if (!String(content).trim()) {
+            return res.status(400).json({ error: 'content is required — this endpoint seeds the new thread' });
+        }
+        const { url } = await openNewChatAndSeed(String(content));
+        console.log(`🆕 /handoff — fresh thread seeded (${String(content).length} chars) at ${url}`);
+        res.json({ ok: true, message: 'fresh chat opened and seeded', page: url || null });
+    } catch (e) {
+        console.log('⚠️ /handoff failed:', String(e.message).slice(0, 90));
         res.status(500).json({ error: String(e.message) });
     }
 });

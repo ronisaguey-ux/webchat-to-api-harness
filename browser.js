@@ -69,7 +69,21 @@ async function probePage() {
 //    CDP mode (chat.js -> cdpWsUrl): attach to the browser the
 //    user already has open and drive their real tab.
 // ──────────────────────────────────────────────────────
-async function initBrowser({ reconnect = false } = {}) {
+// Serialises initBrowser. A stale-session refresh disconnects the CDP session and
+// reattaches; two of those overlapping leaves the SECOND one awaiting a connect()
+// against a browser the first has just detached, and puppeteer never resolves —
+// measured live: /newchat hung indefinitely right after "Attaching to existing
+// browser" with no "✅ Attached", so every thread reset silently did nothing and
+// each "fresh" chat kept the previous conversation's context.
+// One in-flight initialisation at a time; later callers await the same promise.
+let _initInFlight = null;
+async function initBrowser(opts = {}) {
+    if (_initInFlight) return _initInFlight;
+    _initInFlight = _initBrowserInner(opts).finally(() => { _initInFlight = null; });
+    return _initInFlight;
+}
+
+async function _initBrowserInner({ reconnect = false } = {}) {
     if (reconnect && browser) {
         // A long-lived CDP session can go stale (evaluates hang while fresh
         // sessions work). Detach and attach again — cheap (~50ms).
@@ -1326,6 +1340,20 @@ async function snapshotChat(before = null) {
         ? before.ids
         : null;
     return page.evaluate((sels, skipEmptyRows, priorIds) => {
+        // Strip the site's own chrome from a row's text. Gemini renders every reply
+        // inside a row that ALSO carries a "Gemini said" header and, for a tool call,
+        // a "JSON" code-block label. Measured live: a placeholder row holding ONLY the
+        // header ("Gemini said", 11 chars) passed the raw-length emptiness test, became
+        // the newest row, and then cleaned down to the EMPTY STRING — so waitForResponse
+        // read "" for the whole grace window and threw "response is empty after 180s"
+        // while the real answer (a complete run_bash tool call) sat in the row before it.
+        // Emptiness must therefore be judged on the CLEANED text, not the raw text.
+        const cleanRow = (raw) => String(raw || '')
+            .replace(/^\s*Gemini said\s*\n*/gi, '')
+            .replace(/\bGemini said\b\s*/gi, '')
+            .replace(/^\s*JSON\s*\n+/gi, '')
+            .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)?\n+/gi, '')
+            .trim();
         const vl = document.querySelector('.ds-virtual-list');
         if (vl) {
             // Virtual list renders only what's in view — the newest message is
@@ -1372,6 +1400,8 @@ async function snapshotChat(before = null) {
                 mode: 'vl',
                 text: last ? last.innerText || '' : '',
                 answer: clone ? clone.innerText || '' : '',
+                answerIndex: items.length - 1,
+                matchTotal: items.length,
                 lastCls: last ? (last.className || '').toString() : '',
                 body: document.body ? document.body.innerText || '' : '',
                 count: items.length, // message-row count (08-13: growth check)
@@ -1385,6 +1415,8 @@ async function snapshotChat(before = null) {
         // text-bearing one is the newest message (sidebar rows come earlier).
         let n = 0;
         let lastEl = null;
+        let lastElMatchIndex = -1;    // ROW ordinal, not a raw node index (see below)
+        let lastElRowOrdinal = 0;    // ordinal among KEPT rows (see the floor note)
         const seen = new Set();
         const ids = [];
         // 09-16: identity of a row, stable across re-renders. ChatGPT stamps a
@@ -1450,20 +1482,24 @@ async function snapshotChat(before = null) {
                 // is empty after 12s" while the real answer sat in an earlier
                 // node. Only a text-bearing row may become the newest answer.
                 if (skipEmptyRows) {
-                    if (t.length > 0) lastEl = el;
+                    // Cleaned, not raw: a header-only row ("Gemini said") is empty
+                    // for every purpose this function has.
+                    if (cleanRow(t).length > 0) { lastEl = el; lastElMatchIndex = n; }
                 } else {
-                    lastEl = el;
+                    lastEl = el; lastElMatchIndex = n;
                 }
             }
         }
-        let rawTxt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
-        let txt = rawTxt
-            .replace(/^\s*Gemini said\s*\n*/gi, '')
-            .replace(/\bGemini said\b\s*/gi, '')
-            .replace(/^\s*JSON\s*\n+/gi, '')
-            .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)?\n+/gi, '')
-            .trim();
-        return { mode: 'count', count: n, ids, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
+        const rawTxt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
+        const txt = cleanRow(rawTxt);
+        // answerIndex/matchTotal are the identity-free floor: a row whose ordinal is
+        // below the pre-send matchTotal did NOT exist before this send, so it cannot be
+        // this send's answer. Without it, a send whose new row is still EMPTY leaves
+        // `text` pointing at the PREVIOUS answer, the stability test fires, and the API
+        // returns the previous reply verbatim — measured here as a probe answered
+        // "READY" (a stale turn's text) while the real reply was still generating.
+        return { mode: 'count', count: n, ids, text: txt, answer: txt, answerIndex: lastElMatchIndex,
+                 matchTotal: n, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
     }, config.selectors.message, quirk('skipEmptyMessageRows', false), priorIds);
 }
 
@@ -2117,6 +2153,21 @@ async function waitForResponse(before, typedText) {
         const grew = state.mode === 'vl'
             ? !userRow && (state.count !== before.count || (state.text !== before.text && state.text !== typedText && !state.text.includes(typedText)))
             : state.count > before.count;
+        // 09-22 STALE-ANSWER FLOOR (identity-free). `grew` alone is not enough when a
+        // site mounts the new answer row EMPTY: the newest NON-EMPTY row is then the
+        // PREVIOUS answer, the stability test sees unchanging text, and the API returns
+        // the last turn's reply as if it were this one. Measured on Gemini: a probe
+        // came back "READY" — a two-turns-old submit_answer — while the real reply was
+        // still generating. The floor rejects any answer read from a row ordinal that
+        // already existed in the pre-send snapshot. Opt-in (quirk `answerRowFloor`),
+        // because a site whose rows recycle their ordinals would need the id-based
+        // path instead; Gemini stamps no row ids, so ordinal is the only handle it has.
+        const answerIsNewRow = !quirk('answerRowFloor', false)
+            || !before
+            || typeof before.matchTotal !== 'number'
+            || typeof state.answerIndex !== 'number'
+            || state.answerIndex < 0
+            || state.answerIndex >= before.matchTotal;
         // Accept on the THINK-STRIPPED answer text going stable (08-12): the
         // raw text is reasoning-only during cogitation, and accepting raw-text
         // stability could return just the thinking block (which then failed
@@ -2192,13 +2243,13 @@ async function waitForResponse(before, typedText) {
             // 36-char truncation is what wedged the session at 95% context.
             // The stream tee (complete at loadend) is re-checked first and
             // wins whenever it has the body.
-            if (grew && answerText.length > 0 && answerText !== '…' && !/^\.{2,4}$/.test(answerText) && answerText.length === lastAnswerLen && !busy) {
+            if (grew && answerIsNewRow && answerText.length > 0 && answerText !== '…' && !/^\.{2,4}$/.test(answerText) && answerText.length === lastAnswerLen && !busy) {
                 const teeNow = await readStreamedAnswer(teeStart);
                 if (teeNow.found && teeNow.text.trim().length > 0) return teeNow.text;
                 if (!looksLikeTruncatedAnswer(answerText)) return state.answer;
                 // else: mid-stream fragment — do NOT accept; keep polling
             }
-        } else if ((grew || state.text !== before.text) && state.text.length > 0 && state.text.length === lastLen) {
+        } else if ((grew || state.text !== before.text) && answerIsNewRow && state.text.length > 0 && state.text.length === lastLen) {
             // 08-13 MULTI-SITE: same '…'/dots placeholder guard as the vl path
             // — gemini's composer renders a "…" row while cogitating and the
             // count-mode accept returned it as the final answer. The !busy
@@ -2255,11 +2306,17 @@ async function waitForResponse(before, typedText) {
             // whole answer. Per-lane override via EMPTY_GRACE_MS, else by host.
             const host = new URL(config.webchatUrl).host;
             const emptyGraceOverride = parseInt(process.env.EMPTY_GRACE_MS || '0', 10);
+            // config.emptyGraceMs is the configured value (env or harness.config.json,
+            // per-mode overridable); the host table below is only the fallback for a
+            // lane nobody has configured. Gemini needs a real entry: it is a thinking
+            // model, and the old 12s default threw while the tab was mid-generation.
             const emptyGraceMs = emptyGraceOverride > 0
                 ? emptyGraceOverride
-                : host.includes('chatgpt') ? 180000
-                : host.includes('freebuff') ? 240000
-                : 12000;
+                : (config.emptyGraceMs > 0 ? config.emptyGraceMs
+                    : host.includes('chatgpt') ? 180000
+                    : host.includes('freebuff') ? 240000
+                    : host.includes('gemini') ? 180000
+                    : 12000);
             if (emptySince > emptyGraceMs) {
                 // 09-16: carry the PAGE TEXT into the error. The account can be
                 // throttled - DeepSeek then renders "Messages too frequent, try again
@@ -2500,6 +2557,141 @@ async function setReasoningEffortLow() {
     }
 }
 
+// ── open a fresh chat by PRESSING the site's New-chat control ───────────────
+// Navigating to the chat root is NOT equivalent. Gemini redirects /app back to the
+// last conversation (verified: the URL stayed /app/<thread> and the old thread's
+// rows were still rendered), so a goto-based reset reuses the old thread while
+// claiming to have opened a new one - and that history then poisons both the
+// model's context and the DOM read.
+//
+// Returns true only if a control was found AND clicked. The caller falls back to
+// navigation when this returns false, so a webchat with no known selector still
+// resets (imperfectly) rather than dead-ending.
+// ── resolve the live target page, re-picking it if the cached one is gone ────
+// `page` is a module-level cache, and the stale-session refresh tears the CDP
+// connection down and rebuilds it between sends. During that window the cached
+// reference is detached, so any code that trusts it NPEs ("Cannot read properties
+// of null (reading 'goto')") or silently skips its work — measured live: /newchat
+// reported "no New-chat control found" because `page` was null, then threw on the
+// navigation fallback, so the thread was NEVER reset and every "fresh" chat kept
+// the previous conversation's context.
+//
+// Every path that is about to touch the page should call this rather than reading
+// `page` directly. Returns null only when there is genuinely no browser or no
+// matching tab, and never throws.
+async function resolveTargetPage() {
+    try {
+        if (page && !page.isClosed()) return page;
+    } catch { /* detached - fall through and re-pick */ }
+    if (!browser) return null;
+    try {
+        const pages = await browser.pages();
+        const match = (p) => {
+            try {
+                return config.tabUrlSubstring
+                    ? p.url().includes(config.tabUrlSubstring)
+                    : p.url().startsWith(new URL(config.webchatUrl).origin);
+            } catch { return false; }
+        };
+        const found = pages.find((p) => !p.isClosed() && match(p));
+        if (found) { page = found; return page; }
+        // No matching tab: open one rather than failing the whole reset.
+        const fresh = await browser.newPage();
+        await fresh.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
+            .catch(() => { /* the caller's own waits will surface a real problem */ });
+        page = fresh;
+        return page;
+    } catch {
+        return null;
+    }
+}
+
+async function clickNewChatControl() {
+    const sels = (config.selectors && config.selectors.newChat) || [];
+    if (!sels.length) return false;
+    // Never trust the cached reference here: this runs immediately after a CDP
+    // reconnect, which is exactly when the cache goes stale.
+    const pg = await resolveTargetPage();
+    if (!pg) { console.log('   ↳ new-chat: no live page'); return false; }
+
+    // LOCATE the control entirely inside the page, then click the one node the page
+    // itself named. Two reasons this is not a puppeteer handle loop:
+    //   1. `boundingBox()` HANGS on a detached or unpainted node — measured live, the
+    //      first of two matches for Gemini's sparkle button never returned, so
+    //      /newchat hung forever and every thread reset silently did nothing while
+    //      the request sat open. In-page DOM work cannot hang that way.
+    //   2. A site can render the control twice (Gemini matches
+    //      [data-test-id="side-nav-sparkle-button"] twice) and the first is not always
+    //      the painted one. Choosing by measured geometry in the page picks the real
+    //      one, where page.$() would take the hidden copy.
+    const pick = await pg.evaluate((selectors) => {
+        for (let si = 0; si < selectors.length; si++) {
+            let nodes;
+            try { nodes = [...document.querySelectorAll(selectors[si])]; } catch { continue; }
+            for (let ni = 0; ni < nodes.length; ni++) {
+                const el = nodes[ni];
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) return { si, ni, text: el.innerText || el.getAttribute('aria-label') || '' };
+            }
+        }
+        // Last resort: a control whose label says "new chat".
+        const all = [...document.querySelectorAll('a,button,[role="button"],[data-test-id]')];
+        for (let ni = 0; ni < all.length; ni++) {
+            const el = all[ni];
+            const t = (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || '').trim();
+            if (/^new chat$/i.test(t)) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) return { si: -1, ni, text: t };
+            }
+        }
+        return null;
+    }, sels).catch((e) => { console.log(`   ↳ new-chat: locate failed (${String(e.message).slice(0, 60)})`); return null; });
+
+    if (!pick) {
+        console.log('   ↳ new-chat: no visible New-chat control on the page');
+        return false;
+    }
+
+    // Click by COORDINATES rather than by handle. Puppeteer's element click waits for
+    // the node to be stable and can block on the same detached handle that made
+    // boundingBox hang; a coordinate click has nothing to wait on. It is also the
+    // interaction that actually works on these SPAs — a DOM .click() often does not
+    // fire the framework's handler.
+    const box = await pg.evaluate((sel) => {
+        const nodes = [...document.querySelectorAll(sel)];
+        for (const el of nodes) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            }
+        }
+        return null;
+    }, pick.si >= 0 ? sels[pick.si] : 'a,button,[role="button"],[data-test-id]')
+        .catch(() => null);
+
+    if (box) {
+        await pg.mouse.click(box.x, box.y).catch(() => {});
+        console.log(`🆕 clicked the New-chat control (${String(pick.text).slice(0, 40) || sels[pick.si]?.slice(0, 40)})`);
+        return true;
+    }
+
+    // Geometry was unreadable at click time: fall back to a plain DOM click.
+    await pg.evaluate((selectors) => {
+        for (let si = 0; si < selectors.length; si++) {
+            let nodes;
+            try { nodes = [...document.querySelectorAll(selectors[si])]; } catch { continue; }
+            for (const el of nodes) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) { el.click(); return; }
+            }
+        }
+    }, sels).catch(() => {});
+    console.log('🆕 clicked a New-chat control (DOM fallback)');
+    return true;
+}
+
+
+
 async function openNewChat() {
     // Fresh CDP session like every send (stale-session refresh).
     await initBrowser({ reconnect: true });
@@ -2537,7 +2729,6 @@ async function openNewChat() {
             await page.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
     }
-    if (!page) page = await browser.newPage();
     console.log('🆕 Opening a NEW chat');
     // 08-13 MULTI-SITE: deepseek's "new chat" is the /a/chat root; other
     // webchats (qwen/kimi/gemini) don't have that — their root IS a new chat.
@@ -2549,9 +2740,21 @@ async function openNewChat() {
     const newChatUrl = new URL(config.webchatUrl).host.includes('deepseek')
         ? 'https://chat.deepseek.com/a/chat/new'
         : config.webchatUrl;
-    await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await waitForChatInput();
-    await sleep(2500); // let the SPA settle the composer
+    // PRESS the site's own New-chat control. A goto is not a reset on these SPAs:
+    // Gemini sends /app back to the last conversation, so the "fresh" thread still
+    // held the previous history. Navigation is the fallback only.
+    const _clicked = await clickNewChatControl();
+    if (_clicked) {
+        await sleep(2500);      // let the SPA swap the thread and settle the composer
+        await waitForChatInput();
+    } else {
+        console.log('⚠️ no New-chat control found — falling back to navigation');
+        const pg = await resolveTargetPage();
+        if (!pg) throw new Error('no live page to open a new chat in (browser/tab unavailable)');
+        await pg.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await waitForChatInput();
+        await sleep(2500); // let the SPA settle the composer
+    }
     // 08-14 (user rule): mode is locked at thread creation — select EXPERT
     // on the fresh new-chat composer BEFORE the first message creates the
     // thread (instant threads can never become expert afterwards).
@@ -2602,7 +2805,24 @@ async function sendFirstMessage(text) {
         console.log('⚠️ new-chat first reply timed out:', String(e.message).slice(0, 80));
     }
     const url = page.url();
-    if (!/\/a\/chat\/s\//.test(url)) {
+    // Confirm a real conversation, not the bare chat root. The shape is PER MODE: this
+    // was hardcoded to DeepSeek's /a/chat/s/ and therefore threw on every other host -
+    // on Gemini a fresh thread is /app/<hex>, so /handoff reported failure after it had
+    // already created and seeded the thread, and the gateway's own context handoff was
+    // broken there too. A mode with no known shape is judged by URL depth rather than
+    // refused, because refusing on an unknown shape is exactly what broke Gemini.
+    const _pattern = config.threadPattern;
+    let _ok;
+    if (_pattern) {
+        _ok = new RegExp(_pattern).test(url);
+    } else {
+        try {
+            const _root = new URL(config.webchatUrl).pathname.replace(/\/+$/, '');
+            const _now = new URL(url).pathname.replace(/\/+$/, '');
+            _ok = _now.length > _root.length;
+        } catch { _ok = true; }
+    }
+    if (!_ok) {
         throw new Error(`New chat did not get a thread URL (still: ${url})`);
     }
     console.log(`🆕 New thread created: ${url}`);
