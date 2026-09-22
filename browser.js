@@ -2315,8 +2315,11 @@ async function waitForResponse(before, typedText) {
                 : (config.emptyGraceMs > 0 ? config.emptyGraceMs
                     : host.includes('chatgpt') ? 180000
                     : host.includes('freebuff') ? 240000
-                    : host.includes('gemini') ? 180000
-                    : 12000);
+                    // measured 2026-09-22: >250s to first token while Gemini read a
+                    // brief and planned; a complete tool call was on screen when the
+                    // old value threw.
+                    : host.includes('gemini') ? 600000
+                    : 60000);
             if (emptySince > emptyGraceMs) {
                 // 09-16: carry the PAGE TEXT into the error. The account can be
                 // throttled - DeepSeek then renders "Messages too frequent, try again
@@ -2349,7 +2352,8 @@ async function waitForResponse(before, typedText) {
             const _limit = _graceMs > 0 ? _graceMs
                 : _host.includes('chatgpt') ? 180000
                 : _host.includes('freebuff') ? 240000
-                : 12000;
+                : _host.includes('gemini') ? 600000
+                : 60000;
             if (emptySince > _limit) {
                 throw new Error(`Webchat response is empty after ${_limit / 1000}s — no new message row appeared (the send never committed or the model never started).`
                     + ` Page said: ${String(state.body || state.text || '').replace(/\s+/g, ' ').slice(0, 400)}`);
