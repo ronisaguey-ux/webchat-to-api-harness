@@ -40,7 +40,10 @@ BASE="${HARNESS_BASE_URL:-http://127.0.0.1:$PORT}"
 # The model name the gateway advertises. This is the id the agent must send, and
 # it comes from the same config the server reads — so a rename in one place does
 # not silently desync the two.
-MODEL="${HARNESS_MODEL:-}"
+MODEL="${HARNESS_MODEL:-${HARNESS_MODEL_NAME:-}}"
+# HARNESS_MODEL_NAME is accepted as an INPUT as well as exported as an output:
+# it is the variable users see in the docs, so silently ignoring it as an
+# override would be a dead end that looks like the config being ignored.
 if [ -z "$MODEL" ]; then
   MODEL="$(
     HARNESS_CONFIG="${HARNESS_CONFIG:-$HERE/harness.config.json}" node -e '
@@ -193,15 +196,23 @@ MSG
 
   any|"")
     banner
-    cat >&2 <<'MSG'
-    Nothing was launched — this is the integration surface. Point your tool at
-    the OpenAI-compatible base URL and use the model name above.
+    # STDOUT, not stderr: this is the primary output of this mode, so it must be
+    # capturable (`./launch-agent.sh any > vars.txt`) and pipeable.
+    cat <<MSG
+OPENAI_BASE_URL=$OPENAI_BASE_URL
+OPENAI_API_BASE=$OPENAI_API_BASE
+OPENAI_API_KEY=$OPENAI_API_KEY
+ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL
+ANTHROPIC_AUTH_TOKEN=$ANTHROPIC_AUTH_TOKEN
+HARNESS_MODEL_NAME=$HARNESS_MODEL_NAME
 
-    curl check:
-      curl -s "$OPENAI_BASE_URL/chat/completions" \
-        -H "Content-Type: application/json" \
-        -d '{"model":"'"$HARNESS_MODEL_NAME"'","messages":[{"role":"user","content":"hi"}]}'
-
+# nothing was launched — this is the whole integration surface.
+# point any OpenAI-compatible tool at OPENAI_BASE_URL and use the model above.
+#
+# curl check:
+curl -s "$OPENAI_BASE_URL/chat/completions" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"'"$HARNESS_MODEL_NAME"'","messages":[{"role":"user","content":"hi"}]}'
 MSG
     ;;
 
