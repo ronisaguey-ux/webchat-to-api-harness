@@ -430,6 +430,47 @@ async function maybeResetThreadAtBoundary(reason) {
         return false;
     }
 }
+// ── Jev interceptor (2026-09-22, Bob's request) ─────────────────────────────
+// Sits at the sendPrompt funnel so EVERY reply the harness receives passes it.
+// JEV_INTERCEPT: 'off' (default) | 'shadow' (log the verdict, change nothing) |
+// 'enforce' (treat an unusable reply as a failed send so the caller retries).
+// Shadow is the default on purpose: this must be measured before it is allowed
+// to change behaviour. The Jev client itself fails OPEN, so a Jev outage can
+// never break a send.
+const JEV_INTERCEPT = String(process.env.JEV_INTERCEPT || 'off').toLowerCase();
+let jevStats = { checked: 0, unusable: 0, failed: 0 };
+let _jev = null;
+function jev() {
+    if (_jev === null) { try { _jev = require('./jev.js'); } catch (e) { _jev = false; console.warn('⚠️ jev.js unavailable:', e.message); } }
+    return _jev || null;
+}
+// The contract a PASSTHROUGH_FORMAT caller ships is the edits JSON; the prompt
+// itself carries it, so the reply is judged against the tail of the message.
+function jevContractFrom(msg) {
+    const m = String(msg || '');
+    const i = m.lastIndexOf('{"edits"');
+    return i >= 0 ? m.slice(i, i + 800) : 'a usable answer the caller can act on';
+}
+async function jevCheckReply(msg, reply) {
+    if (JEV_INTERCEPT === 'off' || !reply) return;
+    const j = jev();
+    if (!j) return;
+    const verdict = await j.replyIsUsable(reply, jevContractFrom(msg));
+    if (!verdict.ok) { jevStats.failed++; return; }   // Jev down/timeout -> fail open
+    jevStats.checked++;
+    if (!verdict.usable) {
+        jevStats.unusable++;
+        console.log(`🧭 [jev:${JEV_INTERCEPT}] reply judged UNUSABLE (${verdict.reason}) — checked=${jevStats.checked} unusable=${jevStats.unusable} of ${jevStats.checked}`);
+        if (JEV_INTERCEPT === 'enforce') {
+            const e = new Error(`Webchat reply judged unusable by Jev (${verdict.reason})`);
+            e.retryable = true;      // let the existing retry gate act on it
+            throw e;
+        }
+    } else if (process.env.JEV_VERBOSE === 'true') {
+        console.log(`🧭 [jev:${JEV_INTERCEPT}] reply usable (${verdict.reason})`);
+    }
+}
+
 async function countedSend(msg, defs) {
     // Counted here, ACTED ON only at a request boundary (see
     // maybeResetThreadAtBoundary) — a tool-loop send must never navigate the tab.
@@ -473,6 +514,7 @@ async function countedSend(msg, defs) {
     try { fs.writeFileSync(SHARED_SEND_FILE, String(lastSendAt)); } catch { /* non-fatal */ }
     try {
         const r = await sendPrompt(msg, defs);
+        await jevCheckReply(msg, r);
         lastReqBodyChars = await getReqBodyChars();
         // 08-14 EXPERT-SWAP PIN: the send swapped an instant thread for a
         // fresh EXPERT one — pin the new thread for every respawn path (same
