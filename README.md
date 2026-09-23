@@ -55,7 +55,89 @@ a webchat session you own, with tool-call support (read/write files, bash, …).
 - **Context handoff** — at the context threshold the model writes a handoff
   document, a new chat opens in the same tab, and the document seeds it.
 
-## Quick start
+## Quick start — the `webchat` CLI
+
+Run one command and everything is menu-driven. No file editing, and no need to
+remember an environment variable's name.
+
+```bash
+./webchat          # or: npm link  →  a global `webchat` command
+```
+
+Then:
+
+1. **Webchat & browser** → pick your site.
+2. **Launch a browser to log in** → a window opens; sign in yourself.
+3. **Check connection** → the CLI probes the tab for the composer (which exists
+   only when the page is loaded *and* signed in), shows you what it found, and
+   you press one key to confirm.
+4. **Open a NEW terminal** and run:
+
+```bash
+webchat start
+```
+
+That brings the gateway up and offers to launch your agent against it.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `webchat` | the interactive configurator |
+| `webchat setup` | jump straight to the browser/site screen |
+| `webchat start` | start the gateway, then offer to launch your IDE |
+| `webchat status` | one-line state of the gateway and browser |
+| `webchat logs` | tail the gateway log |
+| `webchat doctor` | check the environment and report, with fixes |
+| `webchat settings` | open the settings screens directly |
+
+### What the CLI can change
+
+Everything in `harness.config.json`, grouped and described in plain English:
+the webchat, the target URL and tab pinning, the bind host/port and advertised
+model name, **the gates** (`run_bash`, sandbox on/off, sandbox roots, API token,
+command timeout, throttle cooldown), **the tool-call loops** (`maxToolRounds`,
+`wrapUpRounds`, request timeout, time-to-first-token grace, context handoff),
+agent behaviour (plain-text vs tool mode, narration, anti-spiral), and the
+selectors/timings you need when a site changes its DOM.
+
+### The one thing that catches everybody
+
+Every setting resolves with the precedence **environment variable > config file >
+built-in default**. So a value set in the environment silently overrides the
+file, and editing the file then looks like it did nothing. On a typical install
+that is not hypothetical — `WEBCHAT_MODE`, `PORT`, `HOST` and others commonly
+live in `harness/.env`, which dotenv loads at boot.
+
+The CLI never hides this. Every screen shows which settings are env-shadowed,
+where the shadowing value lives, and what the file says underneath; editing one
+offers to remove the shadowing line so the change actually takes effect.
+
+### Where things live
+
+```
+<repo>/harness.config.json   the in-clone template
+$HARNESS_CONFIG              the real config, often OUTSIDE the clone
+<repo>/.env                  loaded by the server at boot; shadows the config
+<repo>/.webchat/             pidfiles, logs, and the Chrome profile
+```
+
+`webchat doctor` prints the exact config path in use, so there is never a
+question of which file you are editing.
+
+### Two notes before you enable anything
+
+`run_bash` is **double-gated**: it needs `features.bashAllowed` *and*
+`features.sandboxAllowBash`, and the command must touch only paths inside the
+sandbox roots. That fence is a token scan, not a kernel jail — treat it as a
+guardrail and run the harness as a user whose files you are willing to lose.
+
+A browser launched by the CLI uses its own profile under `.webchat/`, which is
+what makes the login survive a restart. Chrome only exposes a debugging port
+when it is given a non-default profile directory, which is why that profile is
+not optional.
+
+## Quick start — by hand
 
 Three commands. No editing.
 

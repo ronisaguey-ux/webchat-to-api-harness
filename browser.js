@@ -1526,77 +1526,96 @@ async function isGenerating() {
 // (element whose aria-label or button text is exactly stop-ish; Chinese
 // labels included — qwen/kimi are zh UIs). Its presence ⇒ the newest row
 // is still streaming — never accept or rescue it, never type into it.
+// ── Busy probe (09-22) ──────────────────────────────────────────────────────
+// The in-page predicate behind isForeignBusy(). It lives at module scope so it
+// can be unit-tested against a stub DOM without launching a browser — the
+// phantom-stop defect below was invisible to every test that needed chrome.
+//
+// SIGNAL CLASSES, and why they are separated:
+//
+//   * STOP-CONTROL signals (aria-label / innerText / data-testid "stop").
+//     A lane with `phantomStopButton` leaves its stop control mounted, visible
+//     and unclickable AFTER the answer commits, so these cannot be trusted
+//     there. They are the ONLY signals that quirk is about.
+//
+//   * ARIA-BUSY signals (an assistant row reporting `aria-busy="true"`).
+//     ChatGPT's trusted in-flight signal; it reports the row's own state and
+//     has nothing to do with the stop control, so it stays valid on every lane.
+//
+//   * EMPTY-MOUNTED-ROW (`emptyRowMeansBusy`). Some lanes mount the response
+//     row for the send and fill it minutes later. That is a generation in
+//     flight, not an aborted answer. Opt-in per mode, because a lane that
+//     leaves EMPTY PHANTOM rows in the DOM (ChatGPT: measured 6 nodes,
+//     lens [22,4,54,0,0,0]) would otherwise read busy forever.
+function busyProbe(spec) {
+    const { phantomStop = false } = spec || {};
+    const stopish = (s) => {
+        s = (s || '').trim().toLowerCase();
+        return s === 'stop' || s === 'stop response' || s === 'stop generating'
+            || s === 'stop generation' || s === 'stop stream'
+            || s === '停止' || s === '停止生成' || s === '停止响应';
+    };
+    const isVisible = (el) => {
+        if (!el) return false;
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') !== null) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) return false;
+        return el.offsetParent !== null || el.getClientRects().length > 0;
+    };
+
+    // ── Non-stop signals: evaluated on EVERY lane ───────────────────────────
+    // 09-17 (Bob: "Chat gbt is likely fine, investigate" - HE WAS RIGHT):
+    // ChatGPT generates with NO stop control in the DOM at all. Measured on the
+    // live tab during a real generation:
+    //   stop-button: false   data-testid stop-ish: none   aria-label stop: none
+    //   assistant row aria-busy="true"  <- the ONLY signal, true for 360s
+    // The row's own aria-busy is the signal to trust. It reports the ROW's
+    // state and has nothing to do with the stop control, so `phantomStopButton`
+    // must not disable it — the quirk is about stop controls lying, not about
+    // the lane having no readable busy state.
+    for (const r of document.querySelectorAll('[data-message-author-role="assistant"][aria-busy="true"]')) {
+        if (isVisible(r)) return true;
+    }
+    for (const r of document.querySelectorAll('[data-message-author-role="assistant"]')) {
+        if (r.querySelector('[aria-busy="true"]') && isVisible(r)) return true;
+    }
+
+    // ── Stop-control signals: skipped on a phantom-stop lane ────────────────
+    // PHANTOM-STOP (gemini): Gemini leaves its "Stop response" control mounted,
+    // visible, enabled and unclickable after the answer commits — verified live
+    // (aria-label "Stop response", rects 1, display flex, opacity 1, persists
+    // for minutes). Reading it as "cogitating" made the pre-send guard refuse
+    // every follow-up AND made the accept gate never fire, so each send burned
+    // the full timeout.
+    if (phantomStop) return false;
+
+    for (const el of document.querySelectorAll('[aria-label]')) {
+        if (!stopish(el.getAttribute('aria-label'))) continue;
+        if (isVisible(el)) return true;
+    }
+    for (const b of document.querySelectorAll('button')) {
+        if (stopish(b.innerText) && isVisible(b)) return true;
+    }
+    // 09-13/09-14 (ChatGPT lane): the in-flight control is a data-testid, not an
+    // aria-label, and is not always `stop-button` — a missed stop control made
+    // `busy` read false, the empty grace expired mid-generation, and the send
+    // threw "empty after 12s" while the tab held the finished answer.
+    for (const el of document.querySelectorAll('[data-testid]')) {
+        const tid = (el.getAttribute('data-testid') || '').toLowerCase();
+        if (tid.includes('stop') && isVisible(el)) return true;
+    }
+    const sb = document.querySelector('[data-testid="stop-button"]');
+    if (isVisible(sb)) return true;
+
+    return false;
+}
+
 async function isForeignBusy() {
     try {
-        return await page.evaluate((phantomStop) => {
-            const stopish = (s) => {
-                s = (s || '').trim().toLowerCase();
-                return s === 'stop' || s === 'stop response' || s === 'stop generating'
-                    || s === 'stop generation' || s === 'stop stream'
-                    || s === '停止' || s === '停止生成' || s === '停止响应';
-            };
-            const isVisible = (el) => {
-                if (!el) return false;
-                if (el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') !== null) return false;
-                if (el.getAttribute('aria-hidden') === 'true') return false;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) return false;
-                return el.offsetParent !== null || el.getClientRects().length > 0;
-            };
-            for (const el of document.querySelectorAll('[aria-label]')) {
-                if (!stopish(el.getAttribute('aria-label'))) continue;
-                if (!isVisible(el)) continue;
-                // PHANTOM-STOP (gemini): Gemini leaves its "Stop response"
-                // control mounted, visible, enabled and unclickable after the
-                // answer commits — verified live (aria-label "Stop response",
-                // rects 1, display flex, opacity 1, persists for minutes).
-                // Reading it as "cogitating" made the pre-send guard refuse
-                // every follow-up with "still generating from a previous
-                // request" AND made the accept gate never fire, so each send
-                // burned the full timeout. On a lane with this quirk the ONLY
-                // trusted completion signal is the answer text itself.
-                if (phantomStop) continue;
-                return true;
-            }
-            if (phantomStop) return false;
-            for (const b of document.querySelectorAll('button')) {
-                if (stopish(b.innerText) && isVisible(b)) return true;
-            }
-            // 09-17 (Bob: "Chat gbt is likely fine, investigate" - HE WAS RIGHT):
-            // ChatGPT generates with NO stop control in the DOM at all. Measured on
-            // the live tab during a real generation:
-            //   stop-button: false   data-testid stop-ish: none   aria-label stop: none
-            //   assistant row aria-busy="true"  <- the ONLY signal, true for 360s
-            // So every stop-based scan above read "not busy", the empty grace expired
-            // at 180s mid-generation, and the send threw "Webchat response is empty
-            // after 180s" while the model was working. Polling the row for 360s showed
-            // it FILL with a real edit contract ({"edits":{"step":"...).
-            // The row's own aria-busy is the signal to trust.
-            for (const r of document.querySelectorAll('[data-message-author-role="assistant"][aria-busy="true"]')) {
-                if (isVisible(r)) return true;
-            }
-            for (const r of document.querySelectorAll('[data-message-author-role="assistant"]')) {
-                if (r.querySelector('[aria-busy="true"]') && isVisible(r)) return true;
-            }
-            // 09-13 (ChatGPT lane): ChatGPT's in-flight control is a
-            // data-testid, not an aria-label, so the aria/innerText scans above
-            // missed it — the harness could not tell "cogitating" from "done"
-            // and threw "response is empty after 12s" while the model was still
-            // thinking. The stop button IS the generation signal.
-            // 09-14: the stop control is not always `stop-button` — ChatGPT
-            // mounts the assistant row EMPTY while it thinks, and a missed stop
-            // control makes `busy` read false, so the 12s empty-grace expired
-            // and the send threw "empty after 12s" while the tab held the
-            // finished answer (measured: gateway 500 at 20.2s, tab had a
-            // 103-char answer). Match any stop-ish data-testid too.
-            for (const el of document.querySelectorAll('[data-testid]')) {
-                const tid = (el.getAttribute('data-testid') || '').toLowerCase();
-                if (tid.includes('stop') && isVisible(el)) return true;
-            }
-            const sb = document.querySelector('[data-testid="stop-button"]');
-            if (isVisible(sb)) return true;
-            return false;
-        }, quirk('phantomStopButton', false));
+        return await page.evaluate(busyProbe, {
+            phantomStop: quirk('phantomStopButton', false),
+        });
     } catch { return false; }
 }
 
@@ -2284,7 +2303,32 @@ async function waitForResponse(before, typedText) {
             // it starts and leaves it EMPTY while the model thinks, which can
             // exceed 12s. An in-flight generation is not an empty answer, so a
             // live stop control resets the grace instead of counting against it.
-            if (busy) emptySince = 0; else emptySince += 1500;
+            //
+            // 09-22 (owner: the Gemini lane) — ON A PHANTOM-STOP LANE THERE IS
+            // NO LIVE STOP CONTROL TO READ, so `busy` stays false for the WHOLE
+            // thinking window and the grace counted that window as silence.
+            // Measured: a send on Gemini held `raw=11 clean=0` for 270s and the
+            // content arrived at t+285s, against a 600s grace — and the gateway
+            // log records the outcome as
+            //   "Webchat response is empty after 600s — stopped or aborted by the UI"
+            // while the page text it quotes proves the model was working
+            // ("Running… Reading…").
+            //
+            // The missing signal is the row itself: we reached this branch
+            // because `grew` is true, i.e. a message row APPEARED that was not
+            // in the pre-send snapshot, and its cleaned text is still empty.
+            // A row mounted for this send that has no text yet is a generation
+            // in flight, not an aborted answer.
+            //
+            // It lives HERE and not in isForeignBusy() on purpose: `grew` is
+            // computed against the pre-send snapshot, so the signal is provably
+            // THIS send's row. isForeignBusy() is also called by the PRE-SEND
+            // guard with no snapshot, and a lane that leaves an empty trailing
+            // row would then read as permanently generating and refuse every
+            // follow-up. Scoped here, the worst case is a slower grace on one
+            // send, never a lane that cannot be used.
+            const inFlight = busy || quirk('emptyMountedRowMeansBusy', false);
+            if (inFlight) emptySince = 0; else emptySince += 1500;
             if (state.body.includes('You stopped this response')) {
                 throw new Error('Webchat response was stopped (Stop button pressed while generating)');
             }
@@ -2941,6 +2985,10 @@ module.exports = {
     closeBrowser,
     getPage: () => page,
     probePage,
+    // Exported for the busy-signal regression tests. It is pure (DOM in, bool
+    // out), so it can be exercised without a browser — which is what would have
+    // caught the phantom-stop short-circuit.
+    busyProbe,
     buildFullPrompt,
     openNewChat,
     sendFirstMessage,
