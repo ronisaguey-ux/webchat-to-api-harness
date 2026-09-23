@@ -49,15 +49,25 @@ guard_stop() {
   return 0
 }
 
-guard_start() {
-  local script="$WORKER/minimize-guard.sh"
-  if [ -x "$script" ]; then
-    setsid --fork "$script" "$PROFILE" 2 >"$WORKER/state/minimize-guard.log" 2>&1 </dev/null &
-    echo "  guard restarted (re-asserts the minimise)"
-  else
-    echo "  (no minimize-guard.sh next to the profile — the window may drift back up on its own)"
-  fi
-}
+  guard_start() {
+    # The guard ships WITH the harness (it is version-controlled here). An installed
+    # worker may still carry its own copy beside the profile, so prefer the sibling in
+    # this repo and fall back to the worker dir rather than requiring either layout —
+    # a fresh clone previously got show-window.sh but no guard to call.
+    local script=""
+    for cand in "$HERE/minimize-guard.sh" "$WORKER/minimize-guard.sh"; do
+      [ -x "$cand" ] && { script="$cand"; break; }
+    done
+    if [ -n "$script" ]; then
+      # `2 >` (space) passed a literal "2" as an argument and left fd 2 pointed at the
+      # caller's stderr, so guard errors were never captured. `2>` is the redirect.
+      setsid --fork "$script" "$PROFILE" >"$WORKER/state/minimize-guard.log" 2>&1 </dev/null &
+      echo "  guard restarted (re-asserts the minimise): $script"
+    else
+      echo "  ✗ no minimize-guard.sh found (looked in $HERE and $WORKER) —"
+      echo "    the window will drift back up on its own."
+    fi
+  }
 
 case "$ACTION" in
   raise)
