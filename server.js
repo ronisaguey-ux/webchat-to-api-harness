@@ -2505,6 +2505,30 @@ async function main() {
     if (config.apiToken) console.log('🔑 Auth: bearer token required');
     if (config.skipBrowser) console.log('⏭️  SKIP_BROWSER=true — no browser until POST /connect');
 
+    // ── BIND GUARD (harness C9) ─────────────────────────────────────────────
+    // This process drives a browser that is LOGGED INTO a real webchat account,
+    // so anyone who can reach the port can use that account. Until now that was
+    // protected by convention only: HOST defaults to 127.0.0.1, but a single
+    // HOST=0.0.0.0 (or an env file edit) exposed the logged-in session with no
+    // token required. Refuse to start rather than run open.
+    const _host = String(config.host || '').toLowerCase();
+    const _isLoopback = _host === '127.0.0.1' || _host === 'localhost' || _host === '::1';
+    if (!_isLoopback && !config.apiToken) {
+        console.error(
+            `\n❌ REFUSING TO START: HOST is "${config.host}" (not loopback) and no API_TOKEN is set.\n` +
+            `   This process drives a browser logged into a real webchat account, so binding it\n` +
+            `   to a reachable address without a token exposes that account to anyone who can\n` +
+            `   reach the port.\n` +
+            `   Fix one of:\n` +
+            `     • HOST=127.0.0.1                    (keep it local)\n` +
+            `     • API_TOKEN=<a-long-random-string>  (require Bearer auth)\n`
+        );
+        process.exit(1);
+    }
+    if (!_isLoopback && config.apiToken) {
+        console.log(`🔒 Bound to ${config.host} with bearer auth required (API_TOKEN set).`);
+    }
+
     // Lazy connect: the browser opens on the first request (or POST /connect),
     // so the server starts even when the webchat is unreachable.
     app.listen(config.port, config.host, () => {
