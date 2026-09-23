@@ -142,6 +142,15 @@ function checkPath(p) {
 // `git status`) passes when SANDBOX_ALLOW_BASH is on.
 const PATH_TOKEN = /(?:^|[\s"'`=(|;&<>])((?:~|\.{0,2}\/|\/)[^\s"'`|;&<>)]*)/g;
 
+// Device files and process-substitution sinks are not "paths outside the roots"
+// — they are pipes to the kernel that every shell command is entitled to use.
+// Measured 2026-09-23: `... 2>/dev/null` was DENIED with
+// "path token(s) outside roots: [\"/dev/null\"]", so a legitimate command the
+// runbook explicitly permits was refused for redirecting its own stderr. The
+// check exists to stop a command reaching a file it should not, and there is
+// nothing to reach in /dev/null.
+const SAFE_PATH_TOKENS = new Set(['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/zero']);
+
 function checkCommand(cmd) {
     if (!ENABLED) return { ok: true };
     if (!ALLOW_BASH) {
@@ -159,6 +168,7 @@ function checkCommand(cmd) {
     while ((m = PATH_TOKEN.exec(String(cmd))) !== null) {
         let tok = m[1];
         if (!tok || tok.startsWith('-')) continue; // flags are not paths
+        if (SAFE_PATH_TOKENS.has(tok)) continue;   // kernel sinks, not files
         if (tok.startsWith('~')) tok = tok.replace(/^~/, process.env.HOME || '');
         // Strip a trailing redirect/quote noise already excluded by the class.
         const abs = path.resolve(tok);
