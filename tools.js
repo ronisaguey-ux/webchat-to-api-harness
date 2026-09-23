@@ -5,6 +5,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const config = require('./config');
 const sandbox = require('./sandbox');
+const memory = require('./memory');
 
 // 08-14 WEDGE ROOT-CAUSE ceiling: tool RESULTS must never round-trip a huge
 // file through the chat tab (read_file on a 5.86MB state file → 6.2M-char
@@ -166,6 +167,10 @@ const TOOL_DEFINITIONS = [
             },
             required: ['command'],
         },
+        // A1: a bash command the harness refuses to run must not be offered as if
+        // it could. Filter it out when the gate is off, so the model never tries
+        // it, gets a hard error, and loops.
+        available: () => config.bashAllowed,
         handler: (args) =>
             new Promise((resolve) => {
                 if (!config.bashAllowed) {
@@ -302,6 +307,15 @@ const TOOL_DEFINITIONS = [
         // answer with sources. Requires DEEPSEEK_API_KEY in the gateway .env
         // (same key the websearch-deepseek MCP uses — v4 flash only, never
         // deepseek-chat).
+        //
+        // 09-22 (owner): "add a websearch mcp that uses the webchat instead of a
+        // paid api" — search_web no longer HARD-requires a key. DeepSeek and
+        // Gemini have NATIVE search in their own UI, so for those lanes the
+        // harness flips the lane's own Search control ON (browser.js ensureToggles,
+        // config webchatModes.<mode>.native.search) and this tool — if the model
+        // calls it anyway — tells it to ask directly instead of faking a search.
+        // With no key and no native search, it returns ONE clear message so the
+        // model never loops on an unavailable tool (A1).
         name: 'search_web',
         category: 'web',
         description: 'Search the web; returns result entries plus an AI-written answer with source URLs.',
@@ -312,10 +326,30 @@ const TOOL_DEFINITIONS = [
             },
             required: ['query'],
         },
+        // A1: never advertise a tool whose requirement is unmet. search_web is
+        // offered only when it can actually produce results — a paid key, or a
+        // lane whose native search is switched on.
+        available: () => config.webSearchAvailable,
         handler: async (args) => {
             const key = process.env.DEEPSEEK_API_KEY;
             if (!key) {
-                return { success: false, error: 'search disabled: DEEPSEEK_API_KEY not set in the gateway .env' };
+                // Keyless: native search lanes use their own UI search, and every
+                // other lane gets a single clear unavailable message — never a
+                // hard "disabled" error the model would retry in a loop.
+                if (config.nativeSearch) {
+                    return {
+                        success: true,
+                        native: true,
+                        answer: 'Web search is handled natively by this webchat — the Search control is ON. ' +
+                            'Ask your search question directly in your next message; do not call search_web.',
+                    };
+                }
+                return {
+                    success: false,
+                    error: 'web search is not available on this lane: set DEEPSEEK_API_KEY for paid search, or ' +
+                        'enable native search for deepseek/gemini (webchatModes.<mode>.native.search = true in ' +
+                        'harness.config.json).',
+                };
             }
             const body = {
                 model: 'deepseek-v4-flash',
@@ -622,6 +656,49 @@ const TOOL_DEFINITIONS = [
             });
         },
     },
+    {
+        // 09-22 (owner): "a memory file that the user or agent can edit." The
+        // model reads and edits the persistent memory file through these two
+        // tools, so facts survive across sends. The file is bounded (it rides
+        // into every request's system prompt) — see memory.js.
+        name: 'read_memory',
+        category: 'memory',
+        description: 'Read the persistent memory file. Use this to recall facts you or the user stored across sessions.',
+        parameters: { type: 'object', properties: {}, required: [] },
+        available: () => config.memoryEnabled,
+        handler: async () => {
+            const content = memory.readMemory();
+            if (!content.trim()) return { success: true, content: '', message: 'Memory is empty.' };
+            return { success: true, content };
+        },
+    },
+    {
+        // Whole-file replace or append. The file is capped at MAX_MEMORY_CHARS
+        // (memory.js) so a bad edit cannot balloon the system prompt.
+        name: 'edit_memory',
+        category: 'memory',
+        description: 'Edit the persistent memory file. Pass `content` to REPLACE the whole file, or `append` to add to the end. Persist anything you must remember across sends (decisions, facts, user preferences).',
+        parameters: {
+            type: 'object',
+            properties: {
+                content: { type: 'string', description: 'Full new contents (overwrites the file)' },
+                append: { type: 'string', description: 'Text to append to the end of the file' },
+            },
+            required: [],
+        },
+        available: () => config.memoryEnabled,
+        handler: async (args) => {
+            const append = String(args?.append ?? '');
+            const content = String(args?.content ?? '');
+            if (!append && !content) return { success: false, error: 'pass content (replace) or append (add to the end)' };
+            if (append && !content) {
+                memory.appendMemory(append);
+            } else {
+                memory.writeMemory(content);
+            }
+            return { success: true, message: `Memory updated (${memory.readMemory().length} chars).` };
+        },
+    },
 ];
 
 // ──────────────────────────────────────────────────────
@@ -629,7 +706,24 @@ const TOOL_DEFINITIONS = [
 // ──────────────────────────────────────────────────────
 function getToolDefinitions() {
     // Expose only the schema (name/category/description/parameters), never the handler
-    return TOOL_DEFINITIONS.map(({ handler, ...rest }) => rest);
+    return TOOL_DEFINITIONS.map(({ handler, available, ...rest }) => rest);
+}
+
+// 09-22 A1: the EXECUTABLE set. A tool whose `available()` predicate returns
+// false (its requirement is unmet — no DEEPSEEK_API_KEY, bash gate off, memory
+// disabled, …) is not advertised, so the model can never try it, hit a hard
+// error, and loop. This is the fix for the user's "repeatedly trying unavailable
+// tools".
+function getExecutableToolDefinitions() {
+    return TOOL_DEFINITIONS
+        .filter((t) => (typeof t.available === 'function' ? t.available() : true))
+        .map(({ handler, available, ...rest }) => rest);
+}
+
+function isToolAvailable(toolName) {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === toolName);
+    if (!tool) return false;
+    return typeof tool.available === 'function' ? tool.available() : true;
 }
 
 async function executeTool(toolName, args, ctx) {
@@ -638,6 +732,14 @@ async function executeTool(toolName, args, ctx) {
         return {
             success: false,
             error: `Tool "${toolName}" not found. Available: ${TOOL_DEFINITIONS.map((t) => t.name).join(', ')}`,
+        };
+    }
+    // A1: even if a tool somehow reaches the executor while its requirement is
+    // unmet (a stale model message), refuse cleanly rather than half-running.
+    if (typeof tool.available === 'function' && !tool.available()) {
+        return {
+            success: false,
+            error: `Tool "${toolName}" is not available on this install (its requirement is unmet).`,
         };
     }
     console.log(`🔧 Executing: ${toolName}(${JSON.stringify(args)})`);
@@ -775,6 +877,8 @@ function parseToolCall(response) {
 module.exports = {
     TOOL_DEFINITIONS,
     getToolDefinitions,
+    getExecutableToolDefinitions,
+    isToolAvailable,
     executeTool,
     parseToolCall,
     parseToolCalls,

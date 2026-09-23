@@ -48,6 +48,12 @@
     "viewportW": 0,
     "viewportH": 0,
     "loginWaitSeconds": 300,
+    "model": "",
+    "native": {
+      "_comment": "Native DeepThink / Search toggles. DeepThink defaults ON, Search OFF. These are the DEFAULT for every mode; a per-mode block under webchatModes.<mode>.native wins.",
+      "deepThink": true,
+      "search": false
+    },
     "selectors": {
       "input": "",
       "send": "",
@@ -215,11 +221,29 @@
     "driftDetect": 2,
     "contextHandoff": true,
     "allowPlainText": false,
+    "noTools": false,
+    "toolCompactor": false,
+    "memory": false,
     "bashAllowed": false,
     "sandbox": true,
     "sandboxAllowBash": false,
     "blockedCss": false,
     "rateLimitCooldownSeconds": 900
+  },
+  "compactor": {
+    "_comment": "Tool-result compaction (features.toolCompactor). Head+tail truncation; errors are never touched. Limits mirror the owner's tool-call-compactor.",
+    "maxText": 10000,
+    "maxItems": 10,
+    "headItems": 3,
+    "tailItems": 2
+  },
+  "memory": {
+    "_comment": "Persistent memory file (features.memory). Bounded — it rides into every request's system prompt. File path: paths.memoryFile (env MEMORY_FILE).",
+    "maxChars": 20000
+  },
+  "mcp": {
+    "_comment": "Attach ANY MCP server. Each entry is { name, command, args, url }. Discovered over the MCP protocol and merged into the tool list. Fail-open: an unreachable server is skipped and its tools are not advertised. OFF by default (empty).",
+    "servers": []
   },
   "limits": {
     "timeoutMs": 1800000,
@@ -228,7 +252,8 @@
     "contextHandoffThreshold": 2000000,
     "antiSpiralMinWords": 40,
     "execTimeoutMs": 10000,
-    "wrapUpRounds": 3
+    "wrapUpRounds": 3,
+    "maxMalformedRounds": 3
   },
   "paths": {
     "workspaceRoot": "",

@@ -510,6 +510,9 @@ async function sendPrompt(prompt, toolDefinitions) {
     // DeepThink chip — Search is never touched). No-op for foreign webchats
     // (no such chips) and never throws.
     await ensureToggles();
+    // 09-22 B5: apply the configured model before the send (no-op if unset or the
+    // picker is not found — a missing picker must never block a send).
+    await setModel();
     // 09-14 (owner): Freebuff resets reasoning effort to "Max" on new chat; a
     // reused tab keeps whatever it had. Pin it to "Low" before every send so the
     // thinking model never cooks the timeout — cheap, idempotent, freebuff-only.
@@ -626,22 +629,82 @@ async function collapseBigReplies() {
 // on an instant thread would lock that thread into instant. Idempotent, every
 // request (a reload or tab flip can reset the chips). Foreign webchats have
 // no such chips — harmless no-op.
+//
+// 09-22 B1 (owner): "for deepseek or gemini, its not needed cuz they have native
+// websearch capabilities, just have it so that the user can config on deepseek
+// deepthink and search on". ensureToggles is now CONFIG-DRIVEN instead of
+// DeepThink-force-on: it sets the DeepThink and Search chips to whatever
+// webchatModes.<mode>.native.deepThink / .search say (DeepThink defaults ON,
+// Search defaults OFF). MEASURED DOM (probed live, current DeepSeek composer):
+//   chips are .ds-toggle-button, labelled by their text "DeepThink" / "Search",
+//   state is aria-pressed="true"|"false". Gemini has NO such chips — its search
+//   is built into the model, so for gemini this is a no-op and native search is
+//   simply ON when the model is asked (recorded, not faked).
 async function ensureToggles() {
     try {
-        const clicked = await page.evaluate(() => {
+        const wantDeepThink = config.nativeDeepThink;
+        const wantSearch = config.nativeSearch;
+        const clicked = await page.evaluate(({ wantDeepThink, wantSearch }) => {
             const flipped = [];
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
-                if (label !== 'DeepThink') continue;
-                if (el.getAttribute('aria-pressed') === 'true') continue;
-                el.click();
-                flipped.push(label);
+                const on = el.getAttribute('aria-pressed') === 'true';
+                if (label === 'DeepThink' && on !== wantDeepThink) {
+                    el.click();
+                    flipped.push(`DeepThink ${wantDeepThink ? 'ON' : 'OFF'}`);
+                } else if (label === 'Search' && on !== wantSearch) {
+                    el.click();
+                    flipped.push(`Search ${wantSearch ? 'ON' : 'OFF'}`);
+                }
             }
             return flipped;
-        });
-        if (clicked && clicked.length) console.log('🧠 DeepThink enabled');
+        }, { wantDeepThink, wantSearch });
+        if (clicked && clicked.length) console.log('🧠 native toggles:', clicked.join(', '));
     } catch (e) {
         console.log('⚠ toggle ensure failed:', String(e.message).slice(0, 60));
+    }
+}
+
+// 09-22 B5 (owner): "allow the user to pick specific models inside the webchat
+// inside the cli". config.webchatModel records the model; this sets it in the
+// tab's OWN picker before a send. MEASURED DOM (probed live 09-22):
+//   gemini -> button[aria-label^="Open mode picker"] opens a menu; the options
+//             are menuitems whose text names the model ("Gemini Flash", "Gemini
+//             2.5 Pro", …). Click the option whose text matches the config.
+//   deepseek -> picker lives in the composer header (discover on a live deepseek
+//             tab; not reachable from this install — only the gemini tab is open).
+// A no-op (and a log line) when the model is blank or the control is not found —
+// a missing picker must never block a send.
+async function setModel() {
+    const want = (config.webchatModel || '').trim();
+    if (!want) return;
+    try {
+        const host = new URL(config.webchatUrl).host;
+        if (host.includes('gemini')) {
+            const opened = await page.evaluate(() => {
+                const btn = document.querySelector('button[aria-label^="Open mode picker"]');
+                if (btn) { btn.click(); return true; }
+                return false;
+            });
+            if (!opened) { console.log('⚠ model picker button not found — leaving model as-is'); return; }
+            await sleep(400);
+            const set = await page.evaluate((want) => {
+                const opts = [...document.querySelectorAll('[role="menuitem"], [role="option"]')];
+                const match = opts.find((o) => (o.textContent || '').trim() === want)
+                    || opts.find((o) => (o.textContent || '').trim().includes(want));
+                if (!match) return { ok: false, have: opts.map((o) => (o.textContent || '').trim()).filter(Boolean).slice(0, 12) };
+                match.click();
+                return { ok: true };
+            }, want);
+            if (set.ok) console.log(`🎛️ model set to "${want}"`);
+            else console.log(`⚠ model "${want}" not in picker; available: ${set.have.join(', ')}`);
+        } else {
+            // deepseek and others: a selector must be configured (discovered live);
+            // without one, leave the model untouched and say so once.
+            console.log('⚠ model picker not configured for this lane — set webchat.model and add a per-mode selector');
+        }
+    } catch (e) {
+        console.log('⚠ setModel failed:', String(e.message).slice(0, 60));
     }
 }
 

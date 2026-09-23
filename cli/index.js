@@ -523,6 +523,16 @@ async function editSetting(settingPath) {
         return;
     }
 
+    // File-backed settings (memory.contents) write the actual file, not config JSON.
+    if (setting.fileBacked) {
+        const mem = require('../memory');
+        mem.writeMemory(String(next ?? ''));
+        await A.message('Saved', [
+            `${setting.label} written to ${shortHome(mem.memoryFile())} (${mem.readMemory().length} chars).`,
+        ]);
+        return;
+    }
+
     const { raw, file } = S.loadRaw();
     S.setPath(raw, setting.path, next);
     S.saveRaw(raw, file);

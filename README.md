@@ -228,8 +228,53 @@ prose-wrapped all work). If found, the tool runs and its result is fed back to
 the chat; the loop repeats up to `MAX_TOOL_ROUNDS` times and the final text is
 returned.
 
-Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
-(placeholder). Custom tools = add entries to `TOOL_DEFINITIONS` in `tools.js`.
+Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`,
+`get_time`, `send_message`, `audit_status`, `git_status`, `telegram_send`,
+`send_message_to_main`, `send_message_to_antigravity`, `send_telegram_message`,
+plus `read_memory` / `edit_memory` (when memory is enabled) and any tools from
+attached MCP servers. The model is offered only the **executable** set — a tool
+whose requirement is unmet (no `DEEPSEEK_API_KEY`, bash gate off, memory
+disabled) is never advertised, so it cannot be tried and looped on.
+
+## Capabilities added 2026-09-22
+
+**Web search without a paid key.** `search_web` no longer hard-requires
+`DEEPSEEK_API_KEY`. DeepSeek and Gemini have *native* search in their own UI, so
+for those lanes the harness flips the lane's own controls on before a send —
+config `webchatModes.<mode>.native.deepThink` / `.search` (DeepSeek chips are
+`.ds-toggle-button`, measured live). With no key and no native search, `search_web`
+returns one clear "not available on this lane" message instead of a hard error the
+model loops on.
+
+**Attach any MCP server.** `harness.config.json` → `"mcp": { "servers": [ { "name",
+"command", "args" } | { "name", "url" } ] }`. Tools are discovered over the MCP
+protocol and merged into the tool list (names are `<server>.<tool>`). Fail-open:
+an unreachable server is skipped and its tools are not advertised. No skills
+format exists in this repo, so skills are not wired.
+
+**Tool-result compaction.** `features.toolCompactor` + `compactor.*` thresholds
+trim big tool results to head+tail (never an error) before they go back to the
+model — the owner's tool-call-compactor rules, re-implemented dependency-free.
+
+**A memory file the user or the model can edit.** `features.memory` (default file
+`<workspace>/webchat_memory.md`, `MEMORY_FILE` to move). The model reads/edits it
+with `read_memory` / `edit_memory`; the CLI edits it under "Memory contents"; its
+contents are included in the system prompt. Capped at `memory.maxChars`.
+
+**Pick the model inside the webchat.** `webchat.model` (or per-mode) selects the
+model in the tab's own picker before a send (Gemini: `button[aria-label^="Open
+mode picker"]`, measured live). Blank leaves the current selection.
+
+**More loop control.** `limits.maxMalformedRounds` (broken-JSON corrections,
+was hardcoded at 3) plus the compactor thresholds above.
+
+**Research-only lane.** `features.noTools` offers the model no work tools (only
+`submit_answer`) — pair with `features.allowPlainText` for pure research /
+plain-English answers.
+
+**Codex model ids.** Codex rejects slash syntax like `webchat-local/anymodel`.
+Point Codex's `model_provider` at this base URL and set `model` to `anymodel` or
+`webchat` (or the advertised `model` name) — see `GET /v1/models`.
 
 ## 🔒 Sandbox (path fence for every file tool)
 
