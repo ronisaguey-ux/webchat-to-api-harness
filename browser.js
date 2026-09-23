@@ -2455,12 +2455,65 @@ async function waitForResponse(before, typedText) {
     // threshold and the dead-renderer probe below would never run — which is
     // exactly the bug this counter exists to fix.
     let _pollFailures = 0;
+    // ── 09-23b: BOUND EVERY POLL AWAIT ────────────────────────────────────────
+    // The recovery below only runs when a poll THROWS. That was still not enough,
+    // because a poll against a dead renderer does not throw promptly: `page.evaluate`
+    // is bounded only by protocolTimeout (240000ms, set above), and each iteration
+    // makes TWO such calls. So a corpse cost ~480s before the failure counter
+    // incremented even once — measured: a send sat at outstandingMs 420542 with the
+    // renderer dead and the counter still at 0. Racing each call against a short
+    // deadline converts "hangs for the protocol timeout" into "fails in
+    // POLL_BOUND_MS", which is what makes the existing recovery reachable in seconds
+    // instead of after most of the 900s budget has already been spent.
+    const POLL_BOUND_MS = Math.max(3000, parseInt(process.env.POLL_BOUND_MS || '20000', 10));
+    const boundPoll = (promise, label, ms = POLL_BOUND_MS) => {
+        let t;
+        const bound = new Promise((_, rej) => {
+            t = setTimeout(() => {
+                const e = new Error(`poll "${label}" exceeded ${ms}ms — renderer unresponsive?`);
+                e.pollTimeout = true;
+                rej(e);
+            }, ms);
+        });
+        // finally clears the timer on BOTH paths, so a fast success cannot leave a
+        // live 20s timer behind. Promise.race keeps a handler on the original promise,
+        // so a late rejection after the race settles is absorbed, not unhandled.
+        return Promise.race([promise, bound]).finally(() => clearTimeout(t));
+    };
+    // Shared failure path for every poll await, so a hang in either one counts.
+    // Returns to continue the loop; throws retryable once the renderer is proven dead.
+    const handlePollFailure = async (e) => {
+        _pollFailures += 1;
+        const _msg = String(e && e.message).slice(0, 70);
+        if (_pollFailures >= RENDERER_DEAD_AFTER) {
+            const alive = await probeRendererAlive();
+            if (!alive) {
+                await dropDeadRenderer(`no renderer response after ${_pollFailures} poll failures: ${_msg}`);
+                // Retryable: the next attempt runs the normal connect path, which
+                // builds a fresh page. Tagged rather than thrown bare so the send
+                // retry in server.js actually fires (it keys on e.retryable).
+                const err = new Error(
+                    'Webchat renderer died mid-generation (tab unresponsive; it has been closed so the retry gets a fresh page) — please resend'
+                );
+                err.retryable = true;
+                err.rendererDead = true;
+                throw err;
+            }
+            console.log(`⏳ ${_pollFailures} poll failures but the renderer answers — still generating, continuing`);
+            // A renderer that ANSWERS is alive, even if the page is too busy to render
+            // a row. Stamp the progress clock or the outer idle deadline counts this
+            // as no-progress and kills a working send.
+            markProgress();
+            _pollFailures = 0;
+        }
+        console.log('⏳ poll evaluate failed (page busy?), retrying:', _msg);
+    };
     while (Date.now() < deadline) {
         // 08-13: stream tee FIRST — the DOM may never render the answer in
         // this environment. found=true means loadend fired, so the body is
         // complete; return it without waiting on the UI.
         try {
-            const tee = await readStreamedAnswer(teeStart);
+            const tee = await boundPoll(readStreamedAnswer(teeStart), 'stream-tee');
             if (tee.found) {
                 // 08-13 RATE-LIMIT FIX: the stream can end with a hint-error
                 // (e.g. "Messages too frequent") — nothing else ever arrives.
@@ -2472,11 +2525,15 @@ async function waitForResponse(before, typedText) {
             }
         } catch (e) {
             if (e.message && /stream ended without content|stream error/.test(e.message)) throw e;
+            // A bounded-await timeout is a renderer signal, not a stream error — route
+            // it through the shared handler so it counts toward recovery instead of
+            // silently falling through and spending another full protocolTimeout.
+            if (e.pollTimeout) await handlePollFailure(e);
             // otherwise (page busy / evaluate race) fall through to the DOM poll
         }
           let state;
           try {
-              state = await snapshotChat(before);
+              state = await boundPoll(snapshotChat(before), 'snapshot');
         } catch (e) {
             // If the BROWSER died (Chrome crash — observed 08-12), polling to
             // the deadline just hangs the client for the full timeout. Fail
@@ -2495,30 +2552,8 @@ async function waitForResponse(before, typedText) {
             // while every chrome process idled at 0.0% CPU. A single failure is
             // still normal; repeated ones are not, so after RENDERER_DEAD_AFTER
             // consecutive failures a bare `1+1` decides which one this is.
-            _pollFailures += 1;
-            const _msg = String(e.message).slice(0, 70);
-            if (_pollFailures >= RENDERER_DEAD_AFTER) {
-                const alive = await probeRendererAlive();
-                if (!alive) {
-                    await dropDeadRenderer(`no renderer response after ${_pollFailures} poll failures: ${_msg}`);
-                    // Retryable: the next attempt runs the normal connect path, which
-                    // builds a fresh page. Tagged rather than thrown bare so the send
-                    // retry in server.js actually fires (it keys on e.retryable).
-                    const err = new Error(
-                        'Webchat renderer died mid-generation (tab unresponsive; it has been closed so the retry gets a fresh page) — please resend'
-                    );
-                    err.retryable = true;
-                    err.rendererDead = true;
-                    throw err;
-                }
-                console.log(`⏳ ${_pollFailures} poll failures but the renderer answers — still generating, continuing`);
-                // A renderer that ANSWERS is alive, even if the page is too busy to
-                // render a row. Stamp the progress clock or the outer idle deadline
-                // counts this as no-progress and kills a working send.
-                markProgress();
-                _pollFailures = 0;
-            }
-            console.log('⏳ poll evaluate failed (page busy?), retrying:', _msg);
+            // 09-23b: shared with the stream-tee await, so a hang there counts too.
+            await handlePollFailure(e);
             await sleep(1500);
             continue;
         }
