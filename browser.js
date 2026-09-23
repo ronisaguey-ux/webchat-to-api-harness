@@ -2450,6 +2450,11 @@ async function waitForResponse(before, typedText) {
     let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
     let lastText = null; // previous poll's thread text, for activity detection
     let emptySince = 0; // how long the newest message element has been empty
+    // Consecutive poll failures. Declared OUTSIDE the while loop on purpose: a
+    // counter scoped inside it resets on every poll, so it can never reach the
+    // threshold and the dead-renderer probe below would never run — which is
+    // exactly the bug this counter exists to fix.
+    let _pollFailures = 0;
     while (Date.now() < deadline) {
         // 08-13: stream tee FIRST — the DOM may never render the answer in
         // this environment. found=true means loadend fired, so the body is
@@ -2469,10 +2474,9 @@ async function waitForResponse(before, typedText) {
             if (e.message && /stream ended without content|stream error/.test(e.message)) throw e;
             // otherwise (page busy / evaluate race) fall through to the DOM poll
         }
-        let state;
-        let _pollFailures = 0;
-        try {
-            state = await snapshotChat(before);
+          let state;
+          try {
+              state = await snapshotChat(before);
         } catch (e) {
             // If the BROWSER died (Chrome crash — observed 08-12), polling to
             // the deadline just hangs the client for the full timeout. Fail
