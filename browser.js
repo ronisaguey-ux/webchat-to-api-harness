@@ -381,8 +381,17 @@ async function saveCookies() {
 // then 503'd the next request with a dead handle and the engine burned a hop.
 const STALE_HANDLE_RE = /detached Frame|Session closed|Target closed|Cannot find context|Execution context was destroyed|Protocol error \(Runtime\.callFunctionOn\)/i;
 
+// "Requesting main frame too early!" — puppeteer's frame manager asked for the main
+// frame before the target finished attaching. Observed 2026-09-23 as the error that
+// ended a plan run right after a page swap. It is the same class as the other stale
+// states: the handle is momentarily unusable and the very next attempt (which runs
+// the normal connect path and rebuilds the page) succeeds. Treated as stale AND
+// retryable; previously it matched nothing, so the send failed outright.
+const EARLY_FRAME_RE = /Requesting main frame too early|Cannot read properties of null \(reading 'mainFrame'\)/i;
+
 function isStaleHandleError(e) {
-    return STALE_HANDLE_RE.test(String(e && e.message ? e.message : e));
+    return STALE_HANDLE_RE.test(String(e && e.message ? e.message : e))
+        || EARLY_FRAME_RE.test(String(e && e.message ? e.message : e));
 }
 
 // ── DEAD RENDERER (measured 2026-09-23) ─────────────────────────────────────
