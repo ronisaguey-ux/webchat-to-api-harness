@@ -1,4 +1,6 @@
 const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
 const puppeteer = require('puppeteer');
 const config = require('./config');
 
@@ -83,6 +85,104 @@ async function initBrowser(opts = {}) {
     return _initInFlight;
 }
 
+/**
+ * Keep the headed browser off the user's screen.
+ *
+ * The browser runs HEADED on purpose — a real headed session keeps the login
+ * (headless gets signed out and is a fingerprint tell) — but Chrome re-raises
+ * its own window whenever a page takes focus, so a single minimise does not
+ * hold. The owner has had a runaway window appear and closed it by hand twice.
+ *
+ * `show-window.sh drop` is the owner's own tested mechanism: it minimises AND
+ * restarts a guard that re-asserts the minimise every couple of seconds, which
+ * is the part a one-shot `xdotool` call is missing.
+ *
+ * Best-effort by design: a missing script, no DISPLAY, or a headless launch must
+ * never block or fail a browser start. The window appearing is a nuisance; a
+ * lane that will not start is a bug.
+ */
+/**
+ * The Chrome profile the lane types into.
+ *
+ * This is the SAME resolution cli/daemon.js uses for its own launch, so the two
+ * launch paths cannot drift: an explicit CHROME_PROFILE wins, otherwise
+ * <repo>/.webchat/chrome-profile.
+ *
+ * It is load-bearing, not cosmetic. Without it Puppeteer invents a throwaway
+ * profile under /tmp on every launch — measured 2026-09-23, a launch came up on
+ * /tmp/puppeteer_dev_chrome_profile-XMZy7h while the signed-in profile (with
+ * DeepSeek's `userToken` in localStorage) sat untouched, so the lane reported
+ * "Waiting for login" forever. A webchat lane whose profile is ephemeral is a
+ * lane that must be logged into by hand every time it starts.
+ */
+function chromeProfile() {
+    return process.env.CHROME_PROFILE || path.join(__dirname, '.webchat', 'chrome-profile');
+}
+
+/**
+ * Find a CDP websocket for a browser already running on this box, so a later
+ * init can ATTACH instead of trying to launch a second instance on a profile
+ * Chrome has locked.
+ *
+ * Probes the conventional debugging ports in order and returns the FIRST live
+ * `webSocketDebuggerUrl`, or null when nothing is listening. Never throws —
+ * "no browser found" is the normal cold-start answer, not an error.
+ */
+const CDP_PROBE_PORTS = [9225, 9224, 9222, 9223];
+
+/**
+ * The port our OWN launched Chrome should expose CDP on.
+ *
+ * An explicit CDP_WS_URL names one; otherwise we use the first probe port, which
+ * is what the CLI's --remote-debugging-port matches and what `webchat connect`
+ * writes into .env. Keeping the launch and the probe on the same port is the
+ * whole point: launch on a port nobody probes and the process is unreachable.
+ */
+function cdpPort() {
+    const fromUrl = (config.cdpWsUrl || '').match(/^ws:\/\/(?:127\.0\.0\.1|localhost):(\d+)\//);
+    if (fromUrl) return Number(fromUrl[1]);
+    const fromEnv = Number(process.env.CDP_PORT || 0);
+    if (fromEnv) return fromEnv;
+    return CDP_PROBE_PORTS[0];
+}
+
+async function findRunningBrowserWs() {
+    for (const port of CDP_PROBE_PORTS) {
+        try {
+            const r = await fetch(`http://127.0.0.1:${port}/json/version`, {
+                signal: AbortSignal.timeout(1000),
+            });
+            if (!r.ok) continue;
+            const j = await r.json();
+            if (j && j.webSocketDebuggerUrl) return j.webSocketDebuggerUrl;
+        } catch (_) {
+            // nothing on this port — keep looking
+        }
+    }
+    return null;
+}
+
+let _hiddenOnce = false;
+function keepWindowHidden() {
+    if (_hiddenOnce) return;                 // one guard process is enough
+    if (config.headless) return;             // nothing to hide
+    if (!process.env.DISPLAY) return;        // no X server to talk to
+    try {
+        const script = path.join(__dirname, 'show-window.sh');
+        if (!fs.existsSync(script)) return;
+        const child = spawn('bash', [script, 'drop'], {
+            detached: true,
+            stdio: 'ignore',
+            env: { ...process.env },
+        });
+        child.unref();
+        _hiddenOnce = true;
+        console.log('🫥 headed browser minimised (show-window.sh drop guard running)');
+    } catch (e) {
+        console.log('⚠ could not minimise the browser window:', String(e.message).slice(0, 60));
+    }
+}
+
 async function _initBrowserInner({ reconnect = false } = {}) {
     if (reconnect && browser) {
         // A long-lived CDP session can go stale (evaluates hang while fresh
@@ -137,17 +237,72 @@ async function _initBrowserInner({ reconnect = false } = {}) {
         return;
     }
 
+    // ── ATTACH BEFORE LAUNCH (measured 2026-09-23) ──────────────────────────
+    // A persistent profile is single-instance: Chrome refuses to start a second
+    // process on a locked `userDataDir`. So once a launch path exists, every
+    // later init MUST attach to that Chrome rather than launch another — and the
+    // reconnect path below makes this mandatory, not theoretical.
+    //
+    // Before this, a stale-session refresh did `browser.disconnect()` (which
+    // LEAVES CHROME RUNNING) and then fell straight through to
+    // `puppeteer.launch(... userDataDir ...)` — measured: the first request
+    // logged in fine, the very next one died with
+    //   "The browser is already running for .../chrome-profile.
+    //    Use a different `userDataDir` or stop the running browser first."
+    // A working lane that bricks after exactly one message.
+    //
+    // Cheap and safe to attempt: no Chrome running → 3s probe fails → we launch
+    // exactly as before. Chrome running → we attach and the login is preserved
+    // (no relaunch, no re-login, no window popped up).
+    const browserWs = await findRunningBrowserWs();
+    if (browserWs) {
+        try {
+            console.log(`🔎 Found a browser already holding this profile — attaching instead of launching.`);
+            browser = await puppeteer.connect({
+                browserWSEndpoint: browserWs,
+                defaultViewport: null,
+                protocolTimeout: 240000,
+            });
+            console.log('✅ Attached to the running browser.');
+            attachDisconnectGuard();
+            return;
+        } catch (e) {
+            console.log(`⚠️  Attach to the running browser failed (${String(e.message).slice(0, 70)}) — launching fresh.`);
+            browser = null;
+            page = null;
+        }
+    }
+
     console.log('🚀 Launching browser...');
     // detached:true puts Chromium in its own process group so a crash can be
     // reaped with kill(-pid) — orphaned renderer/GPU/zygote children otherwise
     // accumulate as zombies (documented Puppeteer-in-container failure mode).
     browser = await puppeteer.launch({
         headless: config.headless,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        // A persistent profile is what carries the webchat login across restarts.
+        // Reusing the CLI's resolution keeps one profile, not two.
+        userDataDir: (() => {
+            const dir = chromeProfile();
+            try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* launch will report */ }
+            return dir;
+        })(),
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            // A debugging port is what makes the launched Chrome ATTACHABLE.
+            // Without it the process exposes no CDP HTTP endpoint, so a later
+            // init can never attach — it can only try to launch a second Chrome
+            // on the same locked profile and fail (measured 2026-09-23).
+            `--remote-debugging-port=${cdpPort()}`,
+        ],
         defaultViewport: { width: 1280, height: 800 },
         detached: true,
     });
     attachDisconnectGuard();
+    // Owner rule: the browser must never appear on screen. The launch branch only —
+    // attaching to an already-running browser is not ours to move.
+    keepWindowHidden();
     page = await browser.newPage();
     await page.setUserAgent(
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -264,13 +419,31 @@ async function connectToWebchatOnce(webchatUrl) {
     // Probe first; on a stale handle, drop it and re-attach before doing work.
     await ensureLivePage();
 
+    // A page handle must exist by now. `initBrowser()` returns early with
+    // "Browser already connected" when the browser object is alive — and that
+    // path acquires NO page, so `page` stays null and the first real call dies on
+    // `null.setCookie`. The tab-selection block below only runs for a browser we
+    // actually hold, so make the page a hard precondition here instead of
+    // assuming initBrowser always assigns one.
+    if (!page) {
+        if (!browser) throw new Error('No browser and no page — cannot connect to webchat');
+        const existing = await browser.pages();
+        page = existing.find((p) => p.url().startsWith(new URL(webchatUrl).origin)) || existing[0] || null;
+        if (!page) page = await browser.newPage();
+        console.log(`📄 Acquired page after init (${page.url()})`);
+    }
+
     // A cached `page` can outlive its frame: Chrome swaps the renderer (tab
     // discarded, crash, or the page navigated) and every call on the old handle
     // throws "Attempted to use detached Frame '<id>'". Observed 2026-09-12 — the
     // gateway answered a good response, refreshed its CDP session, then 503'd the
     // next request with a detached frame and the engine burned a hop on it.
 
-    if (config.cdpWsUrl) {
+    // Tab selection must run whenever a browser exists — not only when CDP_WS_URL
+    // is configured. Gated on `config.cdpWsUrl` (its original form), a LAUNCHED
+    // browser skipped every branch below, left `page` null, and the next call died
+    // on `null.setCookie` (measured 2026-09-23).
+    if (browser) {
         const pages = await browser.pages();
         // TAB_URL_SUBSTRING mode (second instance, 08-12): match the tab whose
         // URL contains the pinned thread id, never an arbitrary deepseek tab —
