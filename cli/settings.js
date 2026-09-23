@@ -26,6 +26,11 @@
 const fs = require('fs');
 const path = require('path');
 
+// The memory file is file-backed, not config-JSON-backed: its `memory.contents`
+// setting reads/writes the actual file. Load it lazily so a broken memory module
+// cannot take the CLI down.
+const memoryMod = (() => { try { return require('../memory'); } catch { return null; } })();
+
 // ── The schema ─────────────────────────────────────────────────────────────
 // type: bool | number | string | list | enum | secret | longtext
 // risk: shown as a warning banner; these loosen a guardrail.
@@ -70,6 +75,18 @@ const SCHEMA = [
             {
                 path: 'server.modelName', label: 'Advertised model name', type: 'string', env: 'MODEL_NAME',
                 help: 'What /v1/models reports. Your agent client sees this as the model id.',
+            },
+            {
+                path: 'webchat.model', label: 'Model in the webchat', type: 'string', env: 'WEBCHAT_MODEL',
+                help: 'Which model the webchat tab selects before a send (its own picker). Blank leaves whatever is selected.',
+            },
+            {
+                path: 'webchat.native.deepThink', label: 'Native DeepThink', type: 'bool',
+                help: 'Turns the webchat\'s own DeepThink control on/off before a send (DeepSeek).',
+            },
+            {
+                path: 'webchat.native.search', label: 'Native web search', type: 'bool',
+                help: 'Turns the webchat\'s own Search control on/off (DeepSeek/Gemini native search) — replaces a paid search key.',
             },
             {
                 path: 'server.headless', label: 'Headless browser', type: 'bool', env: 'HEADLESS',
@@ -177,6 +194,24 @@ const SCHEMA = [
                 help: 'Responses shorter than this are not treated as a spiral candidate.',
                 advanced: true,
             },
+            {
+                path: 'limits.maxMalformedRounds', label: 'Malformed-JSON corrections', type: 'number', env: 'MAX_MALFORMED_ROUNDS',
+                help: 'How many broken tool-JSON replies get a correction before the harness gives up and returns an error.',
+            },
+            {
+                path: 'features.toolCompactor', label: 'Compact tool results', type: 'bool', env: 'TOOL_COMPACTOR',
+                help: 'Trims big tool results to head+tail before they go back to the model. Errors are never touched.',
+            },
+            {
+                path: 'compactor.maxText', label: 'Compactor text cap (chars)', type: 'number', env: 'COMPACTOR_MAX_TEXT',
+                help: 'A text field longer than this is truncated to head + tail with a marker.',
+                advanced: true,
+            },
+            {
+                path: 'compactor.maxItems', label: 'Compactor item cap', type: 'number', env: 'COMPACTOR_MAX_ITEMS',
+                help: 'A result array longer than this keeps only head + tail items.',
+                advanced: true,
+            },
         ],
     },
     {
@@ -187,6 +222,23 @@ const SCHEMA = [
             {
                 path: 'features.allowPlainText', label: 'Accept plain text replies', type: 'bool', env: 'ALLOW_PLAIN_TEXT',
                 help: 'Off, every reply must be exactly one fenced tool call. On, prose is accepted as the final answer too.',
+            },
+            {
+                path: 'features.noTools', label: 'Research-only (no tools)', type: 'bool', env: 'NO_TOOLS',
+                help: 'Offers the model NO work tools — only submit_answer — so research and plain-English tasks answer directly. Pair with Accept plain text for a pure research lane.',
+            },
+            {
+                path: 'features.memory', label: 'Memory file', type: 'bool', env: 'MEMORY_ENABLED',
+                help: 'Keeps a memory file the model can read/edit (read_memory/edit_memory) and includes it in the system prompt.',
+            },
+            {
+                path: 'memory.maxChars', label: 'Memory size cap (chars)', type: 'number', env: 'MAX_MEMORY_CHARS',
+                help: 'The memory file is capped at this size — it rides into every request.',
+                advanced: true,
+            },
+            {
+                path: 'memory.contents', label: 'Memory contents', type: 'longtext', fileBacked: true,
+                help: 'The memory file itself — edit here, or let the model edit it with edit_memory.',
             },
             {
                 path: 'features.ignoreClientSystem', label: 'Ignore caller system prompt', type: 'bool', env: 'IGNORE_CLIENT_SYSTEM',
@@ -243,6 +295,7 @@ const SCHEMA = [
                 help: 'Regex proving a new chat got a real thread, e.g. /app/[0-9a-f]{6,} for Gemini.',
             },
             { path: 'paths.cookieFile', label: 'Cookie file', type: 'string', env: 'COOKIE_FILE', advanced: true },
+            { path: 'paths.memoryFile', label: 'Memory file path', type: 'string', env: 'MEMORY_FILE', advanced: true, help: 'Where the persistent memory file lives.' },
         ],
     },
 ];
@@ -411,6 +464,13 @@ function coerce(setting, value) {
 // it, and change nothing — on this install WEBCHAT_MODE=gemini sits in .env
 // doing exactly that.
 function resolve(setting, raw, env = process.env, dotenv = {}) {
+    // File-backed settings (memory.contents) read the real file, not config JSON.
+    if (setting.fileBacked) {
+        const file = memoryMod ? memoryMod.memoryFile() : '';
+        let value = '';
+        try { value = fs.readFileSync(file, 'utf-8'); } catch { /* empty memory */ }
+        return { value, source: 'memory', memoryFile: file };
+    }
     const fromProcess = setting.env ? env[setting.env] : undefined;
     const fromDotenv = setting.env ? dotenv[setting.env] : undefined;
     const envVal = (fromProcess !== undefined && fromProcess !== '') ? fromProcess

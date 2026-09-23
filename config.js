@@ -69,6 +69,12 @@ const cfg = {
     // instead of demanding fenced tool JSON — for personal threads whose model
     // talks like a friend. Tool calls still work when the model makes them.
     allowPlainText: MC.pickBool('ALLOW_PLAIN_TEXT', 'features', 'allowPlainText') === true,
+    // 09-22 A2: research-only / no-tools mode. When true the model is offered NO
+    // work tools — only submit_answer — so it answers research / plain-English
+    // implementation tasks in prose without touching files. This is the user's
+    // stated fallback ("DeepSeek provides research and plain-English
+    // implementation tasks for another agent").
+    noTools: MC.pickBool('NO_TOOLS', 'features', 'noTools') === true,
     // 09-12 (owner): the "send a 💬 line before every work tool call" rule is a
     // legacy harness feature for when the owner drives a chat himself. Off by
     // default for autonomous runs; set NARRATION=true to get it back.
@@ -165,6 +171,66 @@ const cfg = {
     // Cool that account and answer 429 + Retry-After instead of retrying into
     // the throttle. See rate_limit.js.
     rateLimitCooldownSeconds: MC.pickNum('RATE_LIMIT_COOLDOWN_S', 'features', 'rateLimitCooldownSeconds') || 900,
+
+    // ── 09-22 (owner): native web search + deepthink toggles per webchat ────
+    // DeepSeek and Gemini have NATIVE search in their own UI, so the harness
+    // must not fake a search for them — it flips the lane's own controls ON
+    // before a send. deepThink/search come from the mode's `native` block
+    // (webchatModes.<mode>.native) and fall back to webchat.native; the search
+    // capability is CONFIGURABLE ON/OFF per mode. See browser.js ensureToggles.
+    native: (MODE.native && typeof MODE.native === 'object') ? MODE.native
+        : ((MC.raw.webchat && MC.raw.webchat.native && typeof MC.raw.webchat.native === 'object')
+            ? MC.raw.webchat.native : {}),
+    // DeepThink defaults ON (the harness has always forced it); native search
+    // defaults OFF (turning it on changes what the lane does, so it is opt-in).
+    nativeDeepThink: ((MODE.native || {}).deepThink !== undefined)
+        ? MODE.native.deepThink === true
+        : ((((MC.raw.webchat || {}).native || {}).deepThink !== undefined)
+            ? MC.raw.webchat.native.deepThink === true
+            : true),
+    nativeSearch: ((MODE.native || {}).search !== undefined)
+        ? MODE.native.search === true
+        : ((((MC.raw.webchat || {}).native || {}).search !== undefined)
+            ? MC.raw.webchat.native.search === true
+            : false),
+    // search_web availability: the paid key, OR a lane whose native search is on.
+    // search_web is never advertised when neither holds (A1: never offer a tool
+    // whose requirement is unmet).
+    webSearchAvailable: !!process.env.DEEPSEEK_API_KEY
+        || ((MODE.native || {}).search === true)
+        || (((MC.raw.webchat || {}).native || {}).search === true),
+
+    // ── 09-22 (owner): pick the model INSIDE the webchat from the CLI ───────
+    // Records the model; browser.js sets it in the tab's own picker before a
+    // send (the control is per-mode — gemini's is button[aria-label^="Open mode
+    // picker"], discovered live 09-22).
+    webchatModel: MC.pickStr('WEBCHAT_MODEL', 'webchat', 'model') || MODE.model || '',
+
+    // ── 09-22 (owner): tool-result compaction as a config option ────────────
+    // Ports the owner's tool-call-compactor rules (never touch errors, head+tail
+    // truncation). See compactor.js. Off by default.
+    toolCompactor: MC.pickBool('TOOL_COMPACTOR', 'features', 'toolCompactor') === true,
+    compactor: {
+        maxText: MC.pickNum('COMPACTOR_MAX_TEXT', 'compactor', 'maxText') || 10000,
+        maxItems: MC.pickNum('COMPACTOR_MAX_ITEMS', 'compactor', 'maxItems') || 10,
+        headItems: MC.pickNum('COMPACTOR_HEAD_ITEMS', 'compactor', 'headItems') || 3,
+        tailItems: MC.pickNum('COMPACTOR_TAIL_ITEMS', 'compactor', 'tailItems') || 2,
+    },
+
+    // ── 09-22 (owner): a memory file the user OR the agent can edit ─────────
+    // Included in the system prompt (so it is in effect) and editable through the
+    // read_memory / edit_memory tools. Bounded — it rides into every request.
+    memoryEnabled: MC.pickBool('MEMORY_ENABLED', 'features', 'memory') === true,
+    memoryMaxChars: MC.pickNum('MAX_MEMORY_CHARS', 'memory', 'maxChars') || 20000,
+
+    // ── 09-22 (owner): attach ANY MCP server ────────────────────────────────
+    // Raw section, read directly: mcp.servers = [{ name, command, args, url }].
+    // Discovered lazily (see mcp.js) and merged into the executable tool set.
+    mcpServers: (MC.raw.mcp && Array.isArray(MC.raw.mcp.servers)) ? MC.raw.mcp.servers : [],
+
+    // ── 09-22 (owner): more control over the tool-call loops ────────────────
+    // malformed-tool-JSON correction rounds (was hardcoded at 3).
+    maxMalformedRounds: MC.pickNum('MAX_MALFORMED_ROUNDS', 'limits', 'maxMalformedRounds') || 3,
 
     // Session persistence
     cookieFile: MC.pickStr('COOKIE_FILE', 'paths', 'cookieFile') || '.cookies.json',

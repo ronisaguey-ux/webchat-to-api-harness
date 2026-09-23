@@ -18,7 +18,14 @@ const {
     buildFullPrompt, openNewChat, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
     resetTeeForHandoff, takeThreadSwap, browserAlive, markShuttingDown,
 } = require('./browser');
-const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
+const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
+const { McpPool } = require('./mcp');
+const compactor = require('./compactor');
+const memory = require('./memory');
+
+// 09-22 (owner): attach ANY MCP server. The pool owns discovery and routing; it is
+// created from config here and discovered lazily at the first request (fail-open).
+const mcpPool = new McpPool(config.mcpServers);
 
 // ── Main-reply injection (08-14, user) ───────────────────────────────────
 // The webchat can message MAIN via the send_message_to_main tool. MAIN
@@ -593,7 +600,10 @@ const UPSTREAM_OPENAI = {
 
 function isWebchatModel(body) {
     const m = body && typeof body.model === 'string' ? body.model : config.modelName;
-    return m === config.modelName || m === 'anymodel';
+    // 09-22 A3: 'anymodel' and 'webchat' are the Codex-friendly aliases (no slash
+    // — Codex rejects provider/model syntax it does not know). All three route to
+    // the tab.
+    return m === config.modelName || m === 'anymodel' || m === 'webchat';
 }
 
 // 08-13 MULTI-MODEL ROUTER: Claude Code sends every /model pick to the SAME
@@ -813,10 +823,61 @@ function buildExecutableToolDefs() {
     // list_dir / write_file / submit_answer for 13+ rounds. Keep the set to the two
     // read-only tools, and bound the loop at the call site below.
     if (config.passthroughFormat) {
-        return getToolDefinitions().filter(
+        return getExecutableToolDefinitions().filter(
             (t) => t.name === 'read_file' || t.name === 'see_next_chunk');
     }
-    return [...getToolDefinitions(), SUBMIT_TOOL_DEF];
+    // 09-22 A2: research-only / no-tools. The model is offered NO work tools, only
+    // submit_answer, so a research or plain-English task answers directly instead of
+    // being driven through file tools it does not need.
+    if (config.noTools) {
+        return [SUBMIT_TOOL_DEF];
+    }
+    // 09-22 A1: advertise the EXECUTABLE set, not the full catalogue. A tool whose
+    // requirement is unmet (search_web without a key or native search, run_bash with
+    // the gate off, …) is dropped here so the model can never try it and loop.
+    // External MCP tools (mcp.js) are merged in, already fail-open filtered.
+    return [...getExecutableToolDefinitions(), ...externalToolDefs(), SUBMIT_TOOL_DEF];
+}
+
+// The external MCP tool schemas, discovered once at first request. Kept separate
+// so the synchronous TOOL_SECTION_TOKENS estimate below does not need them.
+let externalDefs = [];
+let mcpDiscovered = false;
+function externalToolDefs() {
+    return externalDefs.map((d) => ({ ...d }));
+}
+
+async function ensureMcpDiscovered() {
+    if (mcpDiscovered) return;
+    mcpDiscovered = true;
+    if (!mcpPool || !mcpPool.configured) return;
+    try {
+        await mcpPool.discover();
+        externalDefs = mcpPool.externalDefinitions();
+    } catch (e) {
+        console.log('⚠️ MCP discovery failed:', String(e.message).slice(0, 100));
+        externalDefs = [];
+    }
+}
+
+// Route a tool call to the right executor: an external MCP tool goes to the pool,
+// everything else to the harness's own tools.js. Both fail soft (a bad call
+// returns {success:false,...}, never throws out of the loop).
+async function runTool(name, args, ctx) {
+    if (mcpPool && mcpPool.has(name)) {
+        return mcpPool.execute(name, args);
+    }
+    return executeTool(name, args, ctx);
+}
+
+// 09-22 B3: compact a tool result for the MODEL-facing receipt (the tab follow-up
+// that becomes the model's next prompt). Errors pass through untouched, always —
+// a truncated stack trace is a wrong answer (the compactor's rule 1).
+function maybeCompactResult(call, result) {
+    if (!config.toolCompactor) return result;
+    const { result: compacted, compacted: did } = compactor.compactResult(result, config.compactor);
+    if (did) console.log(`🗜️ compacted ${call.toolName} result (maxText ${config.compactor.maxText})`);
+    return compacted;
 }
 
 // DeepSeek's web render prepends its reasoning ("Thought for N seconds") to
@@ -937,8 +998,12 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     // "Task completed successfully." and why the engine's steps never landed.
     // A caller that defines its own contract gets its own contract, verbatim.
     let prompt;
+    // 09-22 B4: the persistent memory file rides into the prompt so what the user
+    // or the model wrote is actually in effect. Bounded by memory.js.
+    const memoryBlock = config.memoryEnabled ? memory.memoryBlock() : '';
     if (config.passthroughFormat) {
         prompt = systemText ? `${systemText}\n\n${userPrompt}` : userPrompt;
+        if (memoryBlock) prompt = `${memoryBlock}\n${prompt}`;
         // 09-16 (owner): "their supposed to have a next chunk tool call." Offering the
         // tools in buildExecutableToolDefs() is NOT enough - the passthrough prompt is
         // just system+user, with no tool preamble, so the model does not know they
@@ -961,6 +1026,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     } else {
         const preamble = config.allowPlainText ? CONV_PREAMBLE : WEBCHAT_PREAMBLE;
         prompt = `### SYSTEM INSTRUCTION\n${preamble}\n\n`;
+        if (memoryBlock) prompt += `${memoryBlock}\n`;
         if (systemText) prompt += `${systemText}\n\n`;
         prompt += `### USER MESSAGE\n${userPrompt}\n\n`;
         prompt += config.allowPlainText ? CONV_FORMAT : WEBCHAT_FORMAT;
@@ -1061,7 +1127,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             } catch { /* fall through with the original args */ }
             let _res;
             try {
-                _res = await executeTool(_fetch.toolName, _args, { threadId: config.webchatUrl || null });
+                _res = await runTool(_fetch.toolName, _args, { threadId: config.webchatUrl || null });
             } catch (e) {
                 console.log(`⚠️ passthrough fetch (${_fetch.toolName}) failed: ${String(e).slice(0, 120)}`);
                 return _text;
@@ -1256,7 +1322,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 if (text) onProgress?.({ type: 'text', text });
                 result = { success: true, delivered: true, instruction: 'Message delivered to user. Now proceed with your work tool call (read_file, run_bash, etc.) or deliver final answer via submit_answer.' };
             } else {
-                result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
+                result = await runTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
             }
             // 08-16 (user): stream a readable receipt to the client — the exact
             // command / file / output, not a bare "🔧 toolname" — so anyone
@@ -1288,7 +1354,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             // double the message and re-wedge the tab. send_message needs no
             // receipt: its text was already delivered to the client above.
             const followUp =
-                (call.toolName === 'send_message' ? '' : formatToolResultView(call, result, 150000) + '\n\n') +
+                (call.toolName === 'send_message' ? '' : formatToolResultView(call, maybeCompactResult(call, result), 150000) + '\n\n') +
                 (config.allowPlainText
                     ? 'Task is NOT complete until every part is done AND verified. Send ONE 💬 line, then your ' +
                       'next fenced tool call. Verify with run_bash (syntax checks, imports, the project tests); ' +
@@ -1317,7 +1383,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
         // exactly this shape) — treating it as a broken tool call made the
         // gateway re-send a correction up to maxToolRounds times and never
         // return, so every engine step burned its full timeout on this lane.
-        if (!config.allowPlainText && looksLikeBrokenToolJson(response) && malformedRounds < 3) {
+        if (!config.allowPlainText && looksLikeBrokenToolJson(response) && malformedRounds < config.maxMalformedRounds) {
             malformedRounds++;
             console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent`);
             onProgress?.({ type: 'rejected', text: 'malformed tool JSON — correction sent' });
@@ -1524,7 +1590,7 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
                 const call = parsed.toolCalls[0];
                 if (call.toolName === SUBMIT_TOOL) break;
                 onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
-                const result = await executeTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
+                const result = await runTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
                 const p = String(call.args?.path || '');
                 if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
                 response = await countedSend(
@@ -1739,6 +1805,11 @@ app.get('/status', async (req, res) => {
         connected,
         webchatUrl: config.webchatUrl,
         tools: getToolDefinitions().length,
+        executableTools: buildExecutableToolDefs().map((t) => t.name),
+        responseFormat: {
+            allowPlainText: config.allowPlainText,
+            noTools: config.noTools,
+        },
         contextHandoff: {
             enabled: config.contextHandoffEnabled,
             threshold: config.contextHandoffThreshold,
@@ -1870,6 +1941,8 @@ app.get('/', (req, res) => {
             'The browser opens minimised on purpose. To sign in, run: ./launch-agent.sh any',
             'Point any coding agent here with: ./launch-agent.sh <opencode|claude|codex|aider|hermes>',
             'A model sent to /v1/chat/completions must equal the `model` above.',
+            'Codex: set model_provider to this base URL and model to "anymodel" or "webchat" (no slash — see /v1/models).',
+            `Response format: allowPlainText=${config.allowPlainText} noTools=${config.noTools}`,
         ],
     };
     if (wantsJson) return res.json(info);
@@ -1903,10 +1976,20 @@ app.get('/v1/models', (req, res) => {
         { id: 'claude/kimi webchat', display_name: 'Kimi Webchat' },
         { id: 'claude/omniroute', display_name: 'OmniRoute' },
     ];
+    // 09-22 A3: Codex's orchestration checker rejects slash syntax like
+    // "webchat-local/anymodel" (it reads provider/model and knows neither). Codex
+    // wants a PLAIN model id paired with a `model_provider` block pointing at this
+    // base URL. `anymodel` and `webchat` are the Codex-friendly aliases — send one
+    // of them as `model` and it routes to the webchat (isWebchatModel accepts both).
+    const codexRows = [
+        { id: 'anymodel', display_name: 'Webchat (Codex alias — routes to the tab)' },
+        { id: 'webchat', display_name: 'Webchat (Codex alias)' },
+    ];
     res.json({
         object: 'list',
         data: [
             ...gatewayRows.map((r) => ({ ...r, object: 'model', owned_by: 'webchat-api' })),
+            ...codexRows.map((r) => ({ ...r, object: 'model', owned_by: 'webchat-api' })),
             { id: config.modelName, object: 'model', owned_by: 'webchat-api' },
             { id: 'deepseek-v4-flash', object: 'model', owned_by: 'upstream-proxy' },
         ],
@@ -1983,6 +2066,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         // for one: role delta, the content, then [DONE].
         const wantsStream = !!(req.body && req.body.stream === true);
 
+        await ensureMcpDiscovered();
         const toolDefs = buildExecutableToolDefs();
 
         const text = await enqueue(() =>
@@ -2166,6 +2250,7 @@ app.post('/v1/messages', async (req, res) => {
                   .join('\n')
             : userMessage?.content || '';
 
+        await ensureMcpDiscovered();
         const toolDefs = buildExecutableToolDefs();
 
         const modelName = model || config.modelName;
