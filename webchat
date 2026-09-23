@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Repo-local launcher: `./webchat` works from a fresh clone with no install step.
+# The real entry point is bin/webchat.js; this only finds node.
+set -euo pipefail
+cd "$(dirname "$0")"
+exec node bin/webchat.js "$@"
