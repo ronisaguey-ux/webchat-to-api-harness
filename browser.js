@@ -303,7 +303,7 @@ async function _initBrowserInner({ reconnect = false } = {}) {
     // Owner rule: the browser must never appear on screen. The launch branch only —
     // attaching to an already-running browser is not ours to move.
     keepWindowHidden();
-    page = await browser.newPage();
+    page = await safeNewPage();
     await page.setUserAgent(
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
@@ -433,6 +433,75 @@ async function probeRendererAlive(timeoutMs = RENDERER_PROBE_MS) {
 }
 
 /**
+ * Bound any puppeteer call so a dead renderer becomes a FAST failure.
+ *
+ * The observed shape (2026-09-23) is
+ *   `ProtocolError: Network.enable timed out. Increase the 'protocolTimeout' setting`
+ * thrown from CdpPage._create -> FrameManager.initialize -> NetworkManager.addClient:
+ * attaching to a target whose renderer is gone blocks for the full 240s
+ * protocolTimeout. Every unbounded newPage()/attach in this file was therefore a
+ * FOUR-MINUTE stall during which nothing could throw, so no recovery ever ran.
+ * Same lesson as boundPoll in the send loop — a recovery path keyed on failure is
+ * useless if the call never gets to fail.
+ */
+async function withDeadline(promise, ms, label) {
+    let t;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, rej) => {
+                t = setTimeout(() => {
+                    const e = new Error(`${label} exceeded ${ms}ms — renderer unresponsive?`);
+                    e.timedOut = true;
+                    rej(e);
+                }, ms);
+            }),
+        ]);
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+// Generous compared with the 8s liveness probe: creating a page on a HEALTHY
+// browser is fast, but a cold target attach can legitimately take a few seconds.
+const PAGE_ACQUIRE_MS = Math.max(5000, parseInt(process.env.PAGE_ACQUIRE_MS || '25000', 10));
+
+/**
+ * Does THIS page answer? Bounded, and usable on any page — not just the cached one.
+ *
+ * `page.url()` is served from cached target metadata, so it happily returns a URL
+ * for a renderer that is dead. Selection therefore cannot tell a live tab from a
+ * corpse by URL alone, which is how a dead tab kept getting re-acquired.
+ */
+async function probePageAlive(p, timeoutMs = RENDERER_PROBE_MS) {
+    if (!p) return false;
+    try {
+        if (typeof p.isClosed === 'function' && p.isClosed()) return false;
+        return (await withDeadline(p.evaluate(() => 1 + 1), timeoutMs, 'page liveness probe')) === 2;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Open a new page with a deadline, dropping dead targets if the first attach hangs.
+ *
+ * The retry is only worth making AFTER the corpses are gone: a hung attach leaves
+ * the browser in a state where the next attach hangs the same way.
+ */
+async function safeNewPage() {
+    if (!browser) throw new Error('cannot open a page: no browser');
+    try {
+        return await withDeadline(browser.newPage(), PAGE_ACQUIRE_MS, 'browser.newPage()');
+    } catch (e) {
+        if (!e.timedOut) throw e;
+        console.log(`⚠️  newPage timed out (${e.message}) — dropping dead webchat targets, retrying once`);
+        await closeDeadWebchatTargets().catch(() => {});
+        return await withDeadline(browser.newPage(), PAGE_ACQUIRE_MS, 'browser.newPage() retry');
+    }
+}
+
+/**
  * Close every webchat page target, so the NEXT page acquisition cannot re-acquire
  * the corpse.
  *
@@ -450,7 +519,9 @@ async function closeDeadWebchatTargets() {
     try {
         const pages = await browser.pages();
         via = pages.find((p) => p !== page && !(typeof p.isClosed === 'function' && p.isClosed())) || null;
-        if (!via) via = await browser.newPage();
+        // Bounded: this runs INSIDE the recovery path, so an unbounded attach here
+        // would hang the very code that exists to break a hang.
+        if (!via) via = await withDeadline(browser.newPage(), PAGE_ACQUIRE_MS, 'recovery newPage()');
     } catch (_) {
         return 0;
     }
@@ -552,7 +623,7 @@ async function connectToWebchatOnce(webchatUrl) {
         if (!browser) throw new Error('No browser and no page — cannot connect to webchat');
         const existing = await browser.pages();
         page = existing.find((p) => p.url().startsWith(new URL(webchatUrl).origin)) || existing[0] || null;
-        if (!page) page = await browser.newPage();
+        if (!page) page = await safeNewPage();
         console.log(`📄 Acquired page after init (${page.url()})`);
     }
 
@@ -601,7 +672,7 @@ async function connectToWebchatOnce(webchatUrl) {
                     console.log(`⚠️  no tab with id ${config.tabId} — reusing ${page.url()}`);
                 } else {
                     console.log(`🆕 No tab for ${webchatUrl} — opening one`);
-                    page = await browser.newPage();
+                    page = await safeNewPage();
                     await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
                 }
             }
@@ -609,7 +680,7 @@ async function connectToWebchatOnce(webchatUrl) {
             page = pages.find((p) => p.url().includes(config.tabUrlSubstring));
             if (!page) {
                 console.log(`🆕 No tab matching ${config.tabUrlSubstring} — opening one`);
-                page = await browser.newPage();
+                page = await safeNewPage();
                 await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
             }
         } else {
@@ -622,11 +693,30 @@ async function connectToWebchatOnce(webchatUrl) {
                         !p.url().startsWith('devtools://')
                 );
             if (!page) {
-                page = await browser.newPage();
+                page = await safeNewPage();
                 await page.goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
             }
         }
         console.log(`🟢 Reusing tab: ${page.url()}`);
+        // ── PROBE THE SELECTED TAB (2026-09-23) ─────────────────────────────
+        // `page.url()` comes from cached target metadata, so a tab whose renderer
+        // is DEAD still reports a perfectly good URL. Selection prefers an origin
+        // match, so that corpse is chosen again on every connect and every later
+        // call hangs — measured as `ProtocolError: Network.enable timed out` out of
+        // CdpPage._create, i.e. a 240s stall that never threw and so never recovered.
+        //
+        // One bounded probe here is cheap and decisive: it converts "attach to a
+        // corpse and hang" into "notice, replace the tab, carry on".
+        if (!(await probePageAlive(page))) {
+            console.log('💀 selected tab does not answer (dead renderer) — replacing it');
+            await closeDeadWebchatTargets().catch(() => {});
+            page = null;
+            page = await safeNewPage();
+            await page
+                .goto(webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
+                .catch(() => { /* the caller's own waits will surface a real problem */ });
+            console.log(`🆕 Replaced with a fresh tab: ${page.url()}`);
+        }
         // 08-13 VIEWPORT PIN (GUI-browser fix): on WM-less X sessions Chrome
         // renderers can freeze at the launch-time size — observed: every 9223
         // tab stuck at Chrome's default 800x600 while the X window was
@@ -3072,7 +3162,7 @@ async function resolveTargetPage() {
         const found = pages.find((p) => !p.isClosed() && match(p));
         if (found) { page = found; return page; }
         // No matching tab: open one rather than failing the whole reset.
-        const fresh = await browser.newPage();
+        const fresh = await safeNewPage();
         await fresh.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
             .catch(() => { /* the caller's own waits will surface a real problem */ });
         page = fresh;
@@ -3201,7 +3291,7 @@ async function openNewChat() {
             }
         } catch { /* pruning is best-effort, never block the attach */ }
         if (!page) {
-            page = await browser.newPage();
+            page = await safeNewPage();
             await page.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
     }
