@@ -385,16 +385,139 @@ function isStaleHandleError(e) {
     return STALE_HANDLE_RE.test(String(e && e.message ? e.message : e));
 }
 
+// ── DEAD RENDERER (measured 2026-09-23) ─────────────────────────────────────
+// A Chromium renderer can die while the BROWSER stays perfectly healthy: the
+// tab stops answering CDP entirely, and the failure surfaces as
+//   "Runtime.callFunctionOn timed out. Increase the 'protocolTimeout' setting..."
+//
+// Note that is NOT the same string as the `Protocol error (Runtime.callFunctionOn)`
+// in STALE_HANDLE_RE, so it never matched, recovery never fired, and a send sat
+// on a corpse until the 900s idle deadline. Measured: `1+1` via CDP returned
+// nothing in 20s while /json/version and Target.getTargets both answered
+// instantly, every chrome process idled at 0.0% CPU, and Target.closeTarget +
+// Target.createTarget from a sibling page recovered a responsive tab in 8ms.
+//
+// A dead renderer is indistinguishable from a slow one by message alone, so
+// this only NAMES the suspect; the decision needs a liveness probe (below).
+const RENDERER_TIMEOUT_RE = /callFunctionOn timed out|timed out\. Increase the 'protocolTimeout'|Target closed|Session closed|Cannot find context|detached Frame|Execution context was destroyed/i;
+
+function isRendererTimeoutError(e) {
+    return RENDERER_TIMEOUT_RE.test(String(e && e.message ? e.message : e));
+}
+
+// How long a bare `1+1` gets before the renderer counts as dead, and how many
+// consecutive poll failures are tolerated first. A single failure is normal —
+// the page genuinely can cogitate for minutes — so the probe only runs once
+// polling has already failed repeatedly.
+const RENDERER_PROBE_MS = parseInt(process.env.RENDERER_PROBE_MS || '8000', 10);
+const RENDERER_DEAD_AFTER = parseInt(process.env.RENDERER_DEAD_AFTER || '3', 10);
+
+/**
+ * Is the renderer answering at all?
+ *
+ * Raced against a SHORT deadline on purpose: the point is to catch a corpse, and
+ * `page.evaluate` on a dead renderer otherwise blocks for the full 240s
+ * protocolTimeout — which is the stall this exists to avoid.
+ */
+async function probeRendererAlive(timeoutMs = RENDERER_PROBE_MS) {
+    if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return false;
+    try {
+        const r = await Promise.race([
+            page.evaluate(() => 1 + 1),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('renderer probe timeout')), timeoutMs)),
+        ]);
+        return r === 2;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Close every webchat page target, so the NEXT page acquisition cannot re-acquire
+ * the corpse.
+ *
+ * This step is not optional. Page selection prefers an origin match, so leaving a
+ * dead tab in `browser.pages()` means the very next connect attaches straight
+ * back to it and the lane is wedged again — measured: a reload of the dead tab
+ * changed nothing, because a dead renderer never processes the navigation.
+ *
+ * `Target.closeTarget` is sent from a SIBLING page's session, because the dead
+ * page cannot service one. Returns the number of targets closed.
+ */
+async function closeDeadWebchatTargets() {
+    if (!browser) return 0;
+    let via = null;
+    try {
+        const pages = await browser.pages();
+        via = pages.find((p) => p !== page && !(typeof p.isClosed === 'function' && p.isClosed())) || null;
+        if (!via) via = await browser.newPage();
+    } catch (_) {
+        return 0;
+    }
+    let cdp;
+    try {
+        cdp = await via.createCDPSession();
+    } catch (_) {
+        return 0;
+    }
+    const host = (() => { try { return new URL(config.webchatUrl).host; } catch (_) { return 'chat.deepseek.com'; } })();
+    let closed = 0;
+    try {
+        const { targetInfos } = await cdp.send('Target.getTargets');
+        for (const t of targetInfos || []) {
+            if (t.type !== 'page') continue;
+            if (!String(t.url || '').includes(host)) continue;
+            try {
+                await cdp.send('Target.closeTarget', { targetId: t.targetId });
+                closed += 1;
+            } catch (_) { /* already gone */ }
+        }
+    } catch (_) {
+        // fall through — returning 0 still lets the caller null the handle
+    } finally {
+        try { await cdp.detach(); } catch (_) { /* detach is best-effort */ }
+    }
+    return closed;
+}
+
+/**
+ * Drop a dead renderer and leave the module in a state where the normal connect
+ * path builds a fresh page.
+ *
+ * Deliberately does NOT re-attach here: `sendPrompt` already calls
+ * `initBrowser({ reconnect: true })` then `connectToWebchat(...)`, and that path
+ * does the user-agent, asset-blocking and tee setup. Duplicating it would give
+ * two page-setup code paths that can drift.
+ */
+async function dropDeadRenderer(reason) {
+    console.log(`🧟 renderer unresponsive (${reason}) — closing the dead tab so the next connect builds a fresh page`);
+    const closed = await closeDeadWebchatTargets();
+    page = null;
+    console.log(`♻️  dead renderer cleared (${closed} target(s) closed)`);
+    return closed;
+}
+
+
 // Probe the cached page; on a dead handle, drop it and re-attach once.
 async function ensureLivePage() {
     if (!page) return;
     try {
         await page.evaluate(() => 1);
     } catch (e) {
-        if (!isStaleHandleError(e)) throw e;
-        console.log(`♻️  Stale page handle (${String(e.message).slice(0, 60)}) — re-attaching.`);
-        page = null;
-        await initBrowser({ reconnect: true });
+        if (isStaleHandleError(e)) {
+            console.log(`♻️  Stale page handle (${String(e.message).slice(0, 60)}) — re-attaching.`);
+            page = null;
+            await initBrowser({ reconnect: true });
+            return;
+        }
+        if (isRendererTimeoutError(e)) {
+            // A timeout is not a stale handle: the browser is fine, the renderer
+            // is not. It must be CLOSED, not just forgotten — page selection
+            // prefers an origin match and would otherwise re-acquire the corpse.
+            await dropDeadRenderer(String(e.message).slice(0, 60));
+            return;
+        }
+        throw e;
     }
 }
 
@@ -2347,6 +2470,7 @@ async function waitForResponse(before, typedText) {
             // otherwise (page busy / evaluate race) fall through to the DOM poll
         }
         let state;
+        let _pollFailures = 0;
         try {
             state = await snapshotChat(before);
         } catch (e) {
@@ -2361,7 +2485,36 @@ async function waitForResponse(before, typedText) {
             // Page busy (long cogitation / heavy render) — an evaluate can throw
             // ProtocolError mid-thought. That means "still generating", not failure:
             // keep polling until the deadline.
-            console.log('⏳ poll evaluate failed (page busy?), retrying:', String(e.message).slice(0, 70));
+            //
+            // 09-23: but a DEAD RENDERER throws the same shape and used to get the
+            // same treatment, so a corpse was polled until the 900s idle deadline
+            // while every chrome process idled at 0.0% CPU. A single failure is
+            // still normal; repeated ones are not, so after RENDERER_DEAD_AFTER
+            // consecutive failures a bare `1+1` decides which one this is.
+            _pollFailures += 1;
+            const _msg = String(e.message).slice(0, 70);
+            if (_pollFailures >= RENDERER_DEAD_AFTER) {
+                const alive = await probeRendererAlive();
+                if (!alive) {
+                    await dropDeadRenderer(`no renderer response after ${_pollFailures} poll failures: ${_msg}`);
+                    // Retryable: the next attempt runs the normal connect path, which
+                    // builds a fresh page. Tagged rather than thrown bare so the send
+                    // retry in server.js actually fires (it keys on e.retryable).
+                    const err = new Error(
+                        'Webchat renderer died mid-generation (tab unresponsive; it has been closed so the retry gets a fresh page) — please resend'
+                    );
+                    err.retryable = true;
+                    err.rendererDead = true;
+                    throw err;
+                }
+                console.log(`⏳ ${_pollFailures} poll failures but the renderer answers — still generating, continuing`);
+                // A renderer that ANSWERS is alive, even if the page is too busy to
+                // render a row. Stamp the progress clock or the outer idle deadline
+                // counts this as no-progress and kills a working send.
+                markProgress();
+                _pollFailures = 0;
+            }
+            console.log('⏳ poll evaluate failed (page busy?), retrying:', _msg);
             await sleep(1500);
             continue;
         }
@@ -3225,6 +3378,12 @@ module.exports = {
     // out), so it can be exercised without a browser — which is what would have
     // caught the phantom-stop short-circuit.
     busyProbe,
+    // Dead-renderer handling, exported so the classifier is testable without a
+    // browser — the whole bug was a message that matched nothing, and a test on
+    // the real failure string is what keeps it matched.
+    isRendererTimeoutError,
+    probeRendererAlive,
+    dropDeadRenderer,
     buildFullPrompt,
     openNewChat,
     sendFirstMessage,
