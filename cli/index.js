@@ -1546,6 +1546,25 @@ async function cmdConnect(argv) {
         }
     }
 
+    // ── one url in front of every selected webchat ──────────────────────────
+    // Each webchat needs its own browser, so each keeps its own gateway. The hub turns
+    // those sub urls back into ONE url for the user: /v1/models lists every webchat and
+    // every toggle combination, and each request is forwarded to the gateway that owns
+    // it. With a single webchat there is nothing to route, so it is only started when
+    // it would actually help.
+    let hubPort = 0;
+    if (!dryRun && chosen.length > 1) {
+        const pair = await G.freePortPair();
+        const res = D.startHub({ port: pair.gatewayPort });
+        if (res.started) {
+            hubPort = pair.gatewayPort;
+            A.line(`  ${A.green('✓')} hub        one url for all ${chosen.length} webchats on http://${host}:${hubPort}/v1`);
+        } else {
+            A.line(`  ${A.yellow('·')} hub        not started (${res.reason || 'unknown'}) — falling back to the first webchat`);
+        }
+    }
+    if (hubPort) env = H.envFor(chosen, { modelName: env.HARNESS_MODEL_NAME, hubPort });
+
     // ── what each harness needs on disk ─────────────────────────────────────
     const launches = [];
     for (const hid of cfg.harnesses) {
@@ -1579,7 +1598,7 @@ async function cmdConnect(argv) {
 
     // Only worth saying when it would otherwise surprise someone: with one gate there
     // is nothing to explain, and `reason` is deliberately null.
-    const reach = H.reachability(launches[0].h, chosen);
+    const reach = H.reachability(launches[0].h, chosen, hubPort);
     if (reach.reason) {
         A.line(`  ${A.dim(reach.reason)}`);
         A.line('');
