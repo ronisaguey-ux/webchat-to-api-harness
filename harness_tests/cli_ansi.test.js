@@ -75,19 +75,40 @@ test('boxLines renders an untitled box', () => {
     assert.strictEqual(A.visibleWidth(lines[0]), 24);
 });
 
-test('termWidth is clamped to a sane range whatever the environment claims', () => {
-    const saved = { columns: process.stdout.columns, COLUMNS: process.env.COLUMNS };
+test('termWidth uses the whole terminal, with a small margin, and a configurable cap', () => {
+    const saved = { columns: process.stdout.columns, COLUMNS: process.env.COLUMNS, max: process.env.WEBCHAT_UI_MAX_WIDTH, margin: process.env.WEBCHAT_UI_MARGIN };
     try {
+        delete process.env.WEBCHAT_UI_MAX_WIDTH;
+        delete process.env.WEBCHAT_UI_MARGIN;
+
+        // Narrow terminals keep a floor so the layout cannot collapse.
         process.stdout.columns = 10;
         assert.strictEqual(A.termWidth(), 40, 'never narrower than 40');
+
+        // A wide terminal is USED. The old clamp of 140 left a narrow strip of box in
+        // the middle of an empty screen, which is the complaint this changed for.
         process.stdout.columns = 1000;
-        assert.strictEqual(A.termWidth(), 140, 'never wider than 140');
+        assert.strictEqual(A.termWidth(), 996, 'the default margin is 2 columns each side, not a 140 clamp');
+
+        // The cap still exists — as a setting, for someone who wants it.
+        process.env.WEBCHAT_UI_MAX_WIDTH = '140';
+        assert.strictEqual(A.termWidth(), 140, 'an explicit cap is honoured');
+
+        // And the margin is a setting too: 0 means truly full width.
+        delete process.env.WEBCHAT_UI_MAX_WIDTH;
+        process.env.WEBCHAT_UI_MARGIN = '0';
+        assert.strictEqual(A.termWidth(), 1000, 'margin 0 spans the whole terminal');
+
+        // COLUMNS is still read when the stream reports nothing.
+        delete process.env.WEBCHAT_UI_MARGIN;
         delete process.stdout.columns;
         process.env.COLUMNS = '72';
-        assert.strictEqual(A.termWidth(), 72);
+        assert.strictEqual(A.termWidth(), 68, '72 minus the default 2-column margin each side');
     } finally {
         if (saved.columns !== undefined) process.stdout.columns = saved.columns;
         if (saved.COLUMNS === undefined) delete process.env.COLUMNS; else process.env.COLUMNS = saved.COLUMNS;
+        if (saved.max === undefined) delete process.env.WEBCHAT_UI_MAX_WIDTH; else process.env.WEBCHAT_UI_MAX_WIDTH = saved.max;
+        if (saved.margin === undefined) delete process.env.WEBCHAT_UI_MARGIN; else process.env.WEBCHAT_UI_MARGIN = saved.margin;
     }
 });
 

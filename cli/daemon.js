@@ -295,6 +295,60 @@ function launchBrowser(opts = {}) {
 }
 
 // ── logs ───────────────────────────────────────────────────────────────────
+// Put text on the clipboard.
+//
+// Used by the problem-report screen, where "copy this" has to actually copy — a
+// screen that prints a block and tells the user to select it is not a copyable report.
+//
+// Tries the tools that exist on this box (xclip, xsel, wl-copy for Wayland) and
+// reports failure rather than pretending: the caller offers "save to a file" as the
+// fallback when this returns { ok: false }.
+function onPath(bin) {
+    for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+        if (!dir) continue;
+        try {
+            fs.accessSync(path.join(dir, bin), fs.constants.X_OK);
+            return true;
+        } catch { /* keep looking */ }
+    }
+    return false;
+}
+
+function copyToClipboard(text) {
+    const candidates = [
+        ['xclip', ['-selection', 'clipboard']],
+        ['xsel', ['--clipboard', '--input']],
+        ['wl-copy', []],
+    ];
+    for (const [bin, args] of candidates) {
+        if (!onPath(bin)) continue;
+        try {
+            // These tools DO NOT EXIT — they fork and hold the X selection so a paste
+            // has something to read. Waiting for them to finish therefore blocks until
+            // the timeout and then reports failure over a copy that actually worked
+            // (measured: the clipboard held the text while this returned ok:false).
+            //
+            // So: write the text, give it a moment, and treat "still running" as the
+            // expected outcome rather than an error. Only a hard spawn failure or an
+            // immediate non-zero exit counts as a real failure.
+            const child = spawn(bin, args, { detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+            let exitCode = null;
+            child.on('exit', (c) => { exitCode = c; });
+            child.stdin.end(String(text));
+            child.unref();
+            // Wait just long enough to catch "xclip: command not found"-style
+            // failures, which put nothing on the clipboard and exit immediately.
+            const deadline = Date.now() + 150;
+            while (Date.now() < deadline && exitCode === null) {
+                try { execFileSync('sleep', ['0.02'], { stdio: 'ignore' }); } catch { /* no sleep */ }
+            }
+            if (exitCode !== null && exitCode !== 0) continue;
+            return { ok: true, via: bin };
+        } catch { /* try the next one */ }
+    }
+    return { ok: false, reason: 'no clipboard tool found (tried xclip, xsel, wl-copy)' };
+}
+
 function tailLines(file, n = 60) {
     if (!fs.existsSync(file)) return [];
     const text = fs.readFileSync(file, 'utf-8');
@@ -332,7 +386,8 @@ module.exports = {
     httpGet, httpPost, probeGateway,
     gatewayRunning, startGateway, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
-    tailLines, restoreForExec,
+    tailLines,
+    copyToClipboard, restoreForExec,
     realDisplay, connectFile, readConnection, writeConnection, clearConnection,
 };
 

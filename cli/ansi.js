@@ -56,9 +56,35 @@ const bgBlue = (s) => sgr('44', s);
 const bgGray = (s) => sgr('100', s);
 
 // ── Geometry ───────────────────────────────────────────────────────────────
+// ── Sizing ─────────────────────────────────────────────────────────────────
+//
+// The UI takes the WHOLE terminal by default. It used to clamp at 140 columns,
+// which on a wide monitor left a narrow strip of box floating in empty space.
+//
+// Both bounds are settings read from the same place as everything else, and the
+// defaults are "use what you have". The small default margin exists because a
+// 300-column line is genuinely hard to read — it is a setting, not a cap.
+function uiOpts() {
+    const m = Number(process.env.WEBCHAT_UI_MARGIN);
+    return {
+        margin: Number.isFinite(m) && m >= 0 ? m : 2,
+        maxWidth: Number(process.env.WEBCHAT_UI_MAX_WIDTH) || 0,
+    };
+}
+
 function termWidth(fallback = 80) {
     const w = out.columns || Number(process.env.COLUMNS) || fallback;
-    return Math.max(40, Math.min(140, w));
+    const { margin, maxWidth } = uiOpts();
+    const usable = Math.max(40, w - margin * 2);
+    return maxWidth > 0 ? Math.min(maxWidth, usable) : usable;
+}
+function termHeight(fallback = 24) {
+    return Math.max(10, out.rows || Number(process.env.LINES) || fallback);
+}
+// How many body rows fit, so a screen fills the terminal instead of stopping a
+// third of the way down.
+function bodyRows(reserved = 6) {
+    return Math.max(6, termHeight() - reserved);
 }
 function termHeight(fallback = 24) {
     return Math.max(10, out.rows || Number(process.env.LINES) || fallback);

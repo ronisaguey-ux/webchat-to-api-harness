@@ -21,8 +21,27 @@ const fs = require('fs');
 const A = require('./ansi');
 const S = require('./settings');
 const D = require('./daemon');
+const G = require('./gates');
+const H = require('./harnesses');
+const LC = require('./launchconfig');
+const screensGates = require('./screens-gates');
 
 let SHOW_ADVANCED = false;
+
+// The gates/harnesses/launch screens live in their own file; this wires the shared
+// helpers they need. Built once, lazily, because `state`/`rowsOf` are declared below.
+let G_S = null;
+function gatesScreens() {
+    if (!G_S) {
+        G_S = screensGates.build({
+            A, D, G, H, LC,
+            header, shortHome, panel,
+            state, rowsOf,
+            saveSetting: (p, v) => S.saveSetting(p, v),
+        });
+    }
+    return G_S;
+}
 
 // ── Shared helpers ─────────────────────────────────────────────────────────
 function state() {
@@ -215,15 +234,21 @@ async function screenDashboard() {
         return out;
     }
 
-    const items = [
-        { label: 'Webchat & browser', hint: 'pick the site, launch it, log in, connect', value: 'site' },
-        { label: 'Start the harness', hint: 'bring the gateway up, then your IDE', value: 'start' },
-        { label: 'Gates & sandbox', hint: 'what the model may touch', value: 'gates' },
-        { label: 'All settings', hint: 'every setting, grouped, with its resolving source', value: 'settings' },
-        { label: 'Logs', hint: 'gateway output', value: 'logs' },
-        { label: 'Doctor', hint: 'check everything and report', value: 'doctor' },
-        { label: 'Quit', value: 'quit' },
-    ];
+      const gatesNow = G.read();
+      const cfg = LC.read();
+      const ready = LC.validate(cfg, gatesNow.gates);
+      const items = [
+          { label: 'Webchats', hint: `${gatesNow.gates.length} configured · ${gatesNow.gates.filter((g) => g.connected).length} connected`, value: 'webchats' },
+          { label: 'Agentic harness', hint: cfg.harnesses.length ? cfg.harnesses.join(', ') : 'choose which agent to run', value: 'harnesses' },
+          { label: 'Permission mode', hint: cfg.mode + (cfg.mode === 'yolo' ? ' — no gate at all' : ''), value: 'mode' },
+          { label: ready.ok ? 'Launch' : 'Launch (not ready yet)', hint: ready.ok ? LC.summarize(cfg) : ready.problems[0], value: 'plan' },
+          { label: 'Tools', hint: 'switch individual tools on or off', value: 'tools' },
+          { label: 'Config', hint: 'every setting, grouped, with the source it resolves from', value: 'settings' },
+          { label: 'Agent access (MCP)', hint: 'let any agent drive this harness', value: 'agentaccess' },
+          { label: 'Logs', hint: 'gateway output, with a one-click bug report', value: 'logs' },
+          { label: 'Doctor', hint: 'check everything and report', value: 'doctor' },
+          { label: 'Quit', value: 'quit' },
+      ];
 
     // Auto-refresh only while the menu is waiting. A tick re-renders the panel and
     // leaves the cursor exactly where the user left it.
@@ -906,11 +931,13 @@ async function screenLogs() {
         const which = await A.menu([
             { label: 'Gateway output', hint: shortHome(D.logFile('gateway')), value: 'gateway' },
             { label: 'Gateway errors', hint: shortHome(D.logFile('gateway.err')), value: 'gateway.err' },
+            { label: 'Report a problem', hint: 'copy the details, or open a pre-filled issue', value: 'report' },
             { label: 'Back', value: 'back' },
-        ], { title: 'Which log?' });
+        ], { title: 'Logs' });
         if (which === A.BACK || which === 'back') return;
+        if (which === 'report') { await screenReport(); continue; }
 
-        const lines = D.tailLines(D.logFile(which), 40);
+        const lines = D.tailLines(D.logFile(which), A.bodyRows(6));
         A.clear();
         header(['Logs', which]);
         if (!lines.length) {
@@ -923,9 +950,240 @@ async function screenLogs() {
             A.line(A.truncate(colour(l), A.termWidth() - 2));
         }
         A.newline();
-        A.line(A.gray('  r refresh · any other key returns'));
-        const key = await A.readKey();
-        if (key.name !== 'char' || key.char !== 'r') return;
+        const key = await A.menu([
+            { label: 'Refresh', value: 'r' },
+            { label: 'Report a problem', hint: 'with this log attached', value: 'report' },
+            { label: 'Back', value: 'back' },
+        ], { title: '' });
+        if (key === 'report') { await screenReport({ source: which }); continue; }
+        if (key !== 'r') return;
+    }
+}
+
+// ── Reporting a problem ────────────────────────────────────────────────────
+//
+// The owner asked for this to be easy: an error, a copyable report, and a link to
+// open an issue under their repo. So the screen does three things and none of them
+// require the user to assemble anything by hand:
+//
+//   1. it collects what a maintainer actually needs (versions, OS, which log, the
+//      last errors) into one block;
+//   2. it puts that block on the CLIPBOARD, because "copy this" that requires manual
+//      selection is not copyable;
+//   3. it opens a pre-filled GitHub issue, so the report arrives structured.
+//
+// It never includes a secret. The env is filtered to names, never values — a bug
+// report is the last place an API key should end up.
+function collectDiagnostics(extra = {}) {
+    const st = state();
+    const rows = rowsOf(st);
+    const gates = G.read();
+    const cfg = LC.read();
+    const sh = (c, a) => {
+        try {
+            return require('child_process').execFileSync(c, a, { encoding: 'utf-8', timeout: 3000 }).trim();
+        } catch { return null; }
+    };
+    // Only the NAMES of the environment variables the harness reads. Values are
+    // deliberately not included: several of them are credentials.
+    const harnessEnvNames = Object.keys(process.env)
+        .filter((k) => /^(WEBCHAT|HARNESS|CDP|PORT|HOST|MODEL|BASH|SEND_GAP|MIN_SEND)/.test(k))
+        .sort();
+
+    const logs = {};
+    for (const which of ['gateway', 'gateway.err']) {
+        const lines = D.tailLines(D.logFile(which), 60);
+        logs[which] = lines.filter((l) => /error|fail|❌|⛔|⚠|Traceback/i.test(l)).slice(-12);
+    }
+
+    return {
+        generatedAt: new Date().toISOString(),
+        harness: {
+            commit: sh('git', ['-C', path.join(__dirname, '..'), 'rev-parse', '--short', 'HEAD']),
+            branch: sh('git', ['-C', path.join(__dirname, '..'), 'rev-parse', '--abbrev-ref', 'HEAD']),
+        },
+        runtime: {
+            node: process.version,
+            platform: `${process.platform} ${process.arch}`,
+            release: (() => { try { return require('os').release(); } catch { return null; } })(),
+        },
+        webchats: gates.gates.map((g) => ({ id: g.id, site: g.site, connected: g.connected, cdpPort: g.cdpPort, gatewayPort: g.gatewayPort })),
+        launchConfig: cfg,
+        // Which settings are non-default, and where each value comes from — enough to
+        // reproduce without shipping the user's whole config.
+        settingsNonDefault: rows
+            .filter((r) => r.source !== 'default' && !/_comment|secret|key|token|password/i.test(r.setting.path))
+            .map((r) => ({ path: r.setting.path, source: r.source, shadowedBy: r.shadowedBy || null })),
+        envNamesSet: harnessEnvNames,
+        errors: logs,
+        source: extra.source || null,
+        note: extra.note || null,
+    };
+}
+
+function reportText(diag) {
+    return [
+        `webchat harness — problem report`,
+        `generated: ${diag.generatedAt}`,
+        ``,
+        `harness: ${diag.harness.branch || '?'} @ ${diag.harness.commit || '?'}`,
+        `runtime: node ${diag.runtime.node}, ${diag.runtime.platform}`,
+        ``,
+        `webchats: ${diag.webchats.length ? diag.webchats.map((g) => `${g.id}(${g.site}${g.connected ? ',connected' : ''})`).join(' ') : 'none'}`,
+        `launch:   ${diag.launchConfig.gates.join('+') || 'none'} -> ${diag.launchConfig.harnesses.join('+') || 'none'} [${diag.launchConfig.mode}]`,
+        ``,
+        `settings changed from default:`,
+        ...(diag.settingsNonDefault.length
+            ? diag.settingsNonDefault.map((s) => `  ${s.path}  (${s.source}${s.shadowedBy ? `, shadowed by ${s.shadowedBy}` : ''})`)
+            : ['  (none)']),
+        ``,
+        `environment variables set: ${diag.envNamesSet.join(', ') || '(none)'}`,
+        ``,
+        ...(diag.errors.gateway.length ? ['recent gateway output:', ...diag.errors.gateway.map((l) => '  ' + l)] : []),
+        ...(diag.errors['gateway.err'].length ? ['recent errors:', ...diag.errors['gateway.err'].map((l) => '  ' + l)] : []),
+        ``,
+        diag.note ? `what I was doing: ${diag.note}` : `what I was doing: (describe here)`,
+        ``,
+        `(no secrets are included — only setting names and sources)`,
+    ].join('\n');
+}
+
+function issueUrl(diag) {
+    const title = encodeURIComponent('[harness] ');
+    const body = encodeURIComponent(
+        '<!-- Describe what you expected and what happened. The block below is generated and contains no secrets. -->\n\n'
+        + reportText(diag),
+    );
+    // The canonical repo for this harness. A user with their own fork can change it.
+    const repo = process.env.WEBCHAT_ISSUE_REPO || 'ronisaguey-ux/webchat-to-api-harness';
+    return `https://github.com/${repo}/issues/new?title=${title}&body=${body}`;
+}
+
+async function screenReport(extra = {}) {
+    const diag = collectDiagnostics(extra);
+    const txt = reportText(diag);
+
+    A.clear();
+    header(['Report a problem']);
+    for (const l of A.boxLines('What will be sent', [
+        'A short technical summary — versions, which webchats exist, which',
+        'settings differ from their defaults, and the last errors.',
+        '',
+        A.green('No secrets: setting NAMES only, never their values.'),
+        '',
+        A.dim('Open the issue link and a browser tab opens with this pre-filled.'),
+        A.dim('Describe what you were doing there before you submit.'),
+    ])) A.line(l);
+    A.newline();
+    A.line(A.gray('  ─── the report ───'));
+    for (const l of txt.split('\n').slice(0, A.bodyRows(22))) {
+        A.line(A.truncate(A.gray('  ' + l), A.termWidth() - 2));
+    }
+    A.newline();
+
+    const choice = await A.menu([
+        { label: 'Copy to clipboard', hint: 'paste it anywhere', value: 'copy' },
+        { label: 'Open a pre-filled GitHub issue', hint: 'in your browser', value: 'open' },
+        { label: 'Save to a file', hint: shortHome('/tmp/webchat-report.txt'), value: 'save' },
+        { label: 'Back', value: 'back' },
+    ], { title: '' });
+
+    if (choice === 'copy') {
+        const res = D.copyToClipboard ? D.copyToClipboard(txt) : { ok: false, reason: 'no clipboard helper' };
+        await A.message(res.ok ? 'Copied' : 'Could not copy', [
+            res.ok ? 'The report is on your clipboard — paste it into the issue.' : A.red(res.reason || 'clipboard unavailable'),
+            A.dim('Use "Save to a file" instead if the clipboard is not available.'),
+        ]);
+        return screenReport(extra);
+    }
+    if (choice === 'save') {
+        const file = '/tmp/webchat-report.txt';
+        try {
+            fs.writeFileSync(file, txt, { mode: 0o600 });
+            await A.message('Saved', [shortHome(file)]);
+        } catch (e) {
+            await A.message('Could not save', [A.red(e.message)]);
+        }
+        return screenReport(extra);
+    }
+    if (choice === 'open') {
+        const url = issueUrl(diag);
+        try {
+            require('child_process').spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+            await A.message('Opened in your browser', [
+                'A GitHub issue is pre-filled with the report above.',
+                A.dim('Add what you were doing, then submit.'),
+            ]);
+        } catch (e) {
+            A.clear();
+            header(['Report a problem']);
+            A.line('  Could not open a browser. Copy this link instead:');
+            A.newline();
+            A.line('  ' + A.cyan(url.slice(0, A.termWidth() - 4)));
+            if (url.length > A.termWidth() - 4) A.line('  ' + A.cyan(url.slice(A.termWidth() - 4)));
+            A.newline();
+            await A.readKey();
+        }
+        return screenReport(extra);
+    }
+}
+
+// ── Agent access (MCP) ─────────────────────────────────────────────────────
+//
+// The harness is reachable as an MCP server so ANY agent can drive it. This screen
+// shows the exact line to paste into a client's config and writes the ones it can.
+async function screenAgentAccess() {
+    const serverPath = path.join(__dirname, '..', 'mcp-server.js');
+    let toolCount = 0;
+    try {
+        toolCount = require('../mcp-server').TOOLS.length;
+    } catch { /* report 0 rather than guessing */ }
+
+    A.clear();
+    header(['Agent access', 'MCP']);
+    for (const l of A.boxLines('Let any agent drive this harness', [
+        'The harness speaks MCP, so any agent that supports it can read and',
+        'change the config, add and connect webchats, run the harness tools,',
+        'and put whole tasks through a webchat as a subagent.',
+        '',
+        `${A.bold(String(toolCount))} tools are exposed.`,
+        '',
+        A.dim('Add this to your MCP client config:'),
+        '',
+        `  ${A.cyan('"webchat"')}: {`,
+        `    ${A.cyan('"type"')}: "local",`,
+        `    ${A.cyan('"command"')}: ["node", ${A.cyan(`"${serverPath}"`)}]`,
+        `  }`,
+    ])) A.line(l);
+    A.newline();
+
+    const choice = await A.menu([
+        { label: 'Copy the config block', hint: 'paste it into your agent', value: 'copy' },
+        { label: 'List the tools', hint: `${toolCount} available`, value: 'list' },
+        { label: 'Back', value: 'back' },
+    ], { title: '' });
+
+    if (choice === 'copy') {
+        const block = JSON.stringify({ webchat: { type: 'local', command: ['node', serverPath] } }, null, 2);
+        const res = D.copyToClipboard ? D.copyToClipboard(block) : { ok: false, reason: 'no clipboard helper' };
+        await A.message(res.ok ? 'Copied' : 'Could not copy', [
+            res.ok ? 'Paste it into your MCP client config.' : A.red(res.reason || 'clipboard unavailable'),
+        ]);
+        return screenAgentAccess();
+    }
+    if (choice === 'list') {
+        A.clear();
+        header(['Agent access', 'tools']);
+        let tools = [];
+        try { tools = require('../mcp-server').TOOLS; } catch { /* shown empty */ }
+        for (const t of tools) {
+            A.line(`  ${A.bold(t.name)}`);
+            A.line(A.gray('    ' + A.truncate(String(t.description).split('.')[0] + '.', A.termWidth() - 8)));
+        }
+        A.newline();
+        A.line(A.gray('  any key to go back'));
+        await A.readKey();
+        return screenAgentAccess();
     }
 }
 
@@ -1169,15 +1427,25 @@ async function interactive() {
             if (e instanceof A.QuitError) break;
             throw e;
         }
-        if (choice === A.BACK || choice === 'quit') break;
-        try {
-            if (choice === 'site') await screenSite();
-            else if (choice === 'gates') await screenGates();
-            else if (choice === 'settings') await screenSettings();
-            else if (choice === 'start') await screenStart();
-            else if (choice === 'logs') await screenLogs();
-            else if (choice === 'doctor') await screenDoctor();
-        } catch (e) {
+          if (choice === A.BACK || choice === 'quit') break;
+          try {
+              // `site` is the old single-webchat screen; kept reachable so an older
+              // habit still lands somewhere sensible, but the menu advertises Webchats.
+              if (choice === 'site') await screenSite();
+              else if (choice === 'webchats') await gatesScreens().screenGates();
+              else if (choice === 'harnesses') await gatesScreens().screenHarnesses();
+              else if (choice === 'mode') await gatesScreens().screenMode();
+              else if (choice === 'plan') {
+                  const next = await gatesScreens().screenPlan();
+                  if (next === 'launch') return cmdConnect([]);
+              } else if (choice === 'tools') await gatesScreens().screenTools();
+              else if (choice === 'agentaccess') await screenAgentAccess();
+              else if (choice === 'gates') await screenGates();
+              else if (choice === 'settings') await screenSettings();
+              else if (choice === 'start') await screenStart();
+              else if (choice === 'logs') await screenLogs();
+              else if (choice === 'doctor') await screenDoctor();
+          } catch (e) {
             if (e instanceof A.QuitError) break;
             await A.message('Something went wrong', [
                 A.red(e && e.message ? e.message : String(e)),

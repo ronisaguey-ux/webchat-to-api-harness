@@ -71,6 +71,92 @@ const SCHEMA = [
             },
         ],
     },
+
+    {
+        id: 'permission',
+        title: 'Permission mode',
+        blurb: 'How much the agent may do on its own. This is the setting most worth understanding.',
+        settings: [
+            {
+                path: 'permission.mode', label: 'Mode', type: 'enum',
+                options: ['manual', 'auto', 'yolo'],
+                default: 'auto',
+                help: 'manual = read and answer only. auto = write files and run ordinary commands. yolo = no gate at all, including destructive commands. Passed to whichever harness you launch.',
+                risk: true,
+            },
+            {
+                path: 'permission.confirmYolo', label: 'Confirm before YOLO', type: 'bool',
+                default: true,
+                help: 'Ask once before launching a harness in YOLO mode. Turn off if you find the prompt noise.',
+            },
+        ],
+    },
+    {
+        id: 'tools',
+        title: 'Tools',
+        blurb: 'Which tools the model is allowed to use. A tool switched off is not even offered to it.',
+        settings: [
+            {
+                path: 'tools.disabled', label: 'Disabled tools', type: 'list',
+                default: [],
+                help: 'Tool names to switch off completely, on top of whatever requirement they already have.',
+            },
+            {
+                path: 'tools.bashAllowed', label: 'Allow run_bash at all', type: 'bool', env: 'BASH_ALLOWED',
+                default: false,
+                help: 'The master switch for shell access. With this off, run_bash is unavailable no matter what else is set.',
+                risk: true,
+            },
+        ],
+    },
+    {
+        id: 'prompt',
+        title: 'System prompt',
+        blurb: 'What the model is told about itself before every task.',
+        settings: [
+            {
+                path: 'systemPrompt.text', label: 'System prompt', type: 'longtext',
+                default: '',
+                help: 'Left blank, the harness uses its built-in prompt. Set it to override for this harness.',
+            },
+            {
+                path: 'systemPrompt.perMode', label: 'Per-webchat prompts', type: 'longtext',
+                default: {},
+                help: 'JSON keyed by webchat id, e.g. {"gemini": "...", "deepseek": "..."}. Overrides the prompt above for that webchat.',
+                advanced: true,
+            },
+        ],
+    },
+    {
+        id: 'mcp',
+        title: 'MCP servers',
+        blurb: 'Attach external tool servers. Their tools are merged into the list the model can call.',
+        settings: [
+            {
+                path: 'mcp.servers', label: 'Servers', type: 'longtext',
+                default: [],
+                help: 'A JSON array. Each entry is {"name":"x","command":"node","args":["..."]} for a stdio server, or {"name":"x","url":"http://..."} for one reachable over HTTP. An unreachable server is ignored, never fatal.',
+            },
+        ],
+    },
+    {
+        id: 'ui',
+        title: 'Appearance',
+        blurb: 'How big the interface is and how much of the screen it uses.',
+        settings: [
+            {
+                path: 'ui.margin', label: 'Side margin (columns)', type: 'number', env: 'WEBCHAT_UI_MARGIN',
+                default: 2,
+                help: 'Blank space each side. 0 makes the interface span the entire terminal.',
+                validate: (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 20) ? null : '0-20',
+            },
+            {
+                path: 'ui.maxWidth', label: 'Maximum width', type: 'number', env: 'WEBCHAT_UI_MAX_WIDTH',
+                default: 0,
+                help: '0 means use the whole terminal. Set a number to cap it on a very wide monitor.',
+            },
+        ],
+    },
     {
         id: 'site',
         title: 'Webchat & connection',
@@ -307,10 +393,6 @@ const SCHEMA = [
                 path: 'network.blockedUrlsExtra', label: 'Extra URL block patterns', type: 'list', env: 'BLOCKED_URLS_EXTRA',
                 help: 'Extra glob patterns to abort at the network layer. Images, fonts and media are already blocked.',
                 advanced: true,
-            },
-            {
-                path: 'systemPrompt.text', label: 'System prompt', type: 'longtext',
-                help: 'Blank uses the harness built-in. A per-webchat override wins over this.',
             },
         ],
     },
@@ -589,12 +671,39 @@ function display(setting, value) {
     return String(value);
 }
 
+// Programmatic write, for screens that save a value without going through the
+// one-setting editor (a checkbox list, for instance).
+//
+// Returns what happened rather than assuming success: a value that is SHADOWED by an
+// environment variable is written to the file and still has no effect, and a caller
+// that reports "saved" there is lying to the user. The return says so.
+function saveSetting(dotted, value) {
+    const setting = BY_PATH.get(dotted);
+    if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
+    // loadRaw returns an ENVELOPE ({ file, raw, missing }) — writing that straight
+    // back produces a config containing the envelope instead of the settings, which
+    // silently reverts every value on the next boot. Write `loaded.raw`.
+    const loaded = loadRaw();
+    const next = loaded.raw || {};
+    setPath(next, dotted, value);
+    saveRaw(next, loaded.file);
+    // Re-resolve so the caller learns whether the file write actually took effect.
+    const after = resolve(setting, next);
+    const shadowed = Boolean(after && after.shadowedBy);
+    return {
+        ok: true,
+        value: after ? after.value : value,
+        shadowed,
+        shadowedBy: shadowed ? after.shadowedBy : null,
+    };
+}
+
 module.exports = {
     SCHEMA, BY_PATH,
     getPath, setPath,
     parseEnvFile, setEnvVar, removeEnvVar,
     envFilePath, loadDotenv,
     configFilePath, loadRaw, saveRaw,
-    coerce, resolve, resolveAll, countShadowed,
+    coerce, resolve, resolveAll, countShadowed, saveSetting,
     listModes, display,
 };
