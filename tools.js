@@ -714,16 +714,63 @@ function getToolDefinitions() {
 // disabled, …) is not advertised, so the model can never try it, hit a hard
 // error, and loop. This is the fix for the user's "repeatedly trying unavailable
 // tools".
+// The tools the model is OFFERED. Must agree with isToolAvailable exactly — this
+// used to re-implement the requirement check inline, so the user's deny list was
+// honoured at execution time but the disabled tool was still ADVERTISED. A model
+// offered a tool it cannot run tries it, fails, and burns rounds.
+//
+// There is one rule now, in one function: ask isToolAvailable.
 function getExecutableToolDefinitions() {
     return TOOL_DEFINITIONS
-        .filter((t) => (typeof t.available === 'function' ? t.available() : true))
+        .filter((t) => isToolAvailable(t.name))
         .map(({ handler, available, ...rest }) => rest);
 }
 
 function isToolAvailable(toolName) {
     const tool = TOOL_DEFINITIONS.find((t) => t.name === toolName);
     if (!tool) return false;
+    // ── The user's own deny list ──────────────────────────────────────────────
+    // `tools.disabled` in harness.config.json (or DISABLED_TOOLS as a comma list)
+    // switches a tool off entirely, on top of whatever requirement it already has.
+    //
+    // This is the ONLY place that needs to know: callers already ask this before
+    // using a tool, and executeTool refuses anyway — so a newly disabled tool cannot
+    // slip through a path that forgot to check. A disabled tool is also not
+    // ADVERTISED (getExecutableToolDefinitions filters on this), which matters: a
+    // model offered a tool it cannot run will try it, fail, and burn rounds.
+    if (isToolDisabled(toolName)) return false;
     return typeof tool.available === 'function' ? tool.available() : true;
+}
+
+let _disabledTools = null;
+
+function loadDisabledTools() {
+    const set = new Set();
+    const fromEnv = process.env.DISABLED_TOOLS;
+    if (fromEnv) {
+        for (const n of String(fromEnv).split(',')) {
+            const t = n.trim();
+            if (t) set.add(t);
+        }
+    }
+    try {
+        const MC = require('./master_config');
+        const list = MC.pickList('DISABLED_TOOLS', 'tools', 'disabled');
+        for (const n of (Array.isArray(list) ? list : [])) if (n) set.add(String(n));
+    } catch { /* no master config — env alone is enough */ }
+    return set;
+}
+
+function isToolDisabled(toolName) {
+    try {
+        if (!_disabledTools) _disabledTools = loadDisabledTools();
+        return _disabledTools.has(String(toolName));
+    } catch {
+        // A broken config must not disable everything — fail OPEN, because every
+        // tool still has its own requirement gate, and a config typo silently
+        // removing all of them is far worse than one extra tool.
+        return false;
+    }
 }
 
 async function executeTool(toolName, args, ctx) {
