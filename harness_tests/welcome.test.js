@@ -9,6 +9,11 @@
 //
 // Run: node --test harness_tests/welcome.test.js
 
+// Pin the terminal BEFORE ansi is loaded: without a TTY the size falls back, and the
+// greeting sizes itself to the terminal, so the test would assert against a shrunk screen.
+process.env.COLUMNS = process.env.COLUMNS || '76';
+process.env.LINES = process.env.LINES || '24';
+
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
@@ -104,32 +109,55 @@ test('the greeting explains what the harness is, not just that it exists', async
     assert.match(text, /No API key/i, 'it must answer "what does this cost me"');
 
     const words = text.replace(/[^A-Za-z0-9' -]/g, ' ').split(/\s+/).filter(Boolean).length;
-    assert.ok(words >= 90 && words <= 260,
+    // Shortened 2026-09-24: it was 26 rows against a 24-row terminal, so the top scrolled
+    // off and nobody read the first line. Every claim is still asserted above; the floor is
+    // only here to stop it collapsing into a one-liner.
+    assert.ok(words >= 55 && words <= 260,
         `the greeting is ${words} words - detailed, but still a greeting`);
 });
 
-test('the greeting is the FIRST thing, and the tour question comes after the platform', async () => {
+test('the greeting carries the platform question, and the tour question comes after', async () => {
     const idx = require(path.join(REPO, 'cli', 'index.js'));
     quiet();
-    const order = [];
+    const seen = [];
     const real = { menu: A.menu, line: A.line, clear: A.clear, newline: A.newline, boxLines: A.boxLines };
     A.line = () => {}; A.clear = () => {}; A.newline = () => {}; A.boxLines = () => [];
     A.menu = async (items, opts) => {
-        const title = (opts && opts.title) || (items[0] && items[0].label) || '';
-        order.push(title);
+        seen.push({ title: (opts && opts.title) || (items[0] && items[0].label) || '', above: opts && opts.above, items });
         return items[0] && items[0].value;
     };
     try {
+        // The platform question is asked BY the greeting, so greeting and question are one
+        // screen - which is the whole point of the merge: one question was not worth a
+        // screen of its own.
         await idx.screenWelcome();
-        await idx.screenFirstRun();
         await idx.screenTourChoice();
     } finally { Object.assign(A, real); }
 
-    assert.match(order[0], /welcome/i, `greeting must come first, got ${JSON.stringify(order)}`);
-    assert.match(order[1], /agent running on/i, `platform must come second, got ${JSON.stringify(order)}`);
-    assert.match(order[2], /tour/i, `the tour question must come last, got ${JSON.stringify(order)}`);
+    assert.equal(seen.length, 2, `the opening is two screens now, got ${seen.length}`);
+
+    // Screen one is the greeting AND the question.
+    assert.match(seen[0].title, /agent running on/i, `the platform question must be asked first, got ${seen[0].title}`);
+    assert.deepEqual(seen[0].items.map((i) => i.value), ['linux', 'windows'], 'the two platforms, in order');
+    assert.equal(typeof seen[0].above, 'function', 'the greeting must be DRAWN on that same screen');
+    const drawn = seen[0].above().join('\n').replace(/\u001b\[[0-9;]*m/g, '');
+    assert.match(drawn, /welcome to the webchat-to-api/i,
+        'the wave and the greeting must be on the same screen as the question, not lost');
+
+    // Screen two is the tour, and nothing comes after it.
+    assert.match(seen[1].title, /tour|much of/i, `the tour question comes last, got ${seen[1].title}`);
 });
 
+test('there is no Quit row and Esc is not an exit', async () => {
+    // Esc used to read as "carry on with whatever is next" - which is why it appeared to
+    // move FORWARD. The opening is now a walk where Esc steps back with the greeting as
+    // the floor, and the only way out of the CLI is Ctrl-C.
+    const src = fs.readFileSync(path.join(REPO, 'cli', 'index.js'), 'utf8');
+    assert.ok(!/value:\s*'quit'/.test(src), 'no menu row may offer a Quit - Ctrl-C is the way out');
+    assert.match(src, /value: 'restart'/, 'the menu offers Back to the start instead');
+    assert.match(src, /OPENING\[at\]|step === A\.BACK \? Math\.max\(0, at - 1\)/,
+        'the opening must be a walk that steps BACK, not a one-way run');
+});
 test('the wave never stops, however long the user leaves it', async () => {
     // He used to wave for twenty-four ticks and then settle into a still frame - which is
     // exactly what "the stickman is not even waving" was: by the time the paragraph had
