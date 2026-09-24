@@ -25,7 +25,7 @@ function envDir(name) {
 }
 
 function workspaceRoot() {
-    return envDir('WORKSPACE_ROOT') || path.resolve(__dirname, '..');
+    return envDir('WORKSPACE_ROOT') || path.resolve(__dirname, '..', '..', '..');
 }
 
 function auditsPlans() {
@@ -49,7 +49,7 @@ const paths = {
     auditStateFile: () => envDir('AUDIT_STATE_FILE') || path.join(auditsPlans(), 'audit_state.json'),
     handoffFile: () => envDir('HANDOFF_FILE') || path.join(workspaceRoot(), 'handoff_to_new_chat.md'),
     memoryFile: () => envDir('MEMORY_FILE') || path.join(workspaceRoot(), 'webchat_memory.md'),
-    bashToolLog: () => envDir('BASH_TOOL_LOG') || path.join(__dirname, 'bash_tool_log.jsonl'),
+    bashToolLog: () => envDir('BASH_TOOL_LOG') || path.join(path.resolve(__dirname, '..', '..'), 'bash_tool_log.jsonl'),
     homeDir: () => os.homedir(),
 };
 
