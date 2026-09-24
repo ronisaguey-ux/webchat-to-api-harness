@@ -26,13 +26,69 @@ a webchat session you own, with tool-call support (read/write files, bash, …).
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Requirements
+
+| | |
+|---|---|
+| **Node.js** | **20.12 or newer.** Puppeteer 25 requires it; `setup.sh` refuses to start on anything older. |
+| **A webchat account** | You log in **once, by hand**, in a normal Chrome window. The harness drives that browser — it never has your password and never solves a login for you. |
+| **A browser** | Puppeteer downloads a matching Chrome on `npm install`. To drive your *own* Chrome instead (which keeps the login), launch it with `--remote-debugging-port=9222` and point `CDP_WS_URL` at it. |
+
+**Nothing else.** No Python, no `xdotool`, no X11, no display server. Window control
+runs over CDP (`webchat window raise|drop|maximize|status`), so it behaves the same on
+Linux, macOS and Windows. It can run with the browser window minimised, off-screen, or
+headless — the browser is not supposed to be in your way, and the default is now to
+leave it where you put it.
+
+**Why a webchat at all:** this turns a chat session you already pay for into an
+OpenAI- and Anthropic-compatible endpoint. No API key, no per-token billing — but it is
+only as good as the webchat, and each site is a separate integration with its own
+quirks. DeepSeek is the primary, most-tested target.
+
+## Install
+
+```bash
+git clone https://github.com/ronisaguey-ux/webchat-to-api-harness.git
+cd webchat-to-api-harness
+npm install                # also downloads a matching Chrome
+cp .env.example .env       # then fill in what the site needs
+./webchat                  # menu-driven: it checks your setup and tells you what is missing
+```
+
+One-time login — you do this, not the CLI:
+
+```bash
+./webchat setup     # pick the site, then "Open the browser"
+#   ...sign in by hand in the window that appears...
+./webchat doctor    # confirm the tab is found and logged in
+```
+
+Then point your agent at the API:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8080/v1
+export OPENAI_API_KEY=webchat          # any non-empty string; there is no key
+
+# Anthropic-compatible clients (Claude Code, etc.):
+export ANTHROPIC_BASE_URL=http://localhost:8080
+export ANTHROPIC_API_KEY=webchat
+```
+
+`./webchat doctor` prints exactly what is installed, what is missing, and what to do
+about each missing piece. Run it first whenever something does not work.
+
 ## What's in here
 
 - **Master config** — `harness.config.json` turns every feature on or off and
   sets its value in one place. Env var > file > built-in default.
 - **Webchat modes** — `generic`, `deepseek`, `chatgpt`, `gemini`, `kimi`,
-  `notegpt`. Each carries its own selectors and submit quirks. `generic`
-  attempts any webchat outside that list.
+  `notegpt`, `freebuff`, `claude`. Each carries its own selectors and submit
+  quirks. `generic` attempts any webchat outside that list.
+- **Model ids that change the webchat's own settings** — every toggle combination
+  is published as its own model (`webchat/deepseek/deepthink+search`), so an agent
+  picks a model and the harness sets the site's chips before it sends. A toggle that
+  only applies to a fresh chat makes the harness summarise the thread, open the new
+  chat, and inject the summary as the first message.
 - **Configurable system prompt** — set it in the master config, globally or
   per mode. The caller's own system message still wins.
 - **Configurable tool-call rounds** — `limits.maxToolRounds` plus
@@ -78,6 +134,16 @@ webchat start
 ```
 
 That brings the gateway up and offers to launch your agent against it.
+
+### Permission modes
+
+These say **when** the agent is asked, not what it may do:
+
+| Mode | Asks before |
+|---|---|
+| `manual` | **every** tool call |
+| `auto` | **risky** calls only — writes, shell, network. Ordinary reads just run. |
+| `yolo` | nothing — never asks |
 
 ### Commands
 

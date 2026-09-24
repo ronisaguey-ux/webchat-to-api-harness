@@ -2,6 +2,9 @@
   "name": "webchat-api",
   "version": "1.0.0",
   "description": "OpenAI/Anthropic-compatible API over a real webchat tab (Puppeteer) with tool-call support",
+  "engines": {
+    "node": ">=20.12"
+  },
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
