@@ -65,3 +65,33 @@ test('a caller that does not pass the counts behaves as before', () => {
     const v = markUnverifiedSubmit(PHANTOM, { offeredWorkTools: true, workToolsRun: 25 });
     assert.strictEqual(v.marked, false);
 });
+
+// ─── edit_file must count as a MUTATION (2026-09-24) ─────────────────────────
+//
+// Adding edit_file without adding it to MUTATING_TOOLS would have been a false positive in
+// the opposite direction: a run whose only change came from edit_file would score
+// mutationsRun=0, and a completely honest "updated the file" answer would be marked
+// unverified. The guard exists to catch a phantom, not to slander real work.
+
+test('edit_file is registered as a mutating tool', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    const m = src.match(/const MUTATING_TOOLS = new Set\(\[([^\]]*)\]\)/);
+    assert.ok(m, 'MUTATING_TOOLS must exist');
+    assert.match(m[1], /'write_file'/, 'write_file still counts');
+    assert.match(m[1], /'edit_file'/, 'edit_file MUST count — omitting it falsely flags honest work');
+});
+
+test('every writing tool the harness offers is in MUTATING_TOOLS', () => {
+    // The general rule this bug came from: a new writing tool has to be added to BOTH the
+    // offered set and the mutation set, and forgetting the second is invisible until an
+    // honest answer gets accused.
+    const { getToolDefinitions } = require(path.join(__dirname, '..', 'tools.js'));
+    const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    const m = src.match(/const MUTATING_TOOLS = new Set\(\[([^\]]*)\]\)/);
+    const registered = m[1].split(',').map((s) => s.trim().replace(/^'|'$/g, ''));
+    const offered = getToolDefinitions().map((d) => (d.function ? d.function.name : d.name));
+    const writers = offered.filter((n) => /^write_|^edit_/.test(n) && n !== 'edit_memory');
+    for (const w of writers) {
+        assert.ok(registered.includes(w), `${w} writes files but is not in MUTATING_TOOLS`);
+    }
+});
