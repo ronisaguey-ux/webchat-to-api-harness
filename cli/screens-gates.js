@@ -29,6 +29,7 @@ function build(ctx) {
             header(['Webchats']);
 
             const body = [];
+            const siteNames = G.SITES.filter((s) => !s.generic).map((s) => s.label.replace(/\s*\(.*\)$/, '')).join(', ');
             if (!gates.length) {
                 body.push(A.gray('No webchats yet.'));
                 body.push('');
@@ -46,8 +47,9 @@ function build(ctx) {
                     body.push(`       ${A.dim('gateway')} :${g.gatewayPort || '—'}    ${A.dim('browser')} :${g.cdpPort || '—'}`);
                 }
             }
-            for (const l of A.boxLines('Webchats — one per account', body)) A.line(l);
+            for (const l of A.boxLines('Webchats — the ones you have added', body)) A.line(l);
             A.newline();
+            A.line(A.gray(`  Add a webchat offers every site: ${siteNames}, Generic.`));
 
             const items = [{ label: 'Add a webchat', hint: 'pick a site (or Generic for any site)', value: 'add' }];
             for (const g of gates) {
