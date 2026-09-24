@@ -83,7 +83,21 @@ const cfg = {
     // this gateway must not append a competing one. Set by the oculus step
     // engine lane, whose contract is {"edits":[...]} — see server.js handleRequest.
     passthroughFormat: MC.pickBool('PASSTHROUGH_FORMAT', 'features', 'passthroughFormat') === true,
-    headless: MC.pickBool('HEADLESS', 'server', 'headless') === true,
+    // Browser mode. An explicit choice ('headed' | 'headless') wins; the legacy
+    // HEADLESS bool stays supported so existing .env files keep working unchanged.
+    //
+    // HEADED is the safe default again. It used to be the bad option — the window
+    // jumped onto the owner's screen on every send — so people chose headless and
+    // lost their login. That raise is fixed at the source (safeNewPage creates tabs
+    // with background:true, so Chrome never restores/raises the window), which means
+    // headed now costs nothing: keep your login, and minimise the window once and it
+    // stays minimised.
+    headless: (() => {
+        const mode = String(MC.pick('BROWSER_MODE', 'server', 'browserMode') || '').trim().toLowerCase();
+        if (mode === 'headed' || mode === 'windowed') return false;
+        if (mode === 'headless') return true;
+        return MC.pickBool('HEADLESS', 'server', 'headless') === true;
+    })(),
     modelName: MC.pickStr('MODEL_NAME', 'server', 'modelName') || 'deepseek webchat',
     // 08-13 MULTI-SITE: env FIRST — chat.js carries a hardcoded 9224 URL, so
     // CDP_WS_URL was ignored and no instance could target the 9223 GUI

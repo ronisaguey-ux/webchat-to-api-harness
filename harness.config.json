@@ -158,21 +158,18 @@
     },
     "kimi": {
       "url": "https://www.kimi.ai/chat",
-      "tabUrlSubstring": "kimi.ai/chat",
+      "tabUrlSubstring": "kimi.ai",
       "selectors": {
         "input": ".chat-input-editor",
-        "send": "button[aria-label*=\"Send\" i], .send-button",
+        "send": ".send-button-container, button[data-testid='send-button'], button[aria-label*='Send' i]",
         "message": ".chat-content-item-assistant"
       },
       "quirks": {
-        "clearComposerWithKeyEvents": true,
-        "enterSubmits": true,
-        "clickFallbackOnFullComposer": true,
-        "autoContinueButton": true,
-        "skipEmptyMessageRows": false,
-        "ignoreStopButtonWhileBusy": false,
-        "restoresSavedDraft": true,
-        "rateLimitCooldown": true
+        "_probed_2026_09_24": "Live probe on CDP :9230. Composer .chat-input-editor MATCHES and was EMPTY (the old stale-draft lock is gone). The configured send selector 'button[aria-label*=Send i], .send-button' matched 0 nodes. https://www.kimi.ai/chat redirects to the landing page https://www.kimi.ai/, so a '/chat' tab substring finds no tab - widened to 'kimi.ai'.",
+        "draft": "Historically every send APPENDED to a restored draft (measured 6811 -> 21176 chars). Clearing must use real CDP key events (Input.dispatchKeyEvent ctrl+A + Backspace); execCommand(selectAll/delete) is ignored by this editor.",
+        "send_verified": "UNVERIFIED - no send button is rendered until the composer holds text, so the new selector still needs one hand-driven send to confirm.",
+        "_send_verified": "PROBED LIVE 2026-09-24 on :9230: after Input.insertText the send control is div.send-button-container (36x36 at 1409,435, an svg inside) - a DIV with NO aria-label and no data-testid, which is why `button[aria-label*=Send]` and `.send-button` both matched 0 nodes.",
+        "_still_open": "Clicking it has NOT been verified end to end; confirm with one hand-driven send."
       }
     },
     "notegpt": {
@@ -213,6 +210,21 @@
         "ignoreStopButtonWhileBusy": false,
         "rateLimitCooldown": true
       }
+    },
+    "claude": {
+      "url": "https://claude.ai/new",
+      "tabUrlSubstring": "claude.ai",
+      "selectors": {
+        "input": "div.ProseMirror[contenteditable=\"true\"], fieldset div[contenteditable=\"true\"]",
+        "send": "button[aria-label*=\"Send\" i], button[type=\"submit\"]",
+        "message": ".font-claude-message, [data-testid=\"assistant-message\"]"
+      },
+      "quirks": {
+        "_probed_2026_09_24": "claude.ai served a Cloudflare 'Just a moment...' interstitial to the profile on :9230, so these selectors are NOT verified - they are the known claude.ai contract and must be confirmed with one hand-driven send after logging in.",
+        "cloudflare": "Likely needs a HEADED browser with a signed-in persistent profile (the same class as chatgpt.com, which 403s headless). Do not run this lane headless.",
+        "not_claude_code": "This is the claude.ai WEBCHAT. Claude Code is a separate harness in the harness list, not this site.",
+        "_login_state_2026_09_24": "HEADED browser launched on DISPLAY=:2 (XAUTHORITY=/run/user/1000/xauth_lEjhMq), CDP :9231, profile /home/roni/.config/webchat-profiles/claude/chrome-profile. Measured: window 1500x1006 IsViewable on :2; tabs = 'Sign in - Claude' (claude.ai/login) + a Google accounts sign-in. NOT yet logged in, so selectors stay UNVERIFIED until the owner signs in and a hand-driven send is made."
+      }
     }
   },
   "features": {
@@ -238,7 +250,7 @@
     "tailItems": 2
   },
   "memory": {
-    "_comment": "Persistent memory file (features.memory). Bounded — it rides into every request's system prompt. File path: paths.memoryFile (env MEMORY_FILE).",
+    "_comment": "Persistent memory file (features.memory). Bounded \u2014 it rides into every request's system prompt. File path: paths.memoryFile (env MEMORY_FILE).",
     "maxChars": 20000
   },
   "mcp": {

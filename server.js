@@ -37,6 +37,7 @@ const mcpPool = new McpPool(config.mcpServers);
 const PATHS = require('./paths');
 const ANTI_SPIRAL = require('./anti_spiral');
 const RATE_LIMIT = require('./rate_limit');
+const WEBCHAT_MODELS = require('./webchat-models');
 const MAIN_REPLY_FILE = PATHS.mainReplyFile();
 const MAIN_REPLY_SEEN_FILE = PATHS.mainReplySeenFile(process.env.PORT);
 let mainReplyLastSeen = '';
@@ -674,7 +675,45 @@ function isWebchatModel(body) {
     // 09-22 A3: 'anymodel' and 'webchat' are the Codex-friendly aliases (no slash
     // — Codex rejects provider/model syntax it does not know). All three route to
     // the tab.
-    return m === config.modelName || m === 'anymodel' || m === 'webchat';
+    if (m === config.modelName || m === 'anymodel' || m === 'webchat') return true;
+    // 09-24: every toggle COMBINATION is published as its own model id, so picking a
+    // model is how an agent changes the webchat's own configuration. See
+    // webchat-models.js — webchat/deepseek/deepthink+search and friends.
+    return WEBCHAT_MODELS.parse(m) !== null;
+}
+
+// Turn the REQUESTED MODEL into the webchat's toggle state.
+//
+// This is the point of publishing combinations as model ids: a harness can only pick
+// a model, so picking one is how it flips a chip. An UNKNOWN toggle is refused loudly
+// — silently continuing would let the agent believe it changed something it did not.
+let _lastModelId = null;
+
+async function applyModelSelection(body) {
+    const raw = body && typeof body.model === 'string' ? body.model : '';
+    const parsed = WEBCHAT_MODELS.parse(raw);
+    if (!parsed || parsed.unknownSite) return null;
+    if (parsed.unknown && parsed.unknown.length) {
+        const e = new Error(`unknown toggle(s) "${parsed.unknown.join(', ')}" in model "${raw}"`);
+        e.statusCode = 400;
+        throw e;
+    }
+    const state = WEBCHAT_MODELS.toggleStateFor(parsed.site, parsed.toggles);
+    if (browser && typeof browser.setRequestToggles === 'function') {
+        browser.setRequestToggles(state, parsed);
+    }
+    console.log(`🎛  model "${raw}" -> ${parsed.label} ${JSON.stringify(state)}`);
+
+    // A toggle baked into the thread (ChatGPT's Think, Freebuff's effort) only takes
+    // effect on a fresh chat. Do that ONCE per model CHANGE — not on every request —
+    // and carry the conversation across so the switch costs no context.
+    const changed = _lastModelId !== raw;
+    _lastModelId = raw;
+    if (parsed.requiresNewChat && changed && browser && typeof browser.carryContextToNewChat === 'function') {
+        console.log(`🔄 "${raw}" needs a fresh thread — summarising and reopening`);
+        await browser.carryContextToNewChat();
+    }
+    return parsed;
 }
 
 // 08-13 MULTI-MODEL ROUTER: Claude Code sends every /model pick to the SAME
@@ -2448,6 +2487,12 @@ app.get('/v1/models', (req, res) => {
             ...gatewayRows.map((r) => ({ ...r, object: 'model', owned_by: 'webchat-api' })),
             ...codexRows.map((r) => ({ ...r, object: 'model', owned_by: 'webchat-api' })),
             { id: config.modelName, object: 'model', owned_by: 'webchat-api' },
+            // 09-24: each toggle combination is a selectable model — choosing one
+            // makes the gateway set the webchat's chips over CDP before it sends.
+            ...WEBCHAT_MODELS.allModelIds().map((id) => ({
+                id, object: 'model', owned_by: 'webchat-api',
+                display_name: WEBCHAT_MODELS.parse(id).label,
+            })),
             { id: 'deepseek-v4-flash', object: 'model', owned_by: 'upstream-proxy' },
         ],
     });
@@ -2460,6 +2505,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (!isWebchatModel(req.body)) {
             return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', req.body);
         }
+        await applyModelSelection(req.body);
         if (stream) console.log('⚠️  stream requested — responding non-streamed');
 
         // 09-13: if this account is cooling from a "Messages too frequent"
@@ -2677,6 +2723,7 @@ app.post('/v1/messages', async (req, res) => {
         if (!isWebchatModel(routedBody)) {
             return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
         }
+        await applyModelSelection(routedBody);
 
         if (!(await isConnected()) && !process.env.TEST_FAKE_RESPONSE) {
             try {

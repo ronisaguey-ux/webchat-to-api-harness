@@ -92,8 +92,11 @@ test('EVERY newPage in the connect path is bounded', () => {
     const raw = SRC.split('\n')
         .map((line, i) => ({ line, n: i + 1 }))
         .filter(({ line }) => /browser\.newPage\(\)/.test(line))
-        // Calls already wrapped in withDeadline are the correct form.
-        .filter(({ line }) => !/withDeadline\(browser\.newPage\(\)/.test(line));
+        // Calls already wrapped in withDeadline are the correct form. The exclusion
+        // must allow ARGUMENTS inside newPage(...): page creation passes
+        // {background:true} so Chrome cannot raise the window, and a literal
+        // `newPage()` here would flag every correctly-bounded call.
+        .filter(({ line }) => !/withDeadline\(browser\.newPage\(/.test(line));
     assert.deepStrictEqual(
         raw.map(r => r.n), [],
         `unbounded browser.newPage() at lines ${raw.map(r => r.n).join(', ')} — `

@@ -53,8 +53,20 @@ const SITES = [
     {
         id: 'notegpt',
         label: 'NoteGPT',
-        url: 'https://notegpt.io/',
-        note: 'NoteGPT.',
+        url: 'https://notegpt.io/ai-chat',
+        note: 'NoteGPT. Selectors are tested; its composer resists being cleared and its SEND is gated site-side, so expect to approve a hand-driven send before trusting it.',
+    },
+    {
+        id: 'freebuff',
+        label: 'Freebuff',
+        url: 'https://freebuff.com/chat',
+        note: 'Freebuff (GLM 5.3 Flash, free). Fresh chats default to the highest reasoning effort, which makes a reply take minutes — set effort to Low in the tab.',
+    },
+    {
+        id: 'claude',
+        label: 'Claude (claude.ai)',
+        url: 'https://claude.ai/new',
+        note: 'Claude on the web. Log in first. This is the webchat, not Claude Code — the local agent CLI is a separate option in the harness list.',
     },
     {
         id: 'generic',
@@ -76,8 +88,10 @@ function siteForUrl(url) {
     if (/gemini\.google\.com/.test(u)) return 'gemini';
     if (/chatgpt\.com|chat\.openai\.com/.test(u)) return 'chatgpt';
     if (/chat\.deepseek\.com/.test(u)) return 'deepseek';
-    if (/kimi\.com|moonshot/.test(u)) return 'kimi';
+    if (/kimi\.com|kimi\.ai|moonshot/.test(u)) return 'kimi';
     if (/notegpt\.io/.test(u)) return 'notegpt';
+    if (/freebuff\.com/.test(u)) return 'freebuff';
+    if (/claude\.ai/.test(u)) return 'claude';
     return 'generic';
 }
 

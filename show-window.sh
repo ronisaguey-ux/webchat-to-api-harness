@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  show-window.sh — raise or drop the harness browser window.
+#  show-window.sh — raise, minimise or query the harness browser window.
 #
-#  The browser runs HEADED but MINIMISED, on purpose: a real headed browser keeps
-#  your login (headless gets signed out and is a fingerprint tell), while staying
-#  out of your way. Chrome re-raises its own window whenever a page takes focus —
-#  typing a message, opening a chat — so a single minimise does not hold. A guard
-#  re-asserts it every couple of seconds.
+#  This is a thin wrapper around window.js, which drives Chrome over CDP. Use
+#  this one if you prefer a shell entry point; both do exactly the same thing.
 #
-#      ./show-window.sh raise     # suspend the guard and bring the window up
-#      ./show-window.sh drop      # minimise and restart the guard
-#      ./show-window.sh status    # is it up, down, or is the guard running?
+#      ./show-window.sh raise      # bring the window up (use this to sign in)
+#      ./show-window.sh drop       # minimise it — and it STAYS minimised
+#      ./show-window.sh maximize   # maximise it — and it STAYS maximised
+#      ./show-window.sh status     # what state is it in?
 #
-#  Typical first-run:   ./start.sh   then   ./show-window.sh raise
-#                       … sign in …
-#                       ./show-window.sh drop
+#  NO GUARD. There used to be a `minimize-guard.sh` re-minimising every 0.15s and
+#  it has been REMOVED. It could never stop the flash, because it was racing Chrome
+#  instead of fixing the cause: new pages were created with background:false, which
+#  activates the tab, which makes Chrome restore and raise the window. That is fixed
+#  in browser.js (safeNewPage). Nothing raises the window now, so whatever you do to
+#  it sticks — and the guard also used to fight YOU when you wanted it up.
+#
+#  Works on Linux, macOS and Windows (CDP, not xdotool).
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -23,99 +26,16 @@ cd "$HERE"
 
 ACTION="${1:-status}"
 
-# Where this worker keeps its profile and pid. Defaults match `webchat`, so the
-# standalone script and the driver act on the same browser.
-WORKER="${WEBCHAT_WORKER:-$(dirname "$HERE")}"
-PROFILE="${WEBCHAT_PROFILE:-$WORKER/chrome-profile}"
-export DISPLAY="${WEBCHAT_DISPLAY:-:0}"
-
-guard_pidfile() { printf '%s/minimize-guard.pid' "$WORKER"; }
-
-profile_pid() {
-  pgrep -f "user-data-dir=$PROFILE" 2>/dev/null | head -1 || true
-}
-
-require_tools() {
-  command -v xdotool >/dev/null 2>&1 || {
-    echo "  ✗ xdotool not found — install it (apt: xdotool) to control the window." >&2
-    exit 1
-  }
-}
-
-guard_stop() {
-  local f; f="$(guard_pidfile)"
-  [ -f "$f" ] && { kill "$(cat "$f" 2>/dev/null)" 2>/dev/null || true; rm -f "$f"; }
-  for g in $(pgrep -f "minimize-guard" 2>/dev/null); do kill "$g" 2>/dev/null || true; done
-  return 0
-}
-
-  guard_start() {
-    # The guard ships WITH the harness (it is version-controlled here). An installed
-    # worker may still carry its own copy beside the profile, so prefer the sibling in
-    # this repo and fall back to the worker dir rather than requiring either layout —
-    # a fresh clone previously got show-window.sh but no guard to call.
-    local script=""
-    for cand in "$HERE/minimize-guard.sh" "$WORKER/minimize-guard.sh"; do
-      [ -x "$cand" ] && { script="$cand"; break; }
-    done
-    if [ -n "$script" ]; then
-      # `2 >` (space) passed a literal "2" as an argument and left fd 2 pointed at the
-      # caller's stderr, so guard errors were never captured. `2>` is the redirect.
-      setsid --fork "$script" "$PROFILE" >"$WORKER/state/minimize-guard.log" 2>&1 </dev/null &
-      echo "  guard restarted (re-asserts the minimise): $script"
-    else
-      echo "  ✗ no minimize-guard.sh found (looked in $HERE and $WORKER) —"
-      echo "    the window will drift back up on its own."
-    fi
-  }
+if ! command -v node >/dev/null 2>&1; then
+  echo "  ✗ node not found — the harness needs Node 18+." >&2
+  exit 1
+fi
 
 case "$ACTION" in
-  raise)
-    require_tools
-    pid="$(profile_pid)"
-    [ -n "$pid" ] || { echo "  ✗ the browser is not running. Start it: ./start.sh" >&2; exit 1; }
-    guard_stop
-    for w in $(xdotool search --pid "$pid" 2>/dev/null); do
-      xdotool windowmap "$w" 2>/dev/null || true
-    done
-    # --sync so the window is actually focused before we return, otherwise the
-    # first keystroke lands nowhere and it looks like the raise failed.
-    for w in $(xdotool search --pid "$pid" 2>/dev/null); do
-      xdotool windowactivate --sync "$w" 2>/dev/null || true
-    done
-    echo "  raised — sign in, then: ./show-window.sh drop"
-    ;;
-
-  drop)
-    require_tools
-    pid="$(profile_pid)"
-    [ -n "$pid" ] || { echo "  ✗ the browser is not running." >&2; exit 1; }
-    for w in $(xdotool search --onlyvisible --pid "$pid" 2>/dev/null); do
-      xdotool windowminimize "$w" 2>/dev/null || true
-    done
-    guard_start
-    echo "  dropped — the window stays out of your way"
-    ;;
-
-  status)
-    pid="$(profile_pid)"
-    if [ -z "$pid" ]; then
-      echo "  browser : not running"
-    else
-      vis="$(command -v xdotool >/dev/null 2>&1 \
-             && xdotool search --onlyvisible --pid "$pid" 2>/dev/null | wc -l || echo '?')"
-      echo "  browser : running (pid $pid)"
-      echo "  window  : $([ "${vis:-0}" -gt 0 ] 2>/dev/null && echo 'VISIBLE' || echo 'minimised')"
-    fi
-    f="$(guard_pidfile)"
-    if [ -f "$f" ] && kill -0 "$(cat "$f" 2>/dev/null)" 2>/dev/null; then
-      echo "  guard   : running (pid $(cat "$f"))"
-    else
-      echo "  guard   : not running"
-    fi
-    ;;
-
+  raise|show|up|open|normal|drop|hide|down|minimize|minimized|maximize|maximized|status) ;;
   *)
-    echo "usage: $0 {raise|drop|status}" >&2
+    echo "usage: $0 {raise|drop|maximize|status}" >&2
     exit 2 ;;
 esac
+
+exec node "$HERE/window.js" "$ACTION"

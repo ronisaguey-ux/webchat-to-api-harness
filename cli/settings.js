@@ -81,7 +81,7 @@ const SCHEMA = [
                 path: 'permission.mode', label: 'Mode', type: 'enum',
                 options: ['manual', 'auto', 'yolo'],
                 default: 'auto',
-                help: 'manual = read and answer only. auto = write files and run ordinary commands. yolo = no gate at all, including destructive commands. Passed to whichever harness you launch.',
+                help: 'When the agent asks you before acting. manual = asks for EVERY tool call. auto = asks only for risky tool calls (writes, shell, network); ordinary reads run unprompted. yolo = never asks. Passed to whichever harness you launch.',
                 risk: true,
             },
             {
@@ -211,8 +211,16 @@ const SCHEMA = [
                 help: 'Turns the webchat\'s own Search control on/off (DeepSeek/Gemini native search) — replaces a paid search key.',
             },
             {
-                path: 'server.headless', label: 'Headless browser', type: 'bool', env: 'HEADLESS',
-                help: 'On, no window appears — but you cannot log in. Turn off to sign in, then use Attach.',
+                path: 'server.browserMode', label: 'Browser: headed or headless', type: 'choice',
+                options: ['headed', 'headless'], env: 'BROWSER_MODE',
+                help: 'headed (default) shows a real window — keep your login, and it no longer jumps on screen mid-send. '
+                    + 'headless shows no window at all, but the site can sign you out and it is a fingerprint tell. '
+                    + 'Minimise the headed window once and it stays minimised; raise it with `webchat window raise`.',
+            },
+            {
+                path: 'server.headless', label: 'Headless browser (legacy bool)', type: 'bool', env: 'HEADLESS',
+                help: 'Kept for existing .env files. The headed/headless setting above wins when it is set.',
+                advanced: true,
             },
             {
                 path: 'webchat.viewportW', label: 'Viewport width', type: 'number', env: 'VIEWPORT_W',
@@ -580,6 +588,15 @@ function coerce(setting, value) {
     case 'list':
         if (Array.isArray(value)) return value.map(String);
         return String(value).split(',').map((s) => s.trim()).filter(Boolean);
+    case 'choice': {
+        // One of a fixed set, matched case-insensitively so `HEADED` and `headed`
+        // are the same answer. An unknown value is REJECTED (undefined) rather than
+        // silently stored: a typo'd mode that falls through to a default is how a
+        // setting looks applied and changes nothing.
+        const want = String(value).trim().toLowerCase();
+        const opts = (setting.options || []).map((o) => String(o).toLowerCase());
+        return opts.includes(want) ? want : undefined;
+    }
     default:
         return String(value);
     }
