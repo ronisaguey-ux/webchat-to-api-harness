@@ -13,11 +13,12 @@ const config = require('./src/core/config');
 // numbers — while the deepseek executor still needs the content in its feed.
 // Gate the clean mode to gemini only.
 const IS_GEMINI = (config.modelName || '').toLowerCase().startsWith('gemini');
+const browser = require('./src/browser/browser');
 const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
     buildFullPrompt, openNewChat, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
     resetTeeForHandoff, takeThreadSwap, browserAlive, markShuttingDown,
-} = require('./src/browser/browser');
+} = browser;
 const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./src/tools/tools');
 const { McpPool } = require('./src/tools/mcp');
 const compactor = require('./src/runtime/compactor');

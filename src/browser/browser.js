@@ -1325,7 +1325,7 @@ async function ensureToggles() {
         const wanted = site
             ? (site.toggles || []).map((t) => ({ ui: t.ui, want: (_requestToggles ? _requestToggles[t.id] === true : t.default === true) }))
             : [{ ui: 'DeepThink', want: wantDeepThink }, { ui: 'Search', want: wantSearch }];
-        const clicked = await page.evaluate(({ wantDeepThink, wantSearch }) => {
+        const clicked = await page.evaluate(({ wanted }) => {
             const flipped = [];
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
