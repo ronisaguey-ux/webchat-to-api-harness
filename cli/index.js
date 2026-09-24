@@ -246,6 +246,7 @@ async function screenDashboard() {
           { label: 'Agent access (MCP)', hint: 'let any agent drive this harness', value: 'agentaccess' },
           { label: 'Logs', hint: 'gateway output, with a one-click bug report', value: 'logs' },
           { label: 'Doctor', hint: 'check everything and report', value: 'doctor' },
+            { label: 'Tour', hint: 'the guided walkthrough, any time', value: 'tutorial' },
           { label: 'Quit', value: 'quit' },
       ];
 
@@ -1678,33 +1679,217 @@ module.exports = {
 };
 
 // ── Interactive entry point ────────────────────────────────────────────────
-// ── First run: which system is the agent on? ────────────────────────────────
+// ── The greeting ────────────────────────────────────────────────────────────
+//
+// Shown the first time the CLI is opened, and reachable later from the main menu. The
+// character waves, says hello, and offers to show the user around before dropping them
+// into the menu - a control panel with this many screens is worth ten seconds of
+// orientation, and the ten seconds are the difference between "I do not know what to
+// click" and using it.
+async function screenWelcome() {
+    A.clear();
+    A.line('');
+
+    // The wave, drawn in place. Blocking here is deliberate: this is before anything else
+    // has happened, and a greeting that races the text under it looks broken.
+    const SK = require('./stickman.js');
+    const anim = SK.makeAnimator(A, (tick) => SK.frameFor('wave', tick), { lines: 5 });
+    const waves = 8;
+    for (let i = 0; i < waves; i++) {
+        anim.step(i);
+        await new Promise((r) => setTimeout(r, 170));
+    }
+    anim.done();
+    A.newline();
+
+    const intro = [
+        'Hello, and welcome to the webchat-to-api harness.',
+        '',
+        'This CLI is the control center for the harness. It sets up and controls',
+        'everything, and it is meant to be the only thing you have to drive.',
+        '',
+        'It works by putting a real webchat - Claude, ChatGPT, Gemini, DeepSeek,',
+        'Kimi and others - behind an ordinary model API. You sign in to the',
+        'webchat by hand once; from then on any agentic CLI (Claude Code,',
+        'opencode, Codex) can use that account as if it were a model endpoint.',
+        '',
+        'No API key, no per-token bill, and the browser stays yours.',
+    ];
+    for (const l of intro) A.line(l);
+    A.newline();
+
+    const pick = await A.menu([
+        { label: 'Show me around', hint: 'a short guided tour - start here', value: 'tutorial' },
+        { label: 'I know what I am doing', hint: 'straight to the menu', value: 'skip' },
+    ], { title: 'Want the tour?', footer: ['You can open it again from the main menu at any time.'] });
+
+    if (pick === 'tutorial') { await screenTutorial(); return true; }
+    return pick !== A.BACK;
+}
+
+// ── Tutorial mode ───────────────────────────────────────────────────────────
+//
+// One card per thing worth knowing, each with the character beside it, and - where there
+// is a screen to look at - a "Take me there" that opens the real screen rather than
+// describing it. Teaching by description is how a manual gets ignored; the point of
+// having the CLI open is that it can show you the actual thing.
+//
+// Every step writes nothing. The tour is the one place a user is encouraged to poke at
+// settings, so it must not be the place that changes them.
+async function screenTutorial() {
+    const SK = require('./stickman.js');
+    const steps = [
+        {
+            pose: 'wave',
+            title: 'The idea',
+            lines: [
+                'Every webchat here is a real browser tab, signed in as you.',
+                'The harness turns it into an API, so your agent talks to the',
+                'tab instead of to a paid endpoint.',
+                '',
+                'That is the whole trick. No key, no bill, no quota to buy.',
+            ],
+        },
+        {
+            pose: 'point',
+            title: 'Webchats',
+            lines: [
+                'Start here. Each webchat you add gets its own browser and its',
+                'own port, picked for it so nothing clashes with anything else',
+                'on your machine.',
+                '',
+                'Add one, sign in in the window that opens, and it is ready.',
+            ],
+            goto: 'webchats',
+        },
+        {
+            pose: 'idle',
+            title: 'One url for all of them',
+            lines: [
+                'When you have more than one webchat, the harness puts a hub in',
+                'front of them. You point your agent at that single url and it',
+                'sees every webchat - and every toggle combination - as its own',
+                'model. Pick a different model and you have switched webchat.',
+            ],
+            goto: 'webchats',
+        },
+        {
+            pose: 'think',
+            title: 'Tools and limits',
+            lines: [
+                'Tools is where you decide what your agent may do. Each tool is',
+                'true or false, and behind each one are LIMITS.',
+                '',
+                'A limit is a hard ban, or an ask-the-user. An ask stops the call',
+                'even in yolo mode - that is the point of it.',
+            ],
+            goto: 'tools',
+        },
+        {
+            pose: 'idle',
+            title: 'Harness and mode',
+            lines: [
+                'Pick which agent runs - Claude Code, opencode, Codex - and how',
+                'much it is allowed to do without asking.',
+                '',
+                'This is a setting, so poke at it. Nothing here is permanent.',
+            ],
+            goto: 'harnesses',
+        },
+        {
+            pose: 'point',
+            title: 'Launch',
+            lines: [
+                'Launch starts the webchats, wires the harness to the hub, and',
+                'opens your agent in a terminal.',
+                '',
+                'If an agent cannot be reached, its name is shown greyed out with',
+                'the reason, instead of failing later in a confusing way.',
+            ],
+            goto: 'launch',
+        },
+        {
+            pose: 'idle',
+            title: 'Doctor and Logs',
+            lines: [
+                'If something looks wrong, Doctor checks every moving part and',
+                'says which one is unhappy. Logs shows what the webchats have',
+                'been doing, and can build a bug report.',
+            ],
+            goto: 'doctor',
+        },
+        {
+            pose: 'cheer',
+            title: 'That is everything',
+            lines: [
+                'Go and poke at it - nothing in here is destructive, and any',
+                'setting can be put back.',
+                '',
+                'You can reopen this tour from the main menu whenever you like.',
+            ],
+        },
+    ];
+
+    for (let i = 0; i < steps.length; i++) {
+        const s = steps[i];
+        A.clear();
+        A.line('');
+        for (const l of SK.beside(s.lines, s.pose, i)) A.line(l);
+        A.newline();
+
+        const items = [];
+        if (s.goto) items.push({ label: 'Take me there', hint: `open ${s.title}`, value: 'go' });
+        items.push({ label: i + 1 < steps.length ? 'Next' : 'Finish', hint: `${i + 1} of ${steps.length}`, value: 'next' });
+        items.push({ label: 'Exit the tour', hint: 'back to the menu', value: 'exit' });
+
+        const pick = await A.menu(items, {
+            title: `${s.title}   (${i + 1}/${steps.length})`,
+            footer: ['Nothing in this tour changes a setting. Poke freely.'],
+        });
+
+        if (pick === A.BACK || pick === 'exit') return false;
+        if (pick === 'go') {
+            // The real screen, not a description of it. Whatever the user does there is
+            // their own doing and is saved normally; the tour just takes them to it.
+            try {
+                if (s.goto === 'webchats') await gatesScreens().screenGates();
+                else if (s.goto === 'tools') await gatesScreens().screenTools();
+                else if (s.goto === 'harnesses') await gatesScreens().screenHarnesses();
+                else if (s.goto === 'launch') await screenStart();
+                else if (s.goto === 'doctor') await screenDoctor();
+            } catch (e) {
+                if (e instanceof A.QuitError) throw e;
+                await A.message('That screen could not open', [String(e.message || e)]);
+            }
+        }
+    }
+    return true;
+}
+
+// ── Which system is the agent on? ───────────────────────────────────────────
 //
 // Everything platform-shaped reads from `platform`: which shell a command runs in, how a
 // path is spelled, which command patterns are refused, and which sandbox roots make
 // sense. Guessing it from process.platform is wrong for the case this harness exists for
-// — driving an agent on a Windows box while the browser runs on Linux — so it is asked
-// once, at the start, and then it is just a setting like any other.
-//
-// Shown only when the config has no `platform` of its own. Once it is answered the key is
-// in the file and this never appears again.
+// - driving an agent on Windows from a Linux browser - so it is asked once, and after
+// that it is a setting like any other.
 async function screenFirstRun() {
+    const SK = require('./stickman.js');
     A.clear();
-    const body = [
-        A.bold('Welcome to the webchat harness.'),
+    A.line('');
+    for (const l of SK.beside([
+        'Last thing before the menu:',
         '',
-        'This puts a real webchat — Claude, ChatGPT, Gemini, DeepSeek, Kimi and',
-        'others — behind an ordinary model API, so any agentic CLI can use the',
-        'account you already pay for as if it were a model endpoint.',
+        'which system is your AGENT running on?',
         '',
-        'It drives a real browser window. You sign in once, by hand, and from',
-        'then on the agent works through that tab: no API key, no per-token bill.',
+        'Not necessarily this machine - pointing an',
+        'agent on Windows at a browser on Linux is',
+        'exactly what this setting is for.',
         '',
-        A.dim('First, one question about the machine your AGENT will run on.'),
-        A.dim('It is not necessarily this one — pointing an agent on Windows at a'),
-        A.dim('browser on Linux is exactly what this setting is for.'),
-    ];
-    for (const l of A.boxLines('Welcome', body, { width: A.termWidth() })) A.line(l);
+        'It decides the shell, how paths are written,',
+        'and which commands are refused. Change it',
+        'any time in Settings -> Platform.',
+    ], 'point', 0)) A.line(l);
     A.newline();
 
     const pick = await A.menu([
@@ -1740,8 +1925,11 @@ async function interactive() {
     // every full-screen TUI uses; `restore()` hands the terminal back on any exit path.
     A.enterFullScreen();
     if (!platformChosen()) {
-        try { await screenFirstRun(); }
-        catch (e) { if (e instanceof A.QuitError) { A.restore(); return; } throw e; }
+        try {
+            const goOn = await screenWelcome();
+            if (!goOn) { A.restore(); return; }
+            await screenFirstRun();
+        } catch (e) { if (e instanceof A.QuitError) { A.restore(); return; } throw e; }
     }
     for (;;) {
         let choice;
@@ -1769,6 +1957,7 @@ async function interactive() {
               else if (choice === 'start') await screenStart();
               else if (choice === 'logs') await screenLogs();
               else if (choice === 'doctor') await screenDoctor();
+              else if (choice === 'tutorial') await screenTutorial();
           } catch (e) {
             if (e instanceof A.QuitError) break;
             await A.message('Something went wrong', [
@@ -1889,4 +2078,4 @@ async function main(argv) {
     return 0;
 }
 
-module.exports = { main, interactive, screenFirstRun, platformChosen };
+module.exports = { main, interactive, screenFirstRun, platformChosen, screenWelcome, screenTutorial };
