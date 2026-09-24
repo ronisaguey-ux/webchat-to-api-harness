@@ -308,12 +308,15 @@ function browserRunning() {
 }
 
 function launchBrowser(opts = {}) {
-    const port = opts.port || 9225;
+    // Honour the caller's port and profile. Hardcoding 9225/`profileDir()` meant every
+    // gate opened the SAME browser: the second gate's chrome never bound its own port,
+    // and `webchat connect` could only ever see one webchat.
+    const port = Number(opts.cdpPort || opts.port) || 9225;
     const bin = opts.executable || chromePath();
     if (!bin) return { started: false, error: 'no Chrome or Chromium found — set CHROME_PATH' };
 
     // A debugging port is only accepted with a NON-default profile directory.
-    const profile = profileDir();
+    const profile = opts.profile || profileDir();
     const args = [
         `--remote-debugging-port=${port}`,
         `--user-data-dir=${profile}`,
