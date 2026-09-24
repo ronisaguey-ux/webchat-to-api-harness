@@ -188,7 +188,7 @@ test('saveRaw writes valid JSON, backs up the previous file, and leaves no temp 
 // ── schema integrity ───────────────────────────────────────────────────────
 
 test('the schema is coherent: unique paths, every group titled, every type known', () => {
-    const TYPES = new Set(['bool', 'number', 'string', 'list', 'enum', 'secret', 'longtext', 'envbool', 'mode']);
+    const TYPES = new Set(['bool', 'number', 'string', 'list', 'enum', 'secret', 'longtext', 'envbool', 'mode', 'choice']);
     const seen = new Set();
     for (const g of S.SCHEMA) {
         assert.ok(g.id && g.title && g.blurb, `group ${g.id} needs id/title/blurb`);

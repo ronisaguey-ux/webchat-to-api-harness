@@ -215,24 +215,81 @@ async function findRunningBrowserWs() {
     return null;
 }
 
-let _hiddenOnce = false;
-function keepWindowHidden() {
-    if (_hiddenOnce) return;                 // one guard process is enough
-    if (config.headless) return;             // nothing to hide
-    if (!process.env.DISPLAY) return;        // no X server to talk to
+/**
+ * WINDOW VISIBILITY IS THE USER'S CHOICE. The auto-minimise guard is GONE.
+ *
+ * It used to spawn `show-window.sh drop`: an xdotool guard that re-asserted a
+ * minimise every 0.15s, and it was the wrong answer to the right complaint. It
+ * could never remove the flash, because it was racing Chrome rather than stopping
+ * it — and the raise had a real cause upstream: `newPage()` created its tab with
+ * background:false, which ACTIVATES the tab, which makes Chrome restore and raise
+ * the minimised window on every send. Fixed at the source in safeNewPage().
+ *
+ * Two reasons it is not coming back:
+ *   1. Chrome no longer raises the window, so there is nothing to re-assert.
+ *      Minimise it and it stays minimised; maximise it and it stays maximised.
+ *   2. A 150ms poll cannot tell "Chrome raised itself" from "the owner deliberately
+ *      restored the window", so it also overrode the owner — and it was X11-only,
+ *      so it could never work for Windows users at all.
+ *
+ * Explicit control is still available and is now cross-platform (CDP
+ * Browser.setWindowBounds, implemented by Chrome on Windows, macOS and Linux):
+ *     webchat window status | raise | drop
+ *     node window.js status | raise | drop      (same thing, direct)
+ */
+function noWindowGuard() {
+    // Deliberately does nothing. See the block comment above: the raise is fixed at
+    // the source, so there is no state to re-assert and nothing worth guarding.
+}
+
+/**
+ * Read the harness browser's window state — cross-platform.
+ *
+ * CDP's Browser.getWindowForTarget/setWindowBounds are implemented by Chrome on
+ * Windows, macOS AND Linux. That is the whole reason this replaced the xdotool
+ * script: `minimize-guard.sh` could only ever work on X11, so Windows users had
+ * no window control at all.
+ */
+async function _windowTarget() {
+    if (!browser) throw new Error('no browser attached — connect first (`webchat connect`)');
+    const pages = await browser.pages();
+    const target = page || pages.find((p) => !(typeof p.isClosed === 'function' && p.isClosed())) || pages[0];
+    if (!target) throw new Error('no page open to read a window from');
+    return target;
+}
+
+async function getWindowState() {
+    const target = await _windowTarget();
+    const session = await target.createCDPSession();
     try {
-        const script = path.join(__dirname, 'show-window.sh');
-        if (!fs.existsSync(script)) return;
-        const child = spawn('bash', [script, 'drop'], {
-            detached: true,
-            stdio: 'ignore',
-            env: { ...process.env },
-        });
-        child.unref();
-        _hiddenOnce = true;
-        console.log('🫥 headed browser minimised (show-window.sh drop guard running)');
-    } catch (e) {
-        console.log('⚠ could not minimise the browser window:', String(e.message).slice(0, 60));
+        const { windowId, bounds } = await session.send('Browser.getWindowForTarget');
+        return { windowId, state: (bounds && bounds.windowState) || 'normal', bounds: bounds || {} };
+    } finally {
+        await session.detach().catch(() => {});
+    }
+}
+
+const WINDOW_STATES = ['minimized', 'maximized', 'normal', 'fullscreen'];
+
+async function setWindowState(state) {
+    const want = String(state || '').trim().toLowerCase();
+    if (!WINDOW_STATES.includes(want)) {
+        throw new Error(`unknown window state '${state}' — want one of: ${WINDOW_STATES.join(' | ')}`);
+    }
+    const target = await _windowTarget();
+    const session = await target.createCDPSession();
+    try {
+        const { windowId, bounds } = await session.send('Browser.getWindowForTarget');
+        // CDP refuses minimized -> maximized in one step ("restore it to normal state
+        // first"), so route through normal. Same reason as window.js.
+        const from = (bounds && bounds.windowState) || 'normal';
+        if ((want === 'maximized' || want === 'fullscreen') && (from === 'minimized' || from === 'fullscreen')) {
+            await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+        }
+        await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: want } });
+        return want;
+    } finally {
+        await session.detach().catch(() => {});
     }
 }
 
@@ -348,14 +405,24 @@ async function _initBrowserInner({ reconnect = false } = {}) {
             // init can never attach — it can only try to launch a second Chrome
             // on the same locked profile and fail (measured 2026-09-23).
             `--remote-debugging-port=${cdpPort()}`,
+            // Pages are created with background:true so Chrome never raises the
+            // window (see safeNewPage). These three flags are what make a BACKGROUND
+            // tab behave like a foreground one, so nothing downstream regresses:
+            // without them a backgrounded tab gets its timers throttled, and a
+            // webchat that streams its answer through a timer would stall.
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
         ],
         defaultViewport: { width: 1280, height: 800 },
         detached: true,
     });
     attachDisconnectGuard();
-    // Owner rule: the browser must never appear on screen. The launch branch only —
-    // attaching to an already-running browser is not ours to move.
-    keepWindowHidden();
+    // No window guard here on purpose — see noWindowGuard(). The window only ever
+    // appeared because newPage() activated its tab; with background:true the browser
+    // never raises itself, so the window stays however the user left it. If a user
+    // does want it moved, that is an explicit, cross-platform command:
+    //     webchat window raise | drop | status
     page = await safeNewPage();
     await page.setUserAgent(
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -553,13 +620,22 @@ async function probePageAlive(p, timeoutMs = RENDERER_PROBE_MS) {
  */
 async function safeNewPage() {
     if (!browser) throw new Error('cannot open a page: no browser');
+    // background:true is THE fix for the window that jumped onto the owner's screen.
+    // Puppeteer's newPage() sends CDP Target.createTarget with background:false,
+    // which ACTIVATES the new tab — and activating a tab inside a minimised window
+    // makes Chrome restore and raise that window. Measured here: every send that
+    // opened a chat un-minimised the browser, which is the half-second flash no
+    // minimise-guard could ever win, because the guard was racing Chrome instead of
+    // stopping it. The harness never needs the tab foregrounded: it drives the page
+    // over CDP, and the anti-throttling flags below keep a background tab fully live.
+    const BG = { background: true };
     try {
-        return await withDeadline(browser.newPage(), PAGE_ACQUIRE_MS, 'browser.newPage()');
+        return await withDeadline(browser.newPage(BG), PAGE_ACQUIRE_MS, 'browser.newPage()');
     } catch (e) {
         if (!e.timedOut) throw e;
         console.log(`⚠️  newPage timed out (${e.message}) — dropping dead webchat targets, retrying once`);
         await closeDeadWebchatTargets().catch(() => {});
-        return await withDeadline(browser.newPage(), PAGE_ACQUIRE_MS, 'browser.newPage() retry');
+        return await withDeadline(browser.newPage(BG), PAGE_ACQUIRE_MS, 'browser.newPage() retry');
     }
 }
 
@@ -583,7 +659,7 @@ async function closeDeadWebchatTargets() {
         via = pages.find((p) => p !== page && !(typeof p.isClosed === 'function' && p.isClosed())) || null;
         // Bounded: this runs INSIDE the recovery path, so an unbounded attach here
         // would hang the very code that exists to break a hang.
-        if (!via) via = await withDeadline(browser.newPage(), PAGE_ACQUIRE_MS, 'recovery newPage()');
+        if (!via) via = await withDeadline(browser.newPage({ background: true }), PAGE_ACQUIRE_MS, 'recovery newPage()');
     } catch (_) {
         return 0;
     }
@@ -1088,25 +1164,99 @@ async function collapseBigReplies() {
 //   state is aria-pressed="true"|"false". Gemini has NO such chips — its search
 //   is built into the model, so for gemini this is a no-op and native search is
 //   simply ON when the model is asked (recorded, not faked).
+/**
+ * Per-request toggle state, derived from the model id the caller asked for.
+ *
+ * The harness can only choose a MODEL, so every toggle COMBINATION is published as a
+ * model id (see webchat-models.js) and server.js parses it back into this state
+ * before the send. Without this the chips would only ever follow the static config,
+ * and "pick a different model to change the webchat's settings" would be a lie.
+ */
+let _requestToggles = null;
+let _requestModel = null;
+function setRequestToggles(state, parsed) {
+    _requestToggles = state || null;
+    _requestModel = parsed || null;
+}
+
+/**
+ * Move the conversation into a FRESH chat without losing its context.
+ *
+ * Some toggles are baked into the thread when it starts (ChatGPT's Think, Freebuff's
+ * reasoning effort), so switching to them means a new chat — and a new chat normally
+ * means throwing the conversation away. This asks the CURRENT thread to summarise
+ * itself, opens the new chat with the toggle already applied, and injects that
+ * summary as the first message, so the choice costs the user nothing.
+ *
+ * Ordered deliberately: summarise BEFORE navigating, because openNewChat() destroys
+ * the page the summary has to come from.
+ */
+async function carryContextToNewChat() {
+    let summary = '';
+    try {
+        console.log('📝 toggle needs a fresh chat — asking for a compact summary first');
+        const r = await sendPrompt(
+            'Summarise this conversation for a FRESH thread that has no memory of it. '
+            + 'Include: the task and its goal, decisions already made, files or facts established, '
+            + 'what is still open, and any constraint that must not be broken. '
+            + 'Be compact and concrete. Reply with the summary only.',
+            null,
+        );
+        summary = String((r && (r.text || r.content)) || '').trim();
+        console.log(`📝 summary captured (${summary.length} chars)`);
+    } catch (e) {
+        // Best effort by design: a failed summary must not block the new chat, or a
+        // toggle the user asked for would become unreachable.
+        console.log('⚠ could not summarise before the reset:', String(e.message).slice(0, 70));
+    }
+
+    await openNewChat();
+
+    if (summary) {
+        try {
+            await sendPrompt(
+                'Context carried over from the previous thread (this chat is new and has no memory of it):\n\n'
+                + summary
+                + '\n\nAcknowledge briefly, then wait for the next instruction.',
+                null,
+            );
+            console.log('📥 summary injected into the new chat');
+        } catch (e) {
+            console.log('⚠ could not inject the summary:', String(e.message).slice(0, 70));
+        }
+    }
+    return summary;
+}
+
 async function ensureToggles() {
     try {
-        const wantDeepThink = config.nativeDeepThink;
-        const wantSearch = config.nativeSearch;
+        // A model id that named toggles wins over the static config; the id IS the
+        // user's choice. Keyed by the registry's ids so a rename cannot drift.
+        const W = require('./webchat-models');
+        const siteId = (_requestModel && _requestModel.site) || '';
+        const site = W.SITES[siteId] || null;
+        const wantDeepThink = (_requestToggles && 'deepthink' in _requestToggles)
+            ? _requestToggles.deepthink : config.nativeDeepThink;
+        const wantSearch = (_requestToggles && 'search' in _requestToggles)
+            ? _requestToggles.search : config.nativeSearch;
+        // Every declared toggle for this site, as {uiLabel, want}. Chips are matched
+        // by their own text, which is how DeepSeek labels them.
+        const wanted = site
+            ? (site.toggles || []).map((t) => ({ ui: t.ui, want: (_requestToggles ? _requestToggles[t.id] === true : t.default === true) }))
+            : [{ ui: 'DeepThink', want: wantDeepThink }, { ui: 'Search', want: wantSearch }];
         const clicked = await page.evaluate(({ wantDeepThink, wantSearch }) => {
             const flipped = [];
             for (const el of document.querySelectorAll('.ds-toggle-button')) {
                 const label = (el.textContent || '').trim();
                 const on = el.getAttribute('aria-pressed') === 'true';
-                if (label === 'DeepThink' && on !== wantDeepThink) {
+                const hit = wanted.find((w) => w.ui === label);
+                if (hit && on !== hit.want) {
                     el.click();
-                    flipped.push(`DeepThink ${wantDeepThink ? 'ON' : 'OFF'}`);
-                } else if (label === 'Search' && on !== wantSearch) {
-                    el.click();
-                    flipped.push(`Search ${wantSearch ? 'ON' : 'OFF'}`);
+                    flipped.push(`${label} ${hit.want ? 'ON' : 'OFF'}`);
                 }
             }
             return flipped;
-        }, { wantDeepThink, wantSearch });
+        }, { wanted });
         if (clicked && clicked.length) console.log('🧠 native toggles:', clicked.join(', '));
     } catch (e) {
         console.log('⚠ toggle ensure failed:', String(e.message).slice(0, 60));
@@ -3647,6 +3797,17 @@ module.exports = {
     closeBrowser,
     getPage: () => page,
     probePage,
+    // Window state, exported so the CLI (`webchat window`) and window.js share ONE
+    // implementation instead of each inventing its own idea of where the window is.
+    getWindowState,
+    setWindowState,
+    setRequestToggles,
+    carryContextToNewChat,
+    WINDOW_STATES,
+    // Browser discovery, exported so window.js attaches to the SAME browser the
+    // harness is using instead of probing its own idea of the port order.
+    findRunningBrowserWs,
+    cdpProbeOrder,
     // Exported for the retry-classification test. Pure (text in, Error out), so it can
     // be exercised without a browser — and it must be the SHIPPED function, because a
     // test that re-implements the regex proves only that the regex was copied.

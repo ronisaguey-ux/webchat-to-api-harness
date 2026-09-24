@@ -236,13 +236,20 @@ test('opencode is never given --yolo, which it does not have', () => {
 test('the permission modes are observably different for opencode', () => {
     // opencode has ONE permission flag, so the manual/auto distinction has to be in
     // the config file — otherwise two of three modes launch an identical agent.
+    //
+    // The definition is about WHEN it asks, per the owner:
+    //   manual = asks for EVERY tool call, so the wildcard is 'ask'
+    //   auto   = asks only for RISKY calls, so reads pass ('*': allow) while
+    //            edit/write/bash/webfetch still ask
+    //   yolo   = never asks, so everything is allow
     const manual = H.OPENCODE_PERMISSION.manual;
     const auto = H.OPENCODE_PERMISSION.auto;
     const yolo = H.OPENCODE_PERMISSION.yolo;
     assert.notDeepStrictEqual(manual, auto, 'manual and auto must not be the same');
-    assert.strictEqual(manual.edit, 'ask');
-    assert.strictEqual(auto.edit, 'allow');
-    assert.strictEqual(yolo['*'], 'allow', 'yolo allows what the others merely permit');
+    assert.strictEqual(manual['*'], 'ask', 'manual asks for every tool call');
+    assert.strictEqual(auto['*'], 'allow', 'auto lets ordinary (read) calls through');
+    assert.strictEqual(auto.edit, 'ask', 'auto still asks before a risky write');
+    assert.strictEqual(yolo['*'], 'allow', 'yolo never asks');
 });
 
 test('the generated opencode config carries the chosen mode', () => {

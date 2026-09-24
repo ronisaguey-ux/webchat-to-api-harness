@@ -23,28 +23,28 @@ const fs = require('fs');
 const path = require('path');
 const d = require('./daemon');
 
-// Permission mode. The owner asked for manual / auto / yolo, and the mapping is
-// per-harness because each tool expresses this differently:
-//   manual — never write, never shell. Read and answer only.
-//   auto   — write files and run ordinary commands; destructive ones still refused.
-//   yolo   — no gate at all. The prompt says so; the flags say so.
+// Permission mode. The owner's definition — it is about WHEN the agent asks, not
+// about what the agent is capable of:
+//   manual — asks for EVERY tool call.
+//   auto   — asks only for RISKY tool calls; ordinary ones go through.
+//   yolo   — never asks.
 const MODES = {
     manual: {
         id: 'manual',
         label: 'Manual',
-        blurb: 'Reads and answers. Cannot write files or run commands.',
+        blurb: 'Asks before every tool call. Nothing runs until you approve it.',
         risk: false,
     },
     auto: {
         id: 'auto',
         label: 'Auto',
-        blurb: 'Writes files and runs ordinary commands without asking. Destructive operations still refused.',
+        blurb: 'Asks only for risky tool calls (writes, shell, network). Ordinary reads run without a prompt.',
         risk: false,
     },
     yolo: {
         id: 'yolo',
         label: 'YOLO',
-        blurb: 'No gate at all — anything the agent decides is executed, including destructive commands.',
+        blurb: 'Never asks. Every tool call runs unprompted, including destructive ones.',
         risk: true,
     },
 };
@@ -206,9 +206,16 @@ function reachability(h, gates) {
 // only CLI flag is --auto. So the permission MODE has to be written here, or two of
 // the three modes would launch the same agent.
 const OPENCODE_PERMISSION = {
-    manual: { edit: 'ask', bash: 'ask' },
-    auto: { edit: 'allow', bash: 'allow' },
-    yolo: { edit: 'allow', bash: 'allow', webfetch: 'allow', '*': 'allow' },
+    // Bob's semantics: manual asks for EVERY tool call, auto asks only for the
+    // risky ones, yolo never asks. opencode's `permission` block takes
+    // allow | ask | deny per tool, so the mode is expressed here rather than on the
+    // command line (its only CLI flag is --auto, which is all-or-nothing).
+    //
+    // `edit: 'ask'` on manual and `edit: 'allow'` on auto are load-bearing: without
+    // that difference two of the three modes launch an identical agent.
+    manual: { '*': 'ask', edit: 'ask', bash: 'ask' },
+    auto: { '*': 'allow', edit: 'ask', write: 'ask', bash: 'ask', webfetch: 'ask' },
+    yolo: { '*': 'allow' },
 };
 
 // Write the config a harness needs before it starts. Only opencode needs one, and it

@@ -72,22 +72,94 @@ function uiOpts() {
     };
 }
 
+// ── The terminal's real size ───────────────────────────────────────────────
+//
+// This used to be `stdout.columns || COLUMNS || 80` and nothing else, which is
+// wrong in the one case that matters: when stdout is NOT a TTY — a wrapper, a
+// pipe, `tee`, a multiplexer that does not export COLUMNS — both of those are
+// undefined and the whole dashboard was drawn into an 80x24 box. On a large
+// terminal that is a small strip floating in space, which is exactly the
+// "the CLI is tiny" report.
+//
+// So: ask the live TTY, then the environment, then the CONTROLLING terminal via
+// /dev/tty (which survives a redirected stdout), then the terminfo default. The
+// answer is cached briefly so a redraw is not a fork per frame, and invalidated
+// on resize.
+let _externalSize = { at: 0, columns: 0, rows: 0 };
+const EXTERNAL_TTL_MS = 1000;
+
+// Only the EXPENSIVE probe is cached — the cheap sources (the live stream, the env)
+// are re-read on every call, because those are what change when a test or a
+// multiplexer moves the goalposts, and a stale width draws a ragged frame.
+function _externalTtySize() {
+    if (_externalSize.columns > 0 && (Date.now() - _externalSize.at) < EXTERNAL_TTL_MS) return _externalSize;
+    let columns = 0;
+    let rows = 0;
+
+    // `stty size < /dev/tty` reports the CONTROLLING terminal even when stdout is
+    // piped — the case that produced the tiny box. Output is "<rows> <columns>".
+    try {
+        const { execFileSync } = require('child_process');
+        const raw = execFileSync('sh', ['-c', 'stty size < /dev/tty 2>/dev/null'], {
+            timeout: 400,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            encoding: 'utf8',
+        });
+        const [r, c] = String(raw).trim().split(/\s+/).map(Number);
+        if (r > 0) rows = r;
+        if (c > 0) columns = c;
+    } catch (_) { /* no controlling tty — fall through */ }
+
+    // `tput` reads terminfo, so it works with no tty at all when TERM is set.
+    if (!columns || !rows) {
+        try {
+            const { execFileSync } = require('child_process');
+            const c = Number(execFileSync('tput', ['cols'], { timeout: 400, encoding: 'utf8' }).trim());
+            const r = Number(execFileSync('tput', ['lines'], { timeout: 400, encoding: 'utf8' }).trim());
+            if (!columns && c > 0) columns = c;
+            if (!rows && r > 0) rows = r;
+        } catch (_) { /* no terminfo either */ }
+    }
+
+    _externalSize = { at: Date.now(), columns, rows };
+    return _externalSize;
+}
+
+// Each dimension is resolved INDEPENDENTLY. Requiring both from one source throws
+// away a width you do have (`stdout.columns` set, `rows` undefined — the normal
+// shape outside a tty) and falls all the way back to 80 columns.
+function termSize() {
+    let columns = Number(out.columns) || 0;
+    let rows = Number(out.rows) || 0;
+    if (!columns) columns = Number(process.env.COLUMNS) || 0;
+    if (!rows) rows = Number(process.env.LINES) || 0;
+    if (!columns || !rows) {
+        const ext = _externalTtySize();
+        if (!columns) columns = ext.columns;
+        if (!rows) rows = ext.rows;
+    }
+    return { columns: columns || 80, rows: rows || 24 };
+}
+
+// A resize must land immediately, not on the next cache expiry.
+function _forgetSize() { _externalSize = { at: 0, columns: 0, rows: 0 }; }
+if (typeof out.on === 'function') out.on('resize', _forgetSize);
+if (typeof process.on === 'function') process.on('SIGWINCH', _forgetSize);
+
 function termWidth(fallback = 80) {
-    const w = out.columns || Number(process.env.COLUMNS) || fallback;
+    const { columns } = termSize();
+    const w = columns || fallback;
     const { margin, maxWidth } = uiOpts();
     const usable = Math.max(40, w - margin * 2);
     return maxWidth > 0 ? Math.min(maxWidth, usable) : usable;
 }
 function termHeight(fallback = 24) {
-    return Math.max(10, out.rows || Number(process.env.LINES) || fallback);
+    return Math.max(10, termSize().rows || fallback);
 }
 // How many body rows fit, so a screen fills the terminal instead of stopping a
 // third of the way down.
 function bodyRows(reserved = 6) {
     return Math.max(6, termHeight() - reserved);
-}
-function termHeight(fallback = 24) {
-    return Math.max(10, out.rows || Number(process.env.LINES) || fallback);
 }
 
 // Visible width: ANSI escapes and our own sentinels contribute nothing. Needed

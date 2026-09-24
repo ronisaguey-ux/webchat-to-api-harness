@@ -700,6 +700,17 @@ async function editSetting(settingPath) {
     if (setting.type === 'bool') {
         next = await A.menu([{ label: 'On', value: true }, { label: 'Off', value: false }], { title: setting.label });
         if (next === A.BACK) return;
+    } else if (setting.type === 'choice') {
+        // A fixed set, picked from a menu. This is what makes headed/headless an
+        // actual choice: a free-text field you have to spell exactly right is how a
+        // setting looks applied and silently falls back to the default.
+        const opts = (setting.options || []).map((o) => ({
+            label: String(o),
+            hint: String(o) === String(row.value) ? 'current' : '',
+            value: String(o),
+        }));
+        next = await A.menu(opts.concat([{ label: 'Back', value: 'back' }]), { title: setting.label });
+        if (next === A.BACK || next === 'back') return;
     } else if (setting.type === 'mode') {
         const modes = S.listModes(st.raw).map((m) => ({ label: m.id, hint: m.url, value: m.id }));
         next = await A.menu(modes.concat([{ label: 'Back', value: 'back' }]), { title: 'Webchat' });
@@ -1576,6 +1587,17 @@ const USAGE = `
     Everything is reachable from ${A.bold('webchat')}’s menu: choose the site, launch and
     log in, start the harness, change any setting, read the logs, run the doctor.
 
+    ${A.bold('The browser window')}
+    The browser runs ${A.bold('headed')} by default so it keeps your login, and it no longer
+    jumps onto your screen when a message is sent — nothing raises it, so minimise it
+    once and it stays minimised. To move it yourself:
+      ${A.bold(A.cyan('webchat window status'))}     what state it is in
+      ${A.bold(A.cyan('webchat window raise'))}      bring it up (use this to sign in)
+      ${A.bold(A.cyan('webchat window drop'))}       minimise it, and it stays down
+      ${A.bold(A.cyan('webchat window maximize'))}   maximise it, and it stays up
+    Works on Linux, macOS and Windows. Prefer no window at all? Set
+    ${A.bold('Browser: headed or headless')} to ${A.bold('headless')} in ${A.bold('webchat settings')} (or BROWSER_MODE=headless).
+
     ${A.bold('First run')}
       1. ${A.bold('webchat')}                    open the dashboard
       2. ${A.bold('Webchats → Add a webchat')}   pick the site, then "Open the browser"
@@ -1591,6 +1613,25 @@ const USAGE = `
     ${A.bold('Options')}
       webchat --help          this text
   `;
+// `webchat window raise|drop|maximize|status` — the cross-platform window control.
+//
+// It shells out to window.js instead of re-implementing the CDP calls here, so the
+// CLI and the standalone script can never drift apart about where the window is.
+// Why it exists at all: the browser is HEADED on purpose (it keeps the login), so
+// it has a real window. Nothing raises it any more — new pages are created with
+// background:true — so minimise once and it stays down. This command is for when
+// you deliberately want it moved (chiefly: raise it, sign in, drop it).
+function cmdWindow(args) {
+    const { spawnSync } = require('child_process');
+    const script = path.join(__dirname, '..', 'window.js');
+    const r = spawnSync(process.execPath, [script, ...args], { stdio: 'inherit' });
+    if (r.error) {
+        process.stderr.write(`webchat window: ${r.error.message}\n`);
+        return 1;
+    }
+    return r.status === null ? 1 : r.status;
+}
+
 async function main(argv) {
     const cmd = argv[0];
     A.installGuards();
@@ -1638,6 +1679,7 @@ async function main(argv) {
         A.restore();
         return 0;
     }
+    if (cmd === 'window') return cmdWindow(argv.slice(1));
 
     await interactive();
     return 0;
