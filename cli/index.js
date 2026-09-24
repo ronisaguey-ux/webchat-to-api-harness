@@ -1754,7 +1754,7 @@ const USAGE = `
 // you deliberately want it moved (chiefly: raise it, sign in, drop it).
 function cmdWindow(args) {
     const { spawnSync } = require('child_process');
-    const script = path.join(__dirname, '..', 'window.js');
+    const script = path.join(__dirname, '..', 'src', 'browser', 'window.js');
     const r = spawnSync(process.execPath, [script, ...args], { stdio: 'inherit' });
     if (r.error) {
         process.stderr.write(`webchat window: ${r.error.message}\n`);
