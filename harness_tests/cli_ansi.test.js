@@ -137,3 +137,53 @@ test('screen control writes nothing when stdout is not a TTY', () => {
     assert.strictEqual(out, 'clean',
         'piped output must not contain a clear-screen or cursor escape');
 });
+
+
+// ── one stdin read can carry several keys ────────────────────────────────────
+//
+// A terminal may deliver a paste, a fast double-tap, or an arrow key and an Enter in
+// ONE read. Resolving a chunk as a single key throws the rest away, so the CLI simply
+// ignores input the user definitely made. This was invisible from outside: a piped
+// smoke test looked like it passed while no key after the first had any effect.
+test('a chunk of several keys is split into all of them', () => {
+    assert.deepStrictEqual(A.splitKeys('\u001b[B\u001b[B\r'), ['\u001b[B', '\u001b[B', '\r']);
+    assert.deepStrictEqual(A.splitKeys('abc'), ['a', 'b', 'c']);
+    assert.deepStrictEqual(A.splitKeys(''), []);
+});
+
+test('longer escape sequences win over shorter prefixes', () => {
+    // page-up is \u001b[5~ — four bytes. Splitting it as a lone ESC plus litter would
+    // navigate BACK instead of paging.
+    assert.deepStrictEqual(A.splitKeys('\u001b[5~'), ['\u001b[5~']);
+    assert.deepStrictEqual(A.splitKeys('\u001b[1~'), ['\u001b[1~']);
+    assert.deepStrictEqual(A.splitKeys('\u001b[A'), ['\u001b[A']);
+    assert.deepStrictEqual(A.splitKeys('\u001bOA'), ['\u001bOA'], 'the SS3 form some terminals send');
+});
+
+test('a lone ESC is one key, and multi-byte characters are not sliced', () => {
+    assert.deepStrictEqual(A.splitKeys('\u001b'), ['\u001b']);
+    // by CODE POINT: an emoji is one key but two UTF-16 units
+    assert.deepStrictEqual(A.splitKeys('\u{1F600}\u{1F600}').length, 2);
+});
+
+test('a real stdin read yields every key it contained, in order', async () => {
+    const { EventEmitter } = require('node:events');
+    const fake = new EventEmitter();
+    fake.isTTY = true; fake.isRaw = false;
+    fake.setRawMode = () => {}; fake.resume = () => {};
+    const real = Object.getOwnPropertyDescriptor(process, 'stdin');
+    Object.defineProperty(process, 'stdin', { value: fake, configurable: true });
+    try {
+        const first = A.readKey({ tickMs: 9000 });
+        fake.emit('data', Buffer.from('\u001b[B\u001b[B\r'));
+        const got = [
+            (await first).name,
+            (await A.readKey({ tickMs: 9000 })).name,
+            (await A.readKey({ tickMs: 9000 })).name,
+        ];
+        assert.deepStrictEqual(got, ['down', 'down', 'enter'],
+            'the tail of a multi-key read must be handed out by later readKey calls');
+    } finally {
+        Object.defineProperty(process, 'stdin', real);
+    }
+});
