@@ -151,24 +151,39 @@ function lineRangeFromDiff(text, sign) {
     } catch { return ''; }
 }
 
-function formatToolResultView(call, result, cap) {
-    const name = call.toolName;
-    const args = call.args ?? {};
-    const limit = cap || 6000;
+  function formatToolResultView(call, result, cap, opts = {}) {
+      // `forModel` distinguishes the two consumers of this function, and the
+      // distinction is load-bearing:
+      //   - the STREAMED receipt (forModel false) is what a human watches; it should
+      //     be a readable summary, not a wall of file content;
+      //   - the TAB FOLLOW-UP (forModel true) is what the MODEL reads, and without
+      //     the real content it is blind — it re-reads the same file forever and then
+      //     fabricates an answer.
+      // Measured: asked to read a file containing `CANARY-7731`, the lane replied
+      // `CANARY: opencode-canary-2026-09-23` — a confident invention — because the
+      // content was stripped before it ever reached the model. The comment on the
+      // caller already claimed the receipt "carries the full content for
+      // read_file/run_bash"; the code did the opposite, so the two disagreed and the
+      // model lost.
+      const forModel = opts.forModel === true;
+      const name = call.toolName;
+      const args = call.args ?? {};
+      const limit = cap || 6000;
     try {
         if (name === 'run_bash') {
             const ok = !!result.success;
             const status = ok ? '✅ bash command finished' : '❌ bash command failed';
             const detail = result.error ? ` (${result.error})` : '';
-            // 08-16 (user): gemini tab shows NO command output — just the
-            // command + status + how big the output was. DeepSeek keeps the
-            // output (the plan executor reads it to verify steps).
-            if (IS_GEMINI) {
+            // 08-16 (user): the gemini TAB shows no command output — just the
+            // command, the status and how big the output was. That is the HUMAN view.
+            // The model still receives the output below: a lane that cannot read a
+            // command's result cannot verify anything, and it invents instead.
+            if (IS_GEMINI && !forModel) {
                 const stdout = String(result.stdout ?? '');
                 const stderr = String(result.stderr ?? '');
                 const outChars = stdout.length + stderr.length;
                 const outLines = (stdout + '\n' + stderr).split('\n').length;
-                return `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 300)}\n\n${status}${detail} — output ${outChars} chars / ${outLines} lines (content hidden)`;
+                return `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 300)}\n\n${status}${detail} — output ${outChars} chars / ${outLines} lines (content hidden from the tab; the model receives it)`;
             }
             let out = `🖥️ run_bash → $ ${truncateStr(String(args.command ?? ''), 400)}\n\n${status}${detail}\n`;
             const stdout = String(result.stdout ?? '').trim();
@@ -178,17 +193,24 @@ function formatToolResultView(call, result, cap) {
             return out;
         }
         if (name === 'read_file') {
-            // 08-16 (user): NO content dump — just which file and which lines
-            // were read. The full output is dropped from both the streamed
-            // receipt and the tab follow-up.
             const content = String(result.content ?? '');
-            const lines = content ? content.split('\n').length : 0;
+            const lineCount = content ? content.split('\n').length : 0;
             const total = result.totalLength ?? content.length;
-            let out = `📄 read_file → ${args.path ?? '?'}${lines ? ` (lines 1-${lines})` : ' (empty)'}`;
-            if (result.truncated || total > content.length) {
-                out += ` — truncated at ${content.length} chars (${total} total)`;
+            const header = `📄 read_file → ${args.path ?? '?'}${lineCount ? ` (lines 1-${lineCount})` : ' (empty)'}`;
+            const truncNote = (result.truncated || total > content.length)
+                ? ` — truncated at ${content.length} chars (${total} total)` : '';
+            // The tab receipt is a summary; the MODEL gets the content.
+            //
+            // Dropping the content here made the lane structurally blind: it re-read
+            // the same file until the round budget ran out, then fabricated an answer.
+            // Measured — asked to read a file containing `CANARY-7731`, it replied
+            // `CANARY: opencode-canary-2026-09-23`. A consumer that cannot see what it
+            // read will always guess, and a guess is indistinguishable from a result.
+            if (!forModel) return header + truncNote;
+            if (!content) {
+                return header + truncNote + (result.error ? ` — ❌ ${result.error}` : ' (empty)');
             }
-            return out;
+            return header + truncNote + '\n\n```\n' + truncateStr(content, limit) + '\n```';
         }
         if (name === 'write_file') {
             const path = args.path ?? '?';
@@ -1408,7 +1430,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             // double the message and re-wedge the tab. send_message needs no
             // receipt: its text was already delivered to the client above.
             const followUp =
-                (call.toolName === 'send_message' ? '' : formatToolResultView(call, maybeCompactResult(call, result), 150000) + '\n\n') +
+                (call.toolName === 'send_message' ? '' : formatToolResultView(call, maybeCompactResult(call, result), 150000, { forModel: true }) + '\n\n') +
                 (config.allowPlainText
                     ? 'Task is NOT complete until every part is done AND verified. Send ONE 💬 line, then your ' +
                       'next fenced tool call. Verify with run_bash (syntax checks, imports, the project tests); ' +
@@ -1648,7 +1670,7 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
                 const p = String(call.args?.path || '');
                 if (call.toolName === 'write_file' && /handoff/i.test(p)) handoffPath = p;
                 response = await countedSend(
-                    formatToolResultView(call, result, 6000) + '\n\n' +
+                    formatToolResultView(call, result, 6000, { forModel: true }) + '\n\n' +
                     'The task is: write the handoff document via write_file (if you have not yet) at EXACTLY ' +
                     `${config.handoffFile}, then reply with a fenced submit_answer — one line confirming the path.`,
                     toolDefs
