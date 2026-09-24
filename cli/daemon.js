@@ -180,6 +180,19 @@ function startGateway(opts = {}) {
             ...(opts.env || {}),
             PORT: String(port),
             ...(opts.cdpPort ? { CDP_PORT: String(opts.cdpPort) } : {}),
+            // The gateway drives a HEADED browser, so it needs the display too. Without
+            // this a gateway started from a shell with no DISPLAY fails every send
+            // with "Missing X server to start the headful browser".
+            ...displayEnv(),
+            // Scope the send mutex to THIS gateway's browser. Without it server.js
+            // falls back to the host name, so every gateway on deepseek.com - including
+            // another stack's - shares one lock and the loser waits out the full lock
+            // timeout on a send its own browser was ready for. Observed live: the
+            // harness gateway failed every send with "another chat is mid-generation"
+            // while its chrome sat idle. Two gateways on the SAME profile must still
+            // contend (one account cannot send twice at once), and they do - the lock
+            // is keyed on the profile, not the process.
+            ...(opts.profile ? { WEBCHAT_PROFILE: String(opts.profile) } : {}),
         },
     });
     child.unref();
@@ -248,18 +261,92 @@ function stopProcess(name, { graceMs = 4000 } = {}) {
 // Virtual displays (:99 and up) are deliberately skipped: the gateway uses them so
 // the browser is invisible, and sending a login window there would hide the very
 // thing the user needs to interact with.
-function realDisplay() {
-    if (process.env.WEBCHAT_DISPLAY) return process.env.WEBCHAT_DISPLAY;
-    const virtual = /^:9[0-9]$/;
-    const env = process.env.DISPLAY;
-    if (env && !virtual.test(env)) return env;
-    if (fs.existsSync('/tmp/.X11-unix/X0')) return ':0';
+function displayWorks(d) {
+    // Whether a display actually answers. A socket in /tmp/.X11-unix is NOT proof: on
+    // this box X0 exists while `xdpyinfo -display :0` fails, so picking it sent the login
+    // window to a display nobody can see. The candidate has to be probed.
+    if (!d || !fs.existsSync('/tmp/.X11-unix/X' + d.replace(':', ''))) return false;
     try {
-        const socks = fs.readdirSync('/tmp/.X11-unix').filter((f) => /^X\d+$/.test(f));
-        const real = socks.map((f) => ':' + f.slice(1)).find((d) => !virtual.test(d));
-        if (real) return real;
+        // The auth file must be passed too. The real desktop display (:2 here) needs it
+        // and rejects an unauthenticated probe, while our own Xvfb was started with -ac
+        // and accepts anything - so without this the virtual display looks like the
+        // better choice and the login window lands somewhere nobody can see it.
+        const xa = xauthority();
+        execFileSync('xdpyinfo', ['-display', d], {
+            stdio: 'ignore',
+            timeout: 4000,
+            env: xa ? { ...process.env, XAUTHORITY: xa } : process.env,
+        });
+        return true;
+    } catch { return false; }
+}
+
+function isVirtualDisplay(d) {
+    // A display served by our own Xvfb is fine for the gateway and useless for a login
+    // window - the user cannot see it. Read the running X servers rather than guessing
+    // from the display number (the virtual one here is :1, not the usual :99).
+    try {
+        for (const pid of fs.readdirSync('/proc')) {
+            if (!/^\d+$/.test(pid)) continue;
+            let cmd;
+            try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { continue; }
+            if (!cmd.includes('Xvfb')) continue;
+            if (cmd.split('\0').includes(d)) return true;
+        }
+    } catch { /* /proc unreadable */ }
+    return /^:9[0-9]$/.test(d);
+}
+
+function realDisplay() {
+    // The launch button exists so the user can sign in, which only works if the window
+    // lands on the display they are looking at. Preference order:
+    //   1. WEBCHAT_DISPLAY if it answers;
+    //   2. a display the caller exported, if it answers and is not our own virtual one;
+    //   3. any display that answers, preferring a real desktop over Xvfb.
+    if (process.env.WEBCHAT_DISPLAY && displayWorks(process.env.WEBCHAT_DISPLAY)) {
+        return process.env.WEBCHAT_DISPLAY;
+    }
+    const env = process.env.DISPLAY;
+    if (env && displayWorks(env) && !isVirtualDisplay(env)) return env;
+    let sockets = [];
+    try {
+        sockets = fs.readdirSync('/tmp/.X11-unix')
+            .filter((f) => /^X\d+$/.test(f))
+            .map((f) => ':' + f.slice(1));
     } catch { /* no X at all */ }
-    return env || '';
+    const live = sockets.filter(displayWorks);
+    const real = live.filter((d) => !isVirtualDisplay(d));
+    if (real.length) return real[0];
+    if (live.length) return live[0];
+    return '';
+}
+
+// The gateway runs the browser, so it needs the same display the launch button uses.
+// Chrome without XAUTHORITY dies with "Missing X server" even when DISPLAY is right,
+// and a gateway inheriting an empty DISPLAY fails the moment it has to open a tab
+// itself. Discovering both here means the user never exports anything.
+function xauthority() {
+    if (process.env.XAUTHORITY && fs.existsSync(process.env.XAUTHORITY)) return process.env.XAUTHORITY;
+    const candidates = [];
+    try {
+        for (const d of fs.readdirSync('/run/user')) {
+            const dir = `/run/user/${d}`;
+            for (const f of fs.readdirSync(dir)) {
+                if (f.startsWith('xauth')) candidates.push(`${dir}/${f}`);
+            }
+        }
+    } catch { /* no runtime dir */ }
+    if (process.env.HOME) candidates.push(`${process.env.HOME}/.Xauthority`);
+    return candidates.find((q) => { try { return fs.statSync(q).size > 0; } catch { return false; } }) || null;
+}
+
+function displayEnv() {
+    const out = {};
+    const d = realDisplay();
+    if (d) out.DISPLAY = d;
+    const x = xauthority();
+    if (x) out.XAUTHORITY = x;
+    return out;
 }
 
 function chromePath() {
@@ -337,7 +424,7 @@ function launchBrowser(opts = {}) {
     //   * if DISPLAY is unset entirely, Chrome fails with no useful message.
     // A real desktop display is preferred explicitly, and `headed: false` lets the
     // gateway opt into a virtual display when the window must NOT be seen.
-    const env = { ...process.env };
+    const env = { ...process.env, ...displayEnv() };
     if (opts.headless) {
         // Nothing to show: leave the display alone.
     } else if (opts.display) {
@@ -454,7 +541,7 @@ module.exports = {
     pidFile, logFile,
     readPid, isAlive, writePid, clearPid,
     httpGet, httpPost, probeGateway,
-    gatewayRunning, startGateway, stopGateway, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
+    gatewayRunning, startGateway, stopGateway, displayEnv, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     tailLines,
     copyToClipboard, restoreForExec,
