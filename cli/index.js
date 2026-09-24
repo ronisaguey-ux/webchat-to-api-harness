@@ -1715,7 +1715,8 @@ async function screenWelcome() {
         const art = SK.frameFor(pose, tick);
         // Wrapped to a fixed column so the character never gets pushed sideways by a
         // long line - the block has to keep the same width on every row.
-        const COL = 66;
+        const COL = Math.max(28, Math.min(66, A.termWidth() - 26));
+        const wide = A.termWidth() >= COL + 24;   // only stand him beside the text if he fits
         const text = [];
         intro.forEach((para, i) => {
             const wrapped = A.wrapText(para, COL);
@@ -1723,7 +1724,7 @@ async function screenWelcome() {
         });
         const rows = [];
         for (let i = 0; i < Math.max(art.length, text.length); i++) {
-            const a = (art[i] || '').padEnd(19);
+            const a = wide ? (art[i] || '').padEnd(19) : '';
             const s = text[i] || '';
             rows.push(s ? `${A.padVisible('  ' + s, COL + 5)}${a}`.replace(/\s+$/, '') : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));
         }
@@ -1938,7 +1939,8 @@ async function screenTutorial(mode = 'basic') {
     for (let i = 0; i < steps.length; i++) {
         const s = steps[i];
         const art = SK.frameFor(s.pose, i);
-        const COL = 60;
+        const COL = Math.max(28, Math.min(60, A.termWidth() - 26));
+        const wide = A.termWidth() >= COL + 24;
         // A card is written as readable lines, but those breaks are the AUTHOR's, not the
         // screen's: wrapping them individually leaves a stranded word ("reason,") whenever
         // a hand-written line runs a little past the column. Merging consecutive lines
