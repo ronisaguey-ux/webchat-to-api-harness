@@ -36,6 +36,42 @@ const memoryMod = (() => { try { return require('../memory'); } catch { return n
 // risk: shown as a warning banner; these loosen a guardrail.
 const SCHEMA = [
     {
+        id: 'dashboard',
+        title: 'Dashboard',
+        blurb: 'How the live view looks and behaves. The defaults are sensible — change these only if you want to.',
+        settings: [
+            {
+                path: 'dashboard.autoRefreshSeconds', label: 'Auto-refresh every', type: 'number', env: 'DASHBOARD_REFRESH_S',
+                default: 2,
+                help: 'How often the dashboard re-polls the gateway. 0 turns auto-refresh off. The default is live enough to watch a run without hammering the gateway.',
+                validate: (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 60)
+                    ? null : 'must be 0-60 seconds (0 = off)',
+            },
+            {
+                path: 'dashboard.showPacing', label: 'Show send pacing', type: 'bool',
+                default: true,
+                help: 'Shows how long until the next send is allowed, and whether it is ready.',
+            },
+            {
+                path: 'dashboard.showThrottle', label: 'Show rate-limit backoff', type: 'bool',
+                default: true,
+                help: 'Shows the cooldown countdown when the webchat has throttled us.',
+            },
+            {
+                path: 'dashboard.showRetries', label: 'Show retry budget', type: 'bool',
+                default: false,
+                help: 'Shows how many send retries remain. Useful when debugging, noise otherwise.',
+                advanced: true,
+            },
+            {
+                path: 'dashboard.showTools', label: 'Show tool count', type: 'bool',
+                default: false,
+                help: 'Shows how many tools the model can call.',
+                advanced: true,
+            },
+        ],
+    },
+    {
         id: 'site',
         title: 'Webchat & connection',
         blurb: 'Which webchat the harness drives, and how it reaches the browser.',
@@ -506,6 +542,13 @@ function resolve(setting, raw, env = process.env, dotenv = {}) {
         };
     }
     if (hasFile) return { value: coerce(setting, fileVal), source: 'file' };
+    // A per-setting default, so a setting can be documented and honest about what
+    // applies when nothing is set. Without this a new setting reads as `undefined`,
+    // and the UI cannot tell "off" from "not configured" — which matters because
+    // several consumers treat a missing value differently from a false one.
+    if (setting.default !== undefined) {
+        return { value: coerce(setting, setting.default), source: 'default' };
+    }
     return { value: undefined, source: 'default' };
 }
 

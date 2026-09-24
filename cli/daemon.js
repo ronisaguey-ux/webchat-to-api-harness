@@ -115,7 +115,7 @@ async function probeGateway(host, port) {
         httpStatus: res.status,
         body: parsed,
         // The gateway is listening. `attached` is the browser half.
-        attached: Boolean(parsed && parsed.alive),
+        attached: Boolean(parsed && (parsed.browserAlive || parsed.ok)),
         wedged: Boolean(parsed && parsed.wedged),
     };
 }
@@ -169,8 +169,33 @@ function stopProcess(name, { graceMs = 4000 } = {}) {
 }
 
 // ── the browser ────────────────────────────────────────────────────────────
+// Which X display should a HUMAN see a window on?
+//
+// The launch button exists so the user can sign in, which only works if the window
+// lands on the display they are looking at. Preference order:
+//   1. an explicitly exported DISPLAY that is NOT one of our own virtual ones —
+//      WEBCHAT_DISPLAY overrides this;
+//   2. :0, the usual desktop display on this box;
+//   3. the first non-virtual X socket in /tmp/.X11-unix.
+//
+// Virtual displays (:99 and up) are deliberately skipped: the gateway uses them so
+// the browser is invisible, and sending a login window there would hide the very
+// thing the user needs to interact with.
+function realDisplay() {
+    if (process.env.WEBCHAT_DISPLAY) return process.env.WEBCHAT_DISPLAY;
+    const virtual = /^:9[0-9]$/;
+    const env = process.env.DISPLAY;
+    if (env && !virtual.test(env)) return env;
+    if (fs.existsSync('/tmp/.X11-unix/X0')) return ':0';
+    try {
+        const socks = fs.readdirSync('/tmp/.X11-unix').filter((f) => /^X\d+$/.test(f));
+        const real = socks.map((f) => ':' + f.slice(1)).find((d) => !virtual.test(d));
+        if (real) return real;
+    } catch { /* no X at all */ }
+    return env || '';
+}
+
 function chromePath() {
-    if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
     // Puppeteer ships a known-good Chromium; prefer it over guessing at system
     // names, but fall back to the system browser if puppeteer is unavailable.
     try {
@@ -233,15 +258,40 @@ function launchBrowser(opts = {}) {
     if (opts.headless) args.push('--headless=new');
     if (opts.url) args.push(opts.url);
 
+    // ── DISPLAY: launch where a HUMAN can see it ─────────────────────────────
+    // The point of this button is that the user signs in themselves, so the window
+    // must appear on the display they are actually looking at. Inheriting
+    // process.env is wrong in two ways:
+    //   * if the caller exported a different DISPLAY (a virtual one, as the gateway
+    //     uses), the login window is invisible and the user cannot sign in;
+    //   * if DISPLAY is unset entirely, Chrome fails with no useful message.
+    // A real desktop display is preferred explicitly, and `headed: false` lets the
+    // gateway opt into a virtual display when the window must NOT be seen.
+    const env = { ...process.env };
+    if (opts.headless) {
+        // Nothing to show: leave the display alone.
+    } else if (opts.display) {
+        env.DISPLAY = opts.display;
+    } else {
+        env.DISPLAY = realDisplay();
+    }
+    if (!env.DISPLAY) {
+        return {
+            started: false,
+            error: 'no display available (DISPLAY is unset and no X socket was found) — '
+                 + 'launch from a desktop session, or install Xvfb for a virtual one',
+        };
+    }
+
     ensureStateDir();
     const child = spawn(bin, args, {
         detached: true,
         stdio: 'ignore',
-        env: { ...process.env },
+        env,
     });
     child.unref();
     writePid('browser', child.pid);
-    return { started: true, pid: child.pid, executable: bin, profile, port };
+    return { started: true, pid: child.pid, executable: bin, profile, port, display: env.DISPLAY };
 }
 
 // ── logs ───────────────────────────────────────────────────────────────────
@@ -252,6 +302,29 @@ function tailLines(file, n = 60) {
     return lines.slice(Math.max(0, lines.length - n - 1));
 }
 
+// ── the "which webchat is connected" marker ─────────────────────────────────
+// Written by the CLI's Connect step and read by `webchat connect`, which runs in a
+// SECOND terminal. It is the handoff between the two: without it the second command
+// has no idea which webchat and which browser the user just set up.
+function connectFile() { return path.join(stateDir(), 'connected.json'); }
+
+function readConnection() {
+    try {
+        const d = JSON.parse(fs.readFileSync(connectFile(), 'utf-8'));
+        return d && typeof d === 'object' ? d : null;
+    } catch { return null; }
+}
+
+function writeConnection(info) {
+    ensureStateDir();
+    fs.writeFileSync(connectFile(), JSON.stringify(info, null, 2), { mode: 0o600 });
+    return info;
+}
+
+function clearConnection() {
+    try { fs.unlinkSync(connectFile()); } catch { /* already gone */ }
+}
+
 module.exports = {
     REPO, stateDir, ensureStateDir, profileDir,
     pidFile, logFile,
@@ -260,6 +333,7 @@ module.exports = {
     gatewayRunning, startGateway, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     tailLines, restoreForExec,
+    realDisplay, connectFile, readConnection, writeConnection, clearConnection,
 };
 
 // Hand the terminal back to cooked mode before spawning something that owns the

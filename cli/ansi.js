@@ -99,18 +99,39 @@ function truncate(s, width) {
     return built + '…' + (useColor ? `${ESC}0m` : '');
 }
 
-function wrap(text, width) {
-    const words = String(text).split(/\s+/).filter(Boolean);
-    const lines = [];
-    let line = '';
-    for (const w of words) {
-        if (!line.length) { line = w; continue; }
-        if (line.length + 1 + w.length <= width) line += ` ${w}`;
-        else { lines.push(line); line = w; }
-    }
-    if (line.length) lines.push(line);
-    return lines.length ? lines : [''];
-}
+  function wrap(text, width) {
+      const s = String(text);
+      // Measure VISIBLE width, and keep the original spacing.
+      //
+      // Both halves are load-bearing. These strings carry ANSI colour codes, and the
+      // old version compared raw `String.length`, so every escape byte counted as a
+      // character: a bold menu label measured 26 instead of 17 and the line wrapped
+      // two words early (measured on the live dashboard — the hint broke onto its own
+      // line inside an 80-column box that had room for all of it). The old version
+      // also collapsed runs of whitespace by splitting on /\s+/ and rejoining with a
+      // single space, which silently ate the deliberate two-space gap before a hint.
+      const parts = s.match(/\S+\s*/g);
+      if (!parts) return [''];
+      const lines = [];
+      let line = '';
+      for (const part of parts) {
+          const word = part.replace(/\s+$/, '');
+          const trailing = part.slice(word.length);
+          const joined = line ? line + part : part;
+          // Trailing whitespace never counts, or a line ending exactly on the boundary
+          // would wrap purely because of the space after its last word.
+          const measure = joined.replace(/\s+$/, '');
+          if (line && visibleWidth(measure) > width) {
+              lines.push(line.replace(/\s+$/, ''));
+              line = word + trailing;
+          } else {
+              line = joined;
+          }
+      }
+      const last = line.replace(/\s+$/, '');
+      if (last || !lines.length) lines.push(last);
+      return lines.length ? lines : [''];
+  }
 
 // ── Boxes ──────────────────────────────────────────────────────────────────
 // Pure: returns an array of lines, so callers can compose screens and tests can
@@ -236,83 +257,107 @@ function decodeChunk(s) {
     return { name: 'unknown', raw: s };
 }
 
-function readKey() {
-    return new Promise((resolve) => {
-        const stdin = process.stdin;
-        const wasRaw = stdin.isRaw;
-        let buffer = '';
-        let settle = null;
+  function readKey(opts = {}) {
+      // `tickMs` lets a caller redraw on a timer while still waiting for a key.
+      // It MUST live inside this function rather than being raced outside it: a
+      // raced readKey leaves its stdin `data` listener registered, so the next call
+      // stacks a second listener and one keypress resolves two promises.
+      const tickMs = Number(opts.tickMs) || 0;
+      return new Promise((resolve) => {
+          const stdin = process.stdin;
+          const wasRaw = stdin.isRaw;
+          let buffer = '';
+          let settle = null;
+          let ticker = null;
 
-        function cleanup() {
-            if (settle) { clearTimeout(settle); settle = null; }
-            stdin.removeListener('data', onData);
-            if (stdin.isTTY && !wasRaw) { try { stdin.setRawMode(false); } catch { /* noop */ } }
-        }
-        function finish(seq) {
-            cleanup();
-            resolve(decodeChunk(seq));
-        }
-        function onData(buf) {
-            buffer += buf.toString('utf8');
-            // A lone ESC is held briefly in case the rest of a sequence is behind
-            // it. Anything longer is unambiguous and resolves immediately.
-            if (buffer === '\u001b') {
-                if (settle) clearTimeout(settle);
-                settle = setTimeout(() => finish(buffer), ESC_SEQUENCE_MS);
-                return;
-            }
-            if (settle) { clearTimeout(settle); settle = null; }
-            finish(buffer);
-        }
-        try {
-            if (stdin.isTTY) stdin.setRawMode(true);
-            stdin.resume();
-            stdin.on('data', onData);
-        } catch (e) {
-            cleanup();
-            resolve({ name: 'unknown', raw: String(e && e.message) });
-        }
-    });
-}
+          function cleanup(keepRaw) {
+              if (settle) { clearTimeout(settle); settle = null; }
+              if (ticker) { clearTimeout(ticker); ticker = null; }
+              stdin.removeListener('data', onData);
+              // On a tick we stay in raw mode: restoring and re-entering it between
+              // draws would echo a keystroke that lands in the gap.
+              if (!keepRaw && stdin.isTTY && !wasRaw) { try { stdin.setRawMode(false); } catch { /* noop */ } }
+          }
+          function finish(seq) {
+              cleanup(false);
+              resolve(decodeChunk(seq));
+          }
+          function onData(buf) {
+              buffer += buf.toString('utf8');
+              // A lone ESC is held briefly in case the rest of a sequence is behind
+              // it. Anything longer is unambiguous and resolves immediately.
+              if (buffer === '\u001b') {
+                  if (settle) clearTimeout(settle);
+                  settle = setTimeout(() => finish(buffer), ESC_SEQUENCE_MS);
+                  return;
+              }
+              if (settle) { clearTimeout(settle); settle = null; }
+              finish(buffer);
+          }
+          try {
+              if (stdin.isTTY) stdin.setRawMode(true);
+              stdin.resume();
+              stdin.on('data', onData);
+              if (tickMs > 0) {
+                  ticker = setTimeout(() => {
+                      cleanup(true);
+                      resolve({ name: 'tick', raw: '' });
+                  }, tickMs);
+              }
+          } catch (e) {
+              cleanup(false);
+              resolve({ name: 'unknown', raw: String(e && e.message) });
+          }
+      });
+  }
 
 // ── Interactive primitives ─────────────────────────────────────────────────
 
 // Arrow-key menu. `items` = [{label, hint, value, disabled}]; returns the chosen
 // item's value, or BACK on Esc, or throws QuitError on Ctrl-C.
-async function menu(items, opts = {}) {
-    const { title, footer, width = termWidth(), pageSize } = opts;
-    let index = Math.max(0, items.findIndex((i) => !i.disabled));
-    const size = pageSize || Math.max(3, Math.min(items.length, termHeight() - 10));
+  async function menu(items, opts = {}) {
+      const { title, footer, width = termWidth(), pageSize, tickMs = 0, onTick = null } = opts;
+      let index = Math.max(0, items.findIndex((i) => !i.disabled));
+      const size = pageSize || Math.max(3, Math.min(items.length, termHeight() - 10));
 
-    for (;;) {
-        const start = Math.max(0, Math.min(index - Math.floor(size / 2), Math.max(0, items.length - size)));
-        const view = items.slice(start, start + size);
-        const rendered = view.map((item, i) => {
-            const abs = start + i;
-            const active = abs === index;
-            const pointer = active ? cyan('❯') : ' ';
-            const label = item.disabled
-                ? gray(truncate(item.label, width - 8))
-                : (active ? bold(item.label) : item.label);
-            const hint = item.hint ? gray(`  ${truncate(item.hint, Math.max(0, width - visibleWidth(item.label) - 12))}`) : '';
-            return `${pointer} ${label}${hint}`;
-        });
-        const body = [];
-        if (title) body.push(bold(title), '');
-        body.push(...rendered);
-        if (items.length > size) {
-            body.push('');
-            body.push(gray(`  ${index + 1}/${items.length}`));
-        }
-        clear();
-        for (const l of boxLines(title ? '' : '', body, { width })) line(l);
-        if (footer) { newline(); for (const f of [].concat(footer)) line(gray(`  ${f}`)); }
-        hideCursor();
+      for (;;) {
+          const start = Math.max(0, Math.min(index - Math.floor(size / 2), Math.max(0, items.length - size)));
+          const view = items.slice(start, start + size);
+          const rendered = view.map((item, i) => {
+              const abs = start + i;
+              const active = abs === index;
+              const pointer = active ? cyan('❯') : ' ';
+              const label = item.disabled
+                  ? gray(truncate(item.label, width - 8))
+                  : (active ? bold(item.label) : item.label);
+              const hint = item.hint ? gray(`  ${truncate(item.hint, Math.max(0, width - visibleWidth(item.label) - 12))}`) : '';
+              return `${pointer} ${label}${hint}`;
+          });
+          const body = [];
+          if (title) body.push(bold(title), '');
+          body.push(...rendered);
+          if (items.length > size) {
+              body.push('');
+              body.push(gray(`  ${index + 1}/${items.length}`));
+          }
+          clear();
+          // Anything the caller wants drawn above the menu is re-rendered on every
+          // pass, including a timer tick — that is what keeps a live panel live.
+          let above = [];
+          if (onTick) {
+              try { above = onTick() || []; } catch { above = []; }
+          }
+          if (above.length) { for (const l of above) line(l); newline(); }
+          for (const l of boxLines(title ? '' : '', body, { width })) line(l);
+          if (footer) { newline(); for (const f of [].concat(footer)) line(gray(`  ${f}`)); }
+          hideCursor();
 
-        const key = await readKey();
-        if (key.name === 'ctrl-c') { showCursor(); throw new QuitError(); }
-        if (key.name === 'escape') { showCursor(); return BACK; }
-        if (key.name === 'up') index = (index - 1 + items.length) % items.length;
+          const key = await readKey({ tickMs });
+          if (key.name === 'ctrl-c') { showCursor(); throw new QuitError(); }
+          if (key.name === 'escape') { showCursor(); return BACK; }
+          // A tick is not input: redraw and keep waiting, with the cursor where it was.
+          if (key.name === 'tick') continue;
+          if (key.name === 'up') index = (index - 1 + items.length) % items.length;
         else if (key.name === 'down') index = (index + 1) % items.length;
         else if (key.name === 'pageup') index = Math.max(0, index - size);
         else if (key.name === 'pagedown') index = Math.min(items.length - 1, index + size);

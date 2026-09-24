@@ -54,6 +54,38 @@ async function panel(title, bodyLines, backLabel = 'Back') {
 }
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
+// ── Helpers for the live view ──────────────────────────────────────────────
+function fmtDuration(ms) {
+    if (ms == null) return '—';
+    if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${String(s % 60).padStart(2, '0')}s`;
+    return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
+function fmtClock(d) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// A bar, so pacing is readable at a glance instead of needing arithmetic.
+function bar(fraction, width = 16) {
+    const f = Math.max(0, Math.min(1, Number(fraction) || 0));
+    const filled = Math.round(f * width);
+    return A.cyan('█'.repeat(filled)) + A.gray('░'.repeat(width - filled));
+}
+
+// The landing screen AND the live view — one screen, not two commands.
+//
+// Every number here comes from the gateway's own /metrics, because that is the only
+// honest source: it reports what the process did, not what the CLI believes. A
+// gateway that is not running is shown as stopped rather than as zeroes, since
+// "0 sends" and "no gateway" mean very different things when a run looks stuck.
+//
+// The poll is ASYNC and the render is SYNC. That split matters: the menu owns stdin
+// and must never block on a network call, so a background interval refreshes a
+// snapshot and the tick only redraws from it.
 async function screenDashboard() {
     const st = state();
     const rows = rowsOf(st);
@@ -63,41 +95,141 @@ async function screenDashboard() {
     const host = get('server.host').value || '127.0.0.1';
     const port = get('server.port').value || 8080;
     const cdpPort = Number(process.env.CDP_PORT || 9225);
-    const gw = await D.probeGateway(host, port);
-    const cdp = await D.cdpAlive(cdpPort);
 
-    const body = [
-        `${A.dim('config')}   ${shortHome(st.file)}`,
-        `${A.dim('webchat')}  ${A.bold(get('webchat.mode').value || '(unset)')}`,
-        `${A.dim('gateway')}  ${gw.up
-            ? (gw.attached ? A.green('up · browser attached') : A.yellow('up · waiting for the browser'))
-            : A.gray('stopped')}`,
-        `${A.dim('browser')}  ${cdp.up ? A.green(`running on CDP :${cdpPort}`) : A.gray(`not running on :${cdpPort}`)}`,
-        `${A.dim('bash')}     ${get('features.bashAllowed').value ? A.red('ENABLED') : A.green('disabled')}`,
-        `${A.dim('sandbox')}  ${(get('network.sandboxRoots').value || []).length} root(s)`,
-    ];
-    if (shadowed.length) {
-        body.push('');
-        body.push(A.yellow(`⚠ ${shadowed.length} setting(s) come from an environment variable,`));
-        body.push(A.gray('  which overrides the config file.'));
+    // Dashboard preferences, all optional with sensible defaults so a user who never
+    // opens Settings still gets a good screen.
+    const refreshS = Number(get('dashboard.autoRefreshSeconds').value);
+    const showPacing = get('dashboard.showPacing').value !== false;
+    const showThrottle = get('dashboard.showThrottle').value !== false;
+    const showRetries = get('dashboard.showRetries').value === true;
+    const showTools = get('dashboard.showTools').value === true;
+
+    const snap = {
+        gw: { up: false }, metrics: null, cdp: { up: false, pages: [] },
+        at: new Date(), err: null,
+    };
+
+    async function refresh() {
+        try {
+            const gw = await D.probeGateway(host, port);
+            snap.gw = gw;
+            if (gw.up) {
+                const r = await D.httpGet(`http://${host}:${port}/metrics`, 2000);
+                if (r.ok) {
+                    try { snap.metrics = JSON.parse(r.body); } catch { snap.metrics = null; }
+                } else snap.metrics = null;
+            } else snap.metrics = null;
+            snap.cdp = await D.cdpAlive(cdpPort);
+            snap.at = new Date();
+            snap.err = null;
+        } catch (e) {
+            snap.err = e && e.message ? e.message : String(e);
+        }
     }
-    if (st.error) body.push('', A.red(`config parse error: ${st.error.message}`));
+    await refresh();
 
-    A.clear();
-    header([shortHome(st.file)]);
-    for (const l of A.boxLines('Status', body)) A.line(l);
-    A.newline();
+    // Render one frame from the snapshot. Pure and synchronous.
+    function frame() {
+        const out = [];
+        out.push(A.bold('webchat') + A.gray(`  ${get('webchat.mode').value || '(no webchat chosen)'}`));
+        out.push(A.gray(`  ${shortHome(st.file)}`));
 
-    return A.menu([
+        const m = snap.metrics;
+        const conn = D.readConnection();
+
+        const body = [];
+        body.push(`${A.dim('gateway')}    ${snap.gw.up
+            ? A.green(`up  http://${host}:${port}`)
+            : A.gray('stopped')}${m && m.uptimeMs != null ? A.gray(`   up ${fmtDuration(m.uptimeMs)}`) : ''}`);
+        body.push(`${A.dim('browser')}    ${snap.cdp.up
+            ? A.green(`running, CDP :${cdpPort}`) + A.gray(`  ${snap.cdp.pages.length} tab(s)`)
+            : A.gray('not running')}`);
+        body.push(`${A.dim('webchat')}    ${A.bold(m ? m.model || '—' : (get('webchat.mode').value || '—'))}`
+            + (conn ? A.green('   connected') : A.gray('   not connected')));
+
+        if (!snap.gw.up) {
+            body.push('');
+            body.push(A.gray('Start it to see live numbers and to run an agent.'));
+        } else if (!m) {
+            body.push('');
+            body.push(A.yellow('The gateway is up but /metrics did not answer.'));
+            body.push(A.gray('An older build may be running — restart it from the menu below.'));
+        } else {
+            body.push('');
+            body.push(`${A.dim('state')}      ${m.requestInFlight
+                ? A.yellow(`busy — ${fmtDuration(m.inFlightMs)} into this send`)
+                : A.green('idle')}`);
+            body.push(`${A.dim('sends')}      ${m.sendCount}${m.lastSendAgoMs != null
+                ? A.gray(`   last ${fmtDuration(m.lastSendAgoMs)} ago`) : A.gray('   none yet')}`);
+
+            const p = m.pacing || {};
+            if (showPacing && p.min != null) {
+                const lo = p.min, elapsed = p.elapsedSinceLastSend;
+                const ready = elapsed == null || elapsed >= lo;
+                body.push(`${A.dim('pacing')}     ${lo / 1000}–${p.max / 1000}s between sends`
+                    + (elapsed != null ? `   ${ready ? A.green('ready') : A.yellow('waiting')}` : ''));
+                if (elapsed != null && !ready) {
+                    body.push(`           ${bar(elapsed / lo)}  ${A.gray(`next send in ~${fmtDuration(Math.max(0, lo - elapsed))}`)}`);
+                }
+            }
+
+            const rl = m.rateLimit || {};
+            if (showThrottle) {
+                if (rl.coolingDown) {
+                    body.push(`${A.dim('throttled')}   ${A.red('cooling down')}  ${A.gray(`${fmtDuration(rl.cooldownRemainingMs)} left, then sends resume`)}`);
+                } else if (rl.enabled) {
+                    body.push(`${A.dim('throttled')}   ${A.green('no backoff active')}`);
+                }
+            }
+            if (showRetries) body.push(`${A.dim('retries')}    ${m.sendRetriesLeft} left for the current send`);
+            if (showTools) body.push(`${A.dim('tools')}      ${m.tools} exposed to the model`);
+        }
+
+        if (shadowed.length) {
+            body.push('');
+            body.push(A.yellow(`⚠ ${shadowed.length} setting(s) come from an environment variable,`));
+            body.push(A.gray('  which overrides the config file.'));
+        }
+        if (st.error) body.push('', A.red(`config parse error: ${st.error.message}`));
+        if (snap.err) body.push('', A.red(`probe failed: ${snap.err}`));
+
+        for (const l of A.boxLines(snap.gw.up ? 'Status' : 'Stopped', body)) out.push(l);
+        return out;
+    }
+
+    const items = [
         { label: 'Webchat & browser', hint: 'pick the site, launch it, log in, connect', value: 'site' },
+        { label: 'Start the harness', hint: 'bring the gateway up, then your IDE', value: 'start' },
         { label: 'Gates & sandbox', hint: 'what the model may touch', value: 'gates' },
         { label: 'All settings', hint: 'every setting, grouped, with its resolving source', value: 'settings' },
-        { label: 'Start the harness', hint: 'bring the gateway up, then your IDE', value: 'start' },
         { label: 'Logs', hint: 'gateway output', value: 'logs' },
         { label: 'Doctor', hint: 'check everything and report', value: 'doctor' },
         { label: 'Quit', value: 'quit' },
-    ], { title: 'What do you want to do?' });
+    ];
+
+    // Auto-refresh only while the menu is waiting. A tick re-renders the panel and
+    // leaves the cursor exactly where the user left it.
+    const tickMs = Number.isFinite(refreshS) && refreshS > 0 ? Math.min(60, refreshS) * 1000 : 0;
+    let timer = null;
+    if (tickMs > 0) {
+        timer = setInterval(() => { refresh().catch(() => {}); }, tickMs);
+        if (timer.unref) timer.unref();
+    }
+
+    try {
+        return await A.menu(items, {
+            title: 'What do you want to do?',
+            tickMs,
+            onTick: frame,
+            footer: [`${A.dim('updated')} ${fmtClock(snap.at)}`
+                + (tickMs ? A.gray(`  ·  auto-refresh ${tickMs / 1000}s (Settings → Dashboard)`)
+                          : A.gray('  ·  auto-refresh off'))],
+        });
+    } finally {
+        if (timer) clearInterval(timer);
+    }
 }
+
 
 // ── Webchat & browser ──────────────────────────────────────────────────────
 async function screenSite() {
@@ -108,13 +240,17 @@ async function screenSite() {
         const cdpPort = Number(process.env.CDP_PORT || 9225);
         const cdp = await D.cdpAlive(cdpPort);
 
-        A.clear();
-        header(['Webchat & browser']);
-        const body = [
-            `${A.dim('selected')}  ${A.bold(modeRow.value || '(unset)')}`,
-            `${A.dim('browser')}   ${cdp.up ? A.green(`running on CDP :${cdpPort}`) : A.gray('not running')}`,
-            `${A.dim('profile')}   ${shortHome(D.profileDir())}`,
-        ];
+          A.clear();
+          header(['Webchat & browser']);
+          const conn = D.readConnection();
+          const body = [
+              `${A.dim('selected')}  ${A.bold(modeRow.value || '(unset)')}`,
+              `${A.dim('browser')}   ${cdp.up ? A.green(`running on CDP :${cdpPort}`) : A.gray('not running')}`,
+              `${A.dim('profile')}   ${shortHome(D.profileDir())}`,
+              `${A.dim('connected')} ${conn
+                  ? A.green(`${conn.mode}${conn.agent ? ` → ${conn.agent}` : ''}`)
+                  : A.gray('not yet — launch, log in, then Connect')}`,
+          ];
         if (modeRow.shadowedBy) {
             body.push('');
             body.push(A.yellow(`⚠ ${modeRow.shadowedBy} in ${shortHome(modeRow.shadowedWhere)} overrides the file`));
@@ -124,9 +260,9 @@ async function screenSite() {
 
         const choice = await A.menu([
             { label: 'Choose webchat', hint: `${S.listModes(st.raw).length} configured`, value: 'pick' },
-            { label: 'Launch a browser to log in', hint: 'opens a window you sign into', value: 'launch' },
+            { label: '1. Launch browser & log in', hint: 'opens a headed window on your desktop', value: 'launch' },
+            { label: '2. Connect', hint: 'verify the tab is signed in, then save the choice', value: 'check' },
             { label: 'Attach to a browser I already have open', hint: 'connect to an existing CDP port', value: 'attach' },
-            { label: 'Check connection', hint: 'verify the tab is logged in and ready', value: 'check' },
             { label: 'Back', value: 'back' },
         ], { title: 'Connection' });
 
@@ -179,42 +315,50 @@ async function screenPickMode() {
     await A.message('Saved', [`webchat mode = ${A.cyan(pick)}`]);
 }
 
-async function screenLaunch() {
-    const st = state();
-    const rows = rowsOf(st);
-    const mode = rows.find((r) => r.setting.path === 'webchat.mode').value;
-    const url = (S.listModes(st.raw).find((m) => m.id === mode) || {}).url || '';
+  async function screenLaunch() {
+      const st = state();
+      const rows = rowsOf(st);
+      const mode = rows.find((r) => r.setting.path === 'webchat.mode').value;
+      const url = (S.listModes(st.raw).find((m) => m.id === mode) || {}).url || '';
 
-    if (D.browserRunning()) {
-        await A.message('Browser already running', [
-            'A browser launched by this CLI is already up.',
-            'Use "Check connection" to verify the tab.',
-        ]);
-        return;
-    }
-    const go = await A.confirm(
-        `Launch a browser window and open ${url || 'the webchat'}?`,
-        { footer: 'You log in yourself. The profile lives under .webchat/ so the login survives restarts.' },
-    );
-    if (go !== true) return;
+      if (D.browserRunning()) {
+          await A.message('Browser already running', [
+              'A browser launched by this CLI is already up.',
+              '',
+              `Use ${A.bold('Connect')} to check the tab and continue.`,
+          ]);
+          return;
+      }
+      const go = await A.confirm(
+          `Launch a browser window and open ${url || 'the webchat'}?`,
+          {
+              footer: [
+                  'It opens HEADED on your real desktop, because you sign in yourself.',
+                  'The profile lives under .webchat/ so the login survives restarts.',
+              ],
+          },
+      );
+      if (go !== true) return;
 
-    const port = Number(process.env.CDP_PORT || 9225);
-    const res = D.launchBrowser({ port, url });
-    if (!res.started) {
-        await A.message('Could not launch', [A.red(res.error || 'unknown error')]);
-        return;
-    }
-    await A.message('Browser launched', [
-        A.dim(res.executable),
-        '',
-        A.bold('Sign in to the webchat in that window.'),
-        'When the chat page is loaded and signed in, come back and use',
-        `${A.bold('Check connection')} to confirm.`,
-        '',
-        A.dim(`profile ${shortHome(res.profile)}`),
-        A.dim(`cdp     http://127.0.0.1:${port}`),
-    ]);
-}
+      const port = Number(process.env.CDP_PORT || 9225);
+      // headed on purpose: this is the one launch a human must SEE.
+      const res = D.launchBrowser({ port, url });
+      if (!res.started) {
+          await A.message('Could not launch', [A.red(res.error || 'unknown error')]);
+          return;
+      }
+      await A.message('Browser launched', [
+          A.dim(res.executable),
+          '',
+          A.bold('Sign in to the webchat in that window.'),
+          'When the chat page is loaded and signed in, come back here and choose',
+          `${A.bold(A.cyan('Connect'))} — it verifies the tab and saves the choice.`,
+          '',
+          A.dim(`display ${res.display}   profile ${shortHome(res.profile)}`),
+          A.dim(`cdp     http://127.0.0.1:${port}`),
+      ]);
+  }
+
 
 async function screenAttach() {
     const port = await A.prompt('CDP port of the browser you already have open', {
@@ -355,20 +499,34 @@ async function screenCheck() {
     });
     if (ok !== true) return;
 
-    const targets = await D.cdpTargets(port);
-    const page = targets.pages.find((p) => host && (p.url || '').includes(host)) || targets.pages[0];
-    const { raw, file } = S.loadRaw();
-    if (page && page.webSocketDebuggerUrl) S.setPath(raw, 'webchat.cdpWsUrl', page.webSocketDebuggerUrl);
-    S.saveRaw(raw, file);
+      const targets = await D.cdpTargets(port);
+      const page = targets.pages.find((p) => host && (p.url || '').includes(host)) || targets.pages[0];
+      const { raw, file } = S.loadRaw();
+      if (page && page.webSocketDebuggerUrl) S.setPath(raw, 'webchat.cdpWsUrl', page.webSocketDebuggerUrl);
+      S.saveRaw(raw, file);
 
-    await A.message('Connected', [
-        A.green('This webchat is marked connected.'),
-        '',
-        A.bold('Next:'),
-        '  1. Leave that browser window alone — the harness drives it.',
-        '  2. Open a NEW terminal.',
-        `  3. Run ${A.bold(A.cyan('webchat start'))} to bring up the harness and your IDE.`,
-    ]);
+      // Record what was connected, for `webchat connect` in the other terminal.
+      // Keeping the previously chosen agent means the second command never has to
+      // ask again — it acts on the decision already made here.
+      const prev = D.readConnection() || {};
+      D.writeConnection({
+          mode,
+          cdpPort: port,
+          cdpWsUrl: (page && page.webSocketDebuggerUrl) || null,
+          targetUrl: (page && page.url) || null,
+          agent: prev.agent || null,
+          connectedAt: new Date().toISOString(),
+      });
+
+      await A.message('Connected', [
+          A.green('This webchat is marked connected.'),
+          '',
+          A.bold('Next — in a NEW terminal:'),
+          `    ${A.bold(A.cyan('webchat connect'))}`,
+          '',
+          A.dim('It starts the harness against this browser and opens your agent.'),
+          A.dim('Leave the browser window alone — the harness drives it from now on.'),
+      ]);
 }
 
 // ── All settings ───────────────────────────────────────────────────────────
@@ -793,6 +951,23 @@ async function screenDoctor() {
     });
 
     const shadowed = rows.filter((r) => r.shadowedBy);
+
+    // The bind guard in server.js refuses a non-loopback bind with no token, so
+    // say it here too: the user is about to be told the gateway will not start.
+    const bindHost = String(host);
+    const nonLoopback = !(bindHost === '127.0.0.1' || bindHost === 'localhost' || bindHost === '::1');
+    const tokenSet = Boolean(process.env.API_TOKEN || (st.dotenv && st.dotenv.API_TOKEN));
+    checks.push({
+        name: 'API token',
+        ok: !nonLoopback || tokenSet,
+        warn: nonLoopback,
+        detail: nonLoopback
+            ? (tokenSet
+                ? 'set - required because server.host is not loopback'
+                : 'server.host=' + bindHost + ' is reachable from other machines - set API_TOKEN in harness/.env or the gateway will refuse to start')
+            : 'not needed while bound to loopback',
+    });
+
     checks.push({
         name: 'env shadowing',
         ok: true,
@@ -845,15 +1020,124 @@ function cmdStatus() {
     });
 }
 
-function cmdStart() {
-    // Thin client: bring the pieces up and exit, so it is safe to run from any
-    // terminal. The heavy lifting is the same code the TUI uses.
-    return screenStart();
-}
+
+  // ── webchat connect ────────────────────────────────────────────────────────
+  //
+  // The SECOND step, run in a different terminal once the CLI has launched the
+  // browser and the user has signed in. It is deliberately non-interactive: the
+  // decisions were already made in the TUI and stored in .webchat/connected.json,
+  // so this just acts on them.
+  //
+  // What it does, in order:
+  //   1. read the saved connection (which webchat, which browser target);
+  //   2. confirm that browser is still up on the CDP port;
+  //   3. start the gateway if it is not already running — the gateway ATTACHES to
+  //      the browser that is already open (see findRunningBrowserWs in browser.js,
+  //      attach-before-launch), so the signed-in session is what the model drives;
+  //   4. start the agent the user chose, wired to the gateway.
+  //
+  // Every failure names the one command that fixes it, because the person running
+  // this is in a fresh terminal with no context.
+  async function cmdConnect(argv) {
+      const host = '127.0.0.1';
+      const st = state();
+      const rows = rowsOf(st);
+      const port = rows.find((r) => r.setting.path === 'server.port').value || 8080;
+      const mode = rows.find((r) => r.setting.path === 'webchat.mode').value;
+
+      const conn = D.readConnection();
+      if (!conn) {
+          A.line('');
+          A.line(`  ${A.red('Nothing is connected yet.')}`);
+          A.line('');
+          A.line('  Run the configurator first, in another terminal:');
+          A.line(`      ${A.bold(A.cyan('webchat'))}`);
+          A.line('  then choose  Webchat & browser → Launch → log in → Connect.');
+          A.line('');
+          return 1;
+      }
+
+      const cdpPort = Number(conn.cdpPort || process.env.CDP_PORT || 9225);
+      A.line('');
+      A.line(`  ${A.bold('webchat connect')}   ${A.dim(mode)}`);
+      A.line('');
+
+      // The browser is the thing the user signed into. If it is gone there is
+      // nothing to attach to, and starting a gateway would launch a fresh, logged
+      // -out browser on a virtual display — silently the wrong outcome.
+      const cdp = await D.cdpAlive(cdpPort);
+      if (!cdp.up) {
+          A.line(`  ${A.red('✗')} browser    not answering on CDP :${cdpPort}`);
+          A.line('');
+          A.line('  The window you signed into is gone. Re-open it:');
+          A.line(`      ${A.bold(A.cyan('webchat'))}   → Webchat & browser → Launch`);
+          A.line('');
+          return 1;
+      }
+      A.line(`  ${A.green('✓')} browser    CDP :${cdpPort}  ${A.dim(`${cdp.pages.length} tab(s)`)}`);
+
+      let gw = await D.probeGateway(host, port);
+      if (!gw.up) {
+          A.line(`  ${A.dim('…')} gateway    starting`);
+          const res = D.startGateway();
+          if (!res.started && res.reason !== 'already running') {
+              A.line(`  ${A.red('✗')} gateway    ${res.reason || 'could not start'}`);
+              A.line(`      see the log:  ${A.dim(shortHome(D.logFile()))}`);
+              return 1;
+          }
+          for (let i = 0; i < 30 && !gw.up; i++) {
+              await new Promise((r) => setTimeout(r, 500));
+              gw = await D.probeGateway(host, port);
+          }
+      }
+      if (!gw.up) {
+          A.line(`  ${A.red('✗')} gateway    did not come up on ${host}:${port}`);
+          A.line(`      see the log:  ${A.dim(shortHome(D.logFile()))}`);
+          return 1;
+      }
+      A.line(`  ${A.green('✓')} gateway    http://${host}:${port}/v1`);
+
+      const model = rows.find((r) => r.setting.path === 'server.modelName').value;
+      A.line(`  ${A.green('✓')} model      ${model}`);
+      A.line('');
+
+      // Which agent? From the saved choice, else ask once — still non-interactive
+      // when the CLI recorded a preference.
+      let agent = conn.agent || null;
+      const launcher = path.join(D.REPO, 'launch-agent.sh');
+      if (!fs.existsSync(launcher)) {
+          A.line(`  ${A.red('✗')} launch-agent.sh is missing from ${shortHome(D.REPO)}`);
+          return 1;
+      }
+      if (!agent) {
+          const agents = ['opencode', 'claude', 'codex', 'aider', 'hermes', 'crush'];
+          agent = await A.menu(
+              agents.map((a) => ({ label: a, value: a })),
+              { title: 'Which agent should run against it?', footer: ['Saved for next time.'] },
+          );
+          if (!agent || agent === A.BACK) return 1;
+          D.writeConnection({ ...conn, agent });
+      }
+
+      A.line(`  ${A.dim('$')} ./launch-agent.sh ${agent}`);
+      A.line(`  ${A.gray('handing this terminal to the agent — Ctrl-C / /exit to come back')}`);
+      A.line('');
+
+      // The agent owns the TTY from here, so the TUI must give it back first.
+      D.restoreForExec();
+      const { spawnSync } = require('child_process');
+      const res = spawnSync(launcher, [agent], { cwd: D.REPO, stdio: 'inherit' });
+      if (res.error) {
+          A.line(`  ${A.red('could not launch:')} ${res.error.message}`);
+          return 1;
+      }
+      return res.status || 0;
+  }
+
 
 module.exports = {
     screenDashboard, screenSite, screenSettings, screenGates, screenStart,
-    screenLogs, screenDoctor, cmdStatus, cmdStart,
+    screenLogs, screenDoctor, cmdStatus, cmdConnect,
 };
 
 // ── Interactive entry point ────────────────────────────────────────────────
@@ -892,24 +1176,26 @@ async function interactive() {
 
 // ── Dispatch ───────────────────────────────────────────────────────────────
 const USAGE = `
-  ${A.bold('webchat')} — configure and run the webchat-to-API harness
+  ${A.bold('webchat')} — run any webchat (Gemini, ChatGPT, DeepSeek…) as an API
 
-  ${A.bold('Usage')}
-    webchat                 open the interactive configurator
-    webchat setup           same, but straight into Webchat & browser
-    webchat status          one-line state of the gateway and browser
-    webchat start           bring the gateway up, start, then offer your IDE
-    webchat logs [gateway]  tail a log
-    webchat doctor          check the environment and report
-    webchat settings        open the settings screens
-    webchat --help          this text
+  ${A.bold('Two commands')}
+    ${A.bold(A.cyan('webchat'))}          the dashboard: live status, and everything else
+    ${A.bold(A.cyan('webchat connect'))}  in a NEW terminal — start the harness and your agent
 
-  ${A.bold('First run')}
-    1. webchat              pick your webchat, launch the browser, log in
-    2. Check connection     the CLI verifies the tab and you confirm
-    3. webchat start        new terminal — brings up the harness and your IDE
-`;
+    Everything is reachable from ${A.bold('webchat')}’s menu: choose the site, launch and
+    log in, start the harness, change any setting, read the logs, run the doctor.
 
+    ${A.bold('First run')}
+      1. ${A.bold('webchat')}                        open the dashboard
+      2. Webchat & browser                     pick which site
+      3. ${A.bold('1. Launch browser & log in')}       a window opens on your desktop
+      4. sign in to it                         (you do this, not the CLI)
+      5. ${A.bold('2. Connect')}                     the CLI checks the tab and saves it
+      6. new terminal → ${A.bold('webchat connect')}   harness + agent, wired up
+
+    ${A.bold('Options')}
+      webchat --help          this text
+  `;
 async function main(argv) {
     const cmd = argv[0];
     A.installGuards();
@@ -919,7 +1205,15 @@ async function main(argv) {
         A.line(USAGE);
         return 0;
     }
-    if (cmd === 'status') return cmdStatus();
+
+    // `status` is no longer a separate command — the owner asked for ONE command
+    // that shows everything. It survives as a hidden alias so anything already
+    // calling it keeps working, but it is not advertised.
+    // `status` is folded into the single command. It survives as a hidden alias so
+    // anything already invoking it keeps working; it is not advertised in --help.
+    if (cmd === 'status') { await interactive(); return 0; }
+
+    if (cmd === 'connect' && argv[1] !== '--help') return cmdConnect(argv.slice(1));
 
     if (cmd === 'start') {
         A.installGuards();
@@ -951,18 +1245,9 @@ async function main(argv) {
         A.restore();
         return 0;
     }
+
     await interactive();
     return 0;
-}
-
-if (require.main === module) {
-    main(process.argv.slice(2))
-        .then((code) => { A.restore(); process.exit(code || 0); })
-        .catch((e) => {
-            A.restore();
-            A.line(`  ${A.red('webchat: ' + (e && e.message ? e.message : String(e)))}`);
-            process.exit(1);
-        });
 }
 
 module.exports = { main, interactive };
