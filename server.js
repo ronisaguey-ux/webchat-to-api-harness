@@ -1355,7 +1355,8 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     // gets a nudge back so it continues with its tool call; a broken tool-JSON
     // attempt gets a correction — never a raw leak to the client.
     let proseRounds = 0;      // conversation mode: consecutive prose-only replies
-    let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
+    let malformedRounds = 0;  // CONSECUTIVE broken tool-JSON attempts (resets on a good parse)
+    let malformedRetries = 0; // automatic pauses+retries taken this request (bounded by malformedMaxRetries)
     let narrationNudged = false; // strict mode: send_message narration taught once per request
     let emptyAnswerNudged = false; // 08-16: empty submit_answer retried once before the placeholder
     // Work tools actually EXECUTED in this request. send_message and the submit
@@ -1586,15 +1587,49 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
         // exactly this shape) — treating it as a broken tool call made the
         // gateway re-send a correction up to maxToolRounds times and never
         // return, so every engine step burned its full timeout on this lane.
-        if (!config.allowPlainText && looksLikeBrokenToolJson(response) && malformedRounds < config.maxMalformedRounds) {
+        if (!config.allowPlainText && looksLikeBrokenToolJson(response)) {
             malformedRounds++;
-            // Log WHAT the parser saw. Without the text, a reader-side bug (the
-            // renderer losing the code block) is indistinguishable from the model
-            // never emitting a tool call — and the two need opposite fixes. The
-            // reply is short here by definition (a parse failure), so it is safe.
-            console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent. raw=[${String(response).replace(/\s+/g, ' ').slice(0, 400)}]`);
-            onProgress?.({ type: 'rejected', text: 'malformed tool JSON — correction sent' });
-            response = await countedSend(MALFORMED_MSG, toolDefs);
+            const reason = describeMalformedJson(response);
+            // Log WHAT the parser saw and WHY it failed. Without the reason a reader-side
+            // bug (the renderer losing the code block) is indistinguishable from the model
+            // never emitting a usable tool call — and the two need opposite fixes.
+            console.log(`⚠️ MALFORMED JSON DETECTED (round ${round + 1}, ${malformedRounds}/${config.maxMalformedRounds} in a row) — ${reason}. raw=[${String(response).replace(/\s+/g, ' ').slice(0, 400)}]`);
+            onProgress?.({ type: 'rejected', text: `malformed JSON detected (${malformedRounds}/${config.maxMalformedRounds}) — ${reason}` });
+
+            // ── STOP after N consecutive failures, then RETRY BY ITSELF ──────────
+            //
+            // Measured: a model that emits a broken shape tends to emit the SAME shape
+            // again, so correcting forever just burns the round budget and lands in the same
+            // place. Stopping is right — but stopping permanently loses a run that a single
+            // fresh attempt would often salvage, so a malformed stop pauses and retries on a
+            // timer instead of ending the request.
+            //
+            // The POLICY is the pure `malformedAction` above (all four numbers are
+            // CLI-settable): the streak threshold, the delay in SECONDS, the retry cap and
+            // the enable switch. This block only performs the verdict.
+            const verdict = malformedAction({ malformedRounds, malformedRetries }, config, reason);
+            if (verdict.action === 'retry') {
+                malformedRetries++;
+                console.log(`⏸ ${malformedRounds} malformed JSON replies in a row — pausing ${config.malformedRetryDelaySec}s then auto-retrying (retry ${malformedRetries}/${config.malformedMaxRetries})`);
+                onProgress?.({
+                    type: 'rejected',
+                    text: `malformed JSON ${malformedRounds}x in a row — waiting ${config.malformedRetryDelaySec}s, then retrying (${malformedRetries}/${config.malformedMaxRetries})`,
+                });
+                if (verdict.waitMs > 0) await new Promise((r) => setTimeout(r, verdict.waitMs));
+                // A fresh streak: the retry is a NEW attempt, not a continuation of the one
+                // that failed, so it gets the full threshold again.
+                malformedRounds = 0;
+                response = await countedSend(malformedCorrectionMsg(reason, 1, config.maxMalformedRounds), toolDefs);
+                continue;
+            }
+            if (verdict.action === 'stop') {
+                return exhaustedMarker(
+                    `[⚠️ STOPPED — the model sent malformed JSON ${malformedRounds} times in a row ${verdict.why}. ` +
+                    `Last failure: ${reason}. Wake it again to continue.] `,
+                    response
+                );
+            }
+            response = await countedSend(malformedCorrectionMsg(reason, malformedRounds, config.maxMalformedRounds), toolDefs);
             continue;
         }
 
@@ -1733,14 +1768,77 @@ const PROSE_NUDGE =
 // Malformed tool-JSON attempt (raw triple quotes/newlines in string values,
 // unescaped quotes, truncated braces). Correct with the specific rule the
 // chat model keeps violating — never leak the raw row text to the client.
-const MALFORMED_MSG =
-    '### MALFORMED TOOL CALL\n' +
-    'Your previous reply contained a tool-call attempt that was NOT valid JSON and could not be parsed ' +
-    '(raw newlines or triple quotes inside string values, unescaped quotes, or a missing closing brace). ' +
-    'Resend it as a single valid fenced JSON object. Rules: escape " as \\", backslashes as \\\\, newlines as \\n. ' +
-    'NEVER use triple quotes (""") inside a JSON string — especially in write_file content; file content with ' +
-    'quotes or newlines must be escaped, not triple-quoted. One tool call per reply:\n' +
-    '```json\n{"tool":"<name>","params":{...}}\n```';
+// The malformed-JSON stop/retry decision, as PURE DATA.
+//
+// Exported and pure for the same reason `streamFailureEvents` is: the behaviour under test is
+// a SEQUENCE of decisions taken across rounds (correct -> correct -> ... -> pause -> retry ->
+// stop), and reproducing that against a live browser and a real model is not possible. As a
+// pure function the whole policy is assertable, and the loop below merely performs the
+// verdict — so the test cannot keep passing while the shipped policy drifts.
+//
+// Returns one of:
+//   { action: 'correct', reason }        — send a correction naming the reason
+//   { action: 'retry', reason, waitMs }  — pause, then correct with a fresh streak
+//   { action: 'stop', reason, why }      — give up until something wakes the lane
+function malformedAction({ malformedRounds, malformedRetries }, config, reason) {
+    if (malformedRounds < config.maxMalformedRounds) {
+        return { action: 'correct', reason };
+    }
+    if (config.malformedRetryEnabled && malformedRetries < config.malformedMaxRetries) {
+        // The delay is configured in SECONDS because that is how a human thinks about a
+        // backoff. It is converted to ms exactly once, here.
+        return { action: 'retry', reason, waitMs: Math.max(0, config.malformedRetryDelaySec) * 1000 };
+    }
+    const why = config.malformedRetryEnabled
+        ? `after ${config.malformedMaxRetries} automatic retr${config.malformedMaxRetries === 1 ? 'y' : 'ies'}`
+        : 'automatic retry is disabled';
+    return { action: 'stop', reason, why };
+}
+
+// WHY a tool-call attempt failed to parse, named concretely.
+//
+// "malformed tool JSON" alone is not actionable: the model cannot tell a raw newline
+// from a missing brace from triple quotes, so it resends the same broken shape until the
+// budget runs out. Naming the defect is what lets it fix it on the next attempt, and it is
+// also what makes the log diagnosable — a parse failure that does not say what it saw
+// cannot be told apart from a reader-side bug.
+function describeMalformedJson(text) {
+    const s = String(text || '');
+    if (!s.trim()) return 'the reply was empty';
+    if (!/"tool"\s*:/.test(s)) return 'no "tool" field, so this is not a tool call at all';
+    if (/(^|[^"\\])"""|\'\'\'/.test(s)) return 'triple quotes inside a string value';
+    let inString = false, escaped = false, depth = 0;
+    for (const ch of s) {
+        if (inString) {
+            if (escaped) { escaped = false; continue; }
+            if (ch === '\\') { escaped = true; continue; }
+            if (ch === '"') { inString = false; continue; }
+            if (ch === '\n') return 'a raw line break inside a string value (it must be escaped as \\n)';
+            if (ch === '\r') return 'a raw carriage return inside a string value';
+            if (ch === '\t') return 'a raw tab inside a string value (it must be escaped as \\t)';
+            continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+    }
+    if (inString) return 'a string value that is never closed (a missing closing quote)';
+    if (depth > 0) return 'a missing closing brace — the reply was cut off before the JSON ended';
+    if (depth < 0) return 'an extra closing brace';
+    return 'invalid JSON (check the quoting and the commas)';
+}
+
+function malformedCorrectionMsg(reason, streak, limit) {
+    return '### MALFORMED JSON DETECTED\n' +
+        `Your last reply contained a tool-call attempt that could not be parsed: ${reason}.\n` +
+        `This is attempt ${streak} of ${limit} in a row — when the limit is reached the run STOPS ` +
+        'and waits to be woken again, so fix the shape now.\n' +
+        'Resend it as ONE valid fenced JSON object. Rules: escape " as \\", backslashes as \\\\, ' +
+        'line breaks as \\n, tabs as \\t. NEVER use triple quotes (""") inside a JSON string — ' +
+        'especially in write_file content. For a multi-line file, prefer the edit_file tool: it ' +
+        'takes a small old_string/new_string instead of the entire file as one JSON string.\n' +
+        '```json\n{"tool":"<name>","params":{...}}\n```';
+}
 
 const FORMAT_ERROR_MSG =
     '### FORMAT ERROR\n' +
@@ -1852,7 +1950,9 @@ async function runHandoff({ toolDefs, onProgress, isAborted, userPrompt, lastToo
                 continue;
             }
             if (looksLikeBrokenToolJson(response) && round < 2) {
-                response = await countedSend(MALFORMED_MSG, toolDefs);
+                // Name the defect here too — this is the ONE tool call this flow needs,
+                // so a generic "malformed" leaves the model guessing at the same shape.
+                response = await countedSend(malformedCorrectionMsg(describeMalformedJson(response), 1, config.maxMalformedRounds), toolDefs);
                 continue;
             }
             if (round < 2) {
@@ -2965,5 +3065,11 @@ module.exports = {
         markUnverifiedSubmit,
         claimsWorkDone,
         UNVERIFIED_MARKER,
+        // Malformed-JSON reporting. Exported so the test drives the SHIPPED reason
+        // detector and correction text — a re-implementation would keep passing after
+        // the real one drifted, which is exactly how the flat-args bug hid.
+        describeMalformedJson,
+        malformedCorrectionMsg,
+        malformedAction,
     },
 };
