@@ -132,6 +132,13 @@ function nextId(gates, siteId) {
     return `${base}-${n}`;
 }
 
+// Port ranges the harness OWNS. They deliberately sit above the ports the rest of
+// this machine already uses (8081-8083 are oculus gateways, 9225-9230 their chromes):
+// a collision made `webchat connect` report a healthy gateway that was really another
+// stack's lane, and a model request came back answered by the wrong browser.
+const CDP_PORT_BASE = 9281;
+const GATEWAY_PORT_BASE = 8181;
+
 function add({ site, label, url, cdpPort, gatewayPort, profile }) {
     const state = read();
     const siteId = site || siteForUrl(url);
@@ -150,8 +157,8 @@ function add({ site, label, url, cdpPort, gatewayPort, profile }) {
         // them explicitly, but the MCP tool (webchat_gate_add) did not, so an agent-created
         // gate was stored as 0/0 and `webchat connect` dialled CDP :0 — "browser not
         // answering" on a browser that was open and logged in the whole time.
-        cdpPort: Number(cdpPort) || (9225 + state.gates.length),
-        gatewayPort: Number(gatewayPort) || (8081 + state.gates.length),
+        cdpPort: Number(cdpPort) || (CDP_PORT_BASE + state.gates.length),
+        gatewayPort: Number(gatewayPort) || (GATEWAY_PORT_BASE + state.gates.length),
         // A gate is only usable once the USER has confirmed the browser is logged in.
         // We cannot detect a login reliably — a signed-out Gemini still renders an
         // input box — so this flag is set by the user, deliberately, and is the only
@@ -211,6 +218,8 @@ async function probe(gate) {
 }
 
 module.exports = {
+    CDP_PORT_BASE,
+    GATEWAY_PORT_BASE,
     SITES,
     siteById,
     siteForUrl,

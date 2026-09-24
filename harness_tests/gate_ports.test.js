@@ -27,11 +27,19 @@ test('a gate added with no ports still gets usable ones', () => {
 test('the allocated pair matches what the CLI screen computes', () => {
     G.write({ gates: [], active: null });
     const first = G.add({ site: 'deepseek' });
-    assert.strictEqual(first.cdpPort, 9225, 'first gate -> 9225');
-    assert.strictEqual(first.gatewayPort, 8081, 'first gate -> 8081');
+    assert.strictEqual(first.cdpPort, G.CDP_PORT_BASE, 'first gate -> CDP base');
+    assert.strictEqual(first.gatewayPort, G.GATEWAY_PORT_BASE, 'first gate -> gateway base');
     const second = G.add({ site: 'chatgpt' });
-    assert.strictEqual(second.cdpPort, 9226, 'second gate -> 9226');
-    assert.strictEqual(second.gatewayPort, 8082, 'second gate -> 8082');
+    assert.strictEqual(second.cdpPort, G.CDP_PORT_BASE + 1);
+    assert.strictEqual(second.gatewayPort, G.GATEWAY_PORT_BASE + 1);
+});
+
+test('the harness range does not collide with the rest of this machine', () => {
+    // 8081-8083 are oculus gateway units and 9225-9230 their chromes. Allocating the
+    // harness inside those ranges made `webchat connect` report a healthy gateway that
+    // was really another stack's lane.
+    assert.ok(G.GATEWAY_PORT_BASE >= 8181, `gateway base ${G.GATEWAY_PORT_BASE} is in the occupied range`);
+    assert.ok(G.CDP_PORT_BASE >= 9281, `cdp base ${G.CDP_PORT_BASE} is in the occupied range`);
 });
 
 test('an explicit port is never overridden by the default', () => {
