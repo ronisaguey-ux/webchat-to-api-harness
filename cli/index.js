@@ -1314,102 +1314,202 @@ function cmdStatus() {
   //
   // Every failure names the one command that fixes it, because the person running
   // this is in a fresh terminal with no context.
-  async function cmdConnect(argv) {
-      const host = '127.0.0.1';
-      const st = state();
-      const rows = rowsOf(st);
-      const port = rows.find((r) => r.setting.path === 'server.port').value || 8080;
-      const mode = rows.find((r) => r.setting.path === 'webchat.mode').value;
+  // ── `webchat connect` — the executor ────────────────────────────────────────
+//
+// This runs the config the dashboard primed, and nothing else. It is deliberately
+// NOT a second configurator: every choice lives in .webchat/launch.json, which the
+// Launch screen shows along with the exact command it is about to run. When the two
+// disagree the screen is right and this is the bug.
+//
+// `--dry-run` prints that plan without starting or launching anything, which is also
+// how it is tested — spawning a real interactive agent is not something a test can
+// assert on, but the plan it would execute is.
+async function cmdConnect(argv) {
+    //   --dry-run    print the plan, touch nothing
+    //   --no-launch  do everything except hand the terminal to the harness. The
+    //                plumbing (browsers, one gateway per gate, config files) is
+    //                started for real, which is what a script or the MCP server
+    //                wants — spawning an interactive TUI is not.
+    const dryRun = argv.includes('--dry-run') || argv.includes('-n');
+    const noLaunch = dryRun || argv.includes('--no-launch');
+    const host = '127.0.0.1';
 
-      const conn = D.readConnection();
-      if (!conn) {
-          A.line('');
-          A.line(`  ${A.red('Nothing is connected yet.')}`);
-          A.line('');
-          A.line('  Run the configurator first, in another terminal:');
-          A.line(`      ${A.bold(A.cyan('webchat'))}`);
-          A.line('  then choose  Webchat & browser → Launch → log in → Connect.');
-          A.line('');
-          return 1;
-      }
+    const cfg = LC.read();
+    const { gates: allGates } = G.read();
+    const problems = [];
 
-      const cdpPort = Number(conn.cdpPort || process.env.CDP_PORT || 9225);
-      A.line('');
-      A.line(`  ${A.bold('webchat connect')}   ${A.dim(mode)}`);
-      A.line('');
+    if (!cfg.gates.length && !cfg.harnesses.length) {
+        A.line('');
+        A.line(`  ${A.red('Nothing is configured yet.')}`);
+        A.line('');
+        A.line('  Set it up in another terminal:');
+        A.line(`      ${A.bold(A.cyan('webchat'))}`);
+        A.line(`  then  ${A.bold('Webchats → Add a webchat')}  and  ${A.bold('Launch → Choose harness')}.`);
+        A.line('');
+        return 1;
+    }
 
-      // The browser is the thing the user signed into. If it is gone there is
-      // nothing to attach to, and starting a gateway would launch a fresh, logged
-      // -out browser on a virtual display — silently the wrong outcome.
-      const cdp = await D.cdpAlive(cdpPort);
-      if (!cdp.up) {
-          A.line(`  ${A.red('✗')} browser    not answering on CDP :${cdpPort}`);
-          A.line('');
-          A.line('  The window you signed into is gone. Re-open it:');
-          A.line(`      ${A.bold(A.cyan('webchat'))}   → Webchat & browser → Launch`);
-          A.line('');
-          return 1;
-      }
-      A.line(`  ${A.green('✓')} browser    CDP :${cdpPort}  ${A.dim(`${cdp.pages.length} tab(s)`)}`);
+    const v = LC.validate(cfg, allGates);
+    if (!v.ok) {
+        A.line('');
+        A.line(`  ${A.red('The saved launch config is not ready:')}`);
+        for (const p of v.problems) A.line(`    ${A.gray('·')} ${p}`);
+        A.line('');
+        A.line(`  Fix it in ${A.bold('webchat')} → ${A.bold('Launch')}, then run this again.`);
+        A.line('');
+        return 1;
+    }
 
-      let gw = await D.probeGateway(host, port);
-      if (!gw.up) {
-          A.line(`  ${A.dim('…')} gateway    starting`);
-          const res = D.startGateway();
-          if (!res.started && res.reason !== 'already running') {
-              A.line(`  ${A.red('✗')} gateway    ${res.reason || 'could not start'}`);
-              A.line(`      see the log:  ${A.dim(shortHome(D.logFile()))}`);
-              return 1;
-          }
-          for (let i = 0; i < 30 && !gw.up; i++) {
-              await new Promise((r) => setTimeout(r, 500));
-              gw = await D.probeGateway(host, port);
-          }
-      }
-      if (!gw.up) {
-          A.line(`  ${A.red('✗')} gateway    did not come up on ${host}:${port}`);
-          A.line(`      see the log:  ${A.dim(shortHome(D.logFile()))}`);
-          return 1;
-      }
-      A.line(`  ${A.green('✓')} gateway    http://${host}:${port}/v1`);
+    const chosen = cfg.gates.map((id) => allGates.find((g) => g.id === id)).filter(Boolean);
+    const primary = chosen[0];
+    const cwd = cfg.cwd && fs.existsSync(cfg.cwd) ? cfg.cwd : process.cwd();
+    const env = H.envFor(chosen);
 
-      const model = rows.find((r) => r.setting.path === 'server.modelName').value;
-      A.line(`  ${A.green('✓')} model      ${model}`);
-      A.line('');
+    A.line('');
+    A.line(`  ${A.bold('webchat connect')}   ${A.dim(`${chosen.length} webchat(s) · ${cfg.harnesses.join(', ')} · ${cfg.mode}`)}`);
+    A.line('');
 
-      // Which agent? From the saved choice, else ask once — still non-interactive
-      // when the CLI recorded a preference.
-      let agent = conn.agent || null;
-      const launcher = path.join(D.REPO, 'launch-agent.sh');
-      if (!fs.existsSync(launcher)) {
-          A.line(`  ${A.red('✗')} launch-agent.sh is missing from ${shortHome(D.REPO)}`);
-          return 1;
-      }
-      if (!agent) {
-          const agents = ['opencode', 'claude', 'codex', 'aider', 'hermes', 'crush'];
-          agent = await A.menu(
-              agents.map((a) => ({ label: a, value: a })),
-              { title: 'Which agent should run against it?', footer: ['Saved for next time.'] },
-          );
-          if (!agent || agent === A.BACK) return 1;
-          D.writeConnection({ ...conn, agent });
-      }
+    // ── one gateway per gate ────────────────────────────────────────────────
+    // A gateway serves exactly one browser, so each selected gate needs its own.
+    // Sharing one would send every model through whichever browser it attached to.
+    for (const gate of chosen) {
+        const cdp = await D.cdpAlive(gate.cdpPort);
+        if (!cdp.up) {
+            A.line(`  ${A.red('✗')} ${gate.label.padEnd(10)} browser not answering on CDP :${gate.cdpPort}`);
+            A.line('');
+            A.line(`  The window you signed into is gone. Re-open it:`);
+            A.line(`      ${A.bold(A.cyan('webchat'))}   → Webchats → ${A.bold('Open the browser')}`);
+            A.line('');
+            return 1;
+        }
 
-      A.line(`  ${A.dim('$')} ./launch-agent.sh ${agent}`);
-      A.line(`  ${A.gray('handing this terminal to the agent — Ctrl-C / /exit to come back')}`);
-      A.line('');
+        let gw = await D.probeGateway(host, gate.gatewayPort);
+        if (!gw.up && dryRun) {
+            A.line(`  ${A.yellow('·')} ${gate.label.padEnd(10)} gateway would start on :${gate.gatewayPort}`);
+        } else {
+            if (!gw.up) {
+                A.line(`  ${A.dim('…')} ${gate.label.padEnd(10)} gateway starting on :${gate.gatewayPort}`);
+                const res = D.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort });
+                if (!res.started && res.reason !== 'already running') {
+                    A.line(`  ${A.red('✗')} ${gate.label.padEnd(10)} gateway ${res.reason || 'could not start'}`);
+                    A.line(`      see the log:  ${A.dim(shortHome(D.logFile(D.gatewayKey(gate.gatewayPort))))}`);
+                    return 1;
+                }
+                for (let i = 0; i < 30 && !gw.up; i++) {
+                    await new Promise((r) => setTimeout(r, 500));
+                    gw = await D.probeGateway(host, gate.gatewayPort);
+                }
+            }
+            if (!gw.up) {
+                A.line(`  ${A.red('✗')} ${gate.label.padEnd(10)} gateway did not come up on ${host}:${gate.gatewayPort}`);
+                A.line(`      see the log:  ${A.dim(shortHome(D.logFile(D.gatewayKey(gate.gatewayPort))))}`);
+                return 1;
+            }
+            A.line(`  ${A.green('✓')} ${gate.label.padEnd(10)} CDP :${gate.cdpPort}  gateway http://${host}:${gate.gatewayPort}/v1`);
+        }
+    }
 
-      // The agent owns the TTY from here, so the TUI must give it back first.
-      D.restoreForExec();
-      const { spawnSync } = require('child_process');
-      const res = spawnSync(launcher, [agent], { cwd: D.REPO, stdio: 'inherit' });
-      if (res.error) {
-          A.line(`  ${A.red('could not launch:')} ${res.error.message}`);
-          return 1;
-      }
-      return res.status || 0;
-  }
+    // ── what each harness needs on disk ─────────────────────────────────────
+    const launches = [];
+    for (const hid of cfg.harnesses) {
+        const h = H.harnessById(hid);
+        if (!h) { problems.push(`unknown harness "${hid}"`); continue; }
+        if (!H.installed(h) && !dryRun) {
+            A.line(`  ${A.red('✗')} ${h.label}  not installed (${h.bin} is not on PATH)`);
+            return 1;
+        }
+        if (!dryRun) {
+            try { H.prepareConfigFiles(h, chosen, cwd, env, cfg.mode); } catch (e) {
+                A.line(`  ${A.red('✗')} ${h.label}  could not write its config: ${e.message}`);
+                return 1;
+            }
+        }
+        launches.push({ h, argv: H.argvFor(h, cfg.mode) });
+    }
+    if (problems.length) {
+        for (const p of problems) A.line(`  ${A.red('✗')} ${p}`);
+        return 1;
+    }
 
+    A.line(`  ${A.green('✓')} model      ${env.HARNESS_MODEL_NAME}`);
+    A.line(`  ${A.green('✓')} directory  ${shortHome(cwd)}`);
+    A.line('');
+
+    // Only worth saying when it would otherwise surprise someone: with one gate there
+    // is nothing to explain, and `reason` is deliberately null.
+    const reach = H.reachability(launches[0].h, chosen);
+    if (reach.reason) {
+        A.line(`  ${A.dim(reach.reason)}`);
+        A.line('');
+    }
+
+    // ── hand the terminal to the first harness ──────────────────────────────
+    // They are interactive programs, so exactly one can own this TTY. The rest are
+    // printed as ready-to-paste commands rather than spawned blind.
+    const first = launches[0];
+    const rest = launches.slice(1);
+
+    if (dryRun) {
+        A.line(`  ${A.dim('dry run — nothing started')}`);
+        for (const { h, argv } of launches) {
+            A.line(`  ${A.gray(`${h.bin} ${argv.join(' ')}`.trim())}`);
+        }
+        A.line('');
+        return 0;
+    }
+
+    if (noLaunch) {
+        // Everything is up and wired; we simply do not take over the terminal.
+        A.line(`  ${A.green('✓')} ready — nothing launched (--no-launch)`);
+        for (const { h, argv } of launches) {
+            A.line(`      ${A.cyan(`${h.bin} ${argv.join(' ')}`.trim())}`);
+        }
+        A.line('');
+        D.writeConnection({
+            gates: chosen.map((g) => ({ id: g.id, gatewayPort: g.gatewayPort, cdpPort: g.cdpPort })),
+            agent: launches[0].h.id,
+            mode: cfg.mode,
+            cwd,
+            connectedAt: new Date().toISOString(),
+        });
+        return 0;
+    }
+
+    A.line(`  ${A.dim('$')} ${first.h.bin} ${first.argv.join(' ')}`.trimEnd());
+    A.line(`  ${A.gray('handing this terminal to it — Ctrl-C / exit to come back')}`);
+    A.line('');
+
+    if (rest.length) {
+        A.line(`  ${A.bold('The other harness(es) need their own terminal:')}`);
+        for (const { h, argv } of rest) {
+            A.line(`      ${A.cyan(`${h.bin} ${argv.join(' ')}`.trim())}`);
+        }
+        A.line('');
+    }
+
+    D.writeConnection({
+        gates: chosen.map((g) => ({ id: g.id, gatewayPort: g.gatewayPort, cdpPort: g.cdpPort })),
+        agent: first.h.id,
+        mode: cfg.mode,
+        cwd,
+        connectedAt: new Date().toISOString(),
+    });
+
+    // The agent owns the TTY from here, so the TUI must give it back first.
+    D.restoreForExec();
+    const { spawnSync } = require('child_process');
+    const args = first.argv;
+    const res = spawnSync(first.h.bin, args, {
+        cwd,
+        stdio: 'inherit',
+        env: { ...process.env, ...env, HARNESS_MODE: cfg.mode },
+    });
+    if (res.error) {
+        A.line(`  ${A.red('could not launch:')} ${res.error.message}`);
+        return 1;
+    }
+    return res.status || 0;
+}
 
 module.exports = {
     screenDashboard, screenSite, screenSettings, screenGates, screenStart,

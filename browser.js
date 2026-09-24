@@ -158,6 +158,10 @@ function chromeProfile() {
  * "no browser found" is the normal cold-start answer, not an error.
  */
 const CDP_PROBE_PORTS = [9225, 9224, 9222, 9223];
+// The CLI gives each extra webchat 9226, 9227, … so a gateway for gate #2 can find
+// its own browser. These are probed AFTER CDP_PROBE_PORTS when nothing is configured,
+// and are what makes "several webchats at once" reachable rather than theoretical.
+const CDP_EXTRA_PORTS = [9226, 9227, 9228, 9229, 9230];
 
 /**
  * The port our OWN launched Chrome should expose CDP on.
@@ -175,8 +179,24 @@ function cdpPort() {
     return CDP_PROBE_PORTS[0];
 }
 
+/**
+ * The ports to try, in order, when looking for a browser to attach to.
+ *
+ * Pure and exported so the ORDER can be tested without a network: with several
+ * webchats connected, getting this order wrong means gate #2's gateway attaches to
+ * gate #1's browser — the wrong account answering, with no error anywhere.
+ */
+function cdpProbeOrder() {
+    const mine = cdpPort();
+    return [mine, ...CDP_PROBE_PORTS, ...CDP_EXTRA_PORTS].filter((p, i, a) => p && a.indexOf(p) === i);
+}
+
 async function findRunningBrowserWs() {
-    for (const port of CDP_PROBE_PORTS) {
+    // The port we were CONFIGURED for comes first. With several webchats connected at
+    // once, 9225 is gate #1's browser — probing the conventional list in order would
+    // attach a gateway meant for gate #2 to gate #1's session, which is the wrong
+    // account answering. Any port we did not launch is only a fallback.
+    for (const port of cdpProbeOrder()) {
         try {
             const r = await fetch(`http://127.0.0.1:${port}/json/version`, {
                 signal: AbortSignal.timeout(1000),
@@ -3632,4 +3652,8 @@ module.exports = {
     getAndClearThinkBuf,
     resetTeeForHandoff,
     takeThreadSwap,
+    // Exported for the multi-webchat test. Pure and network-free, so the probe ORDER
+    // can be asserted directly — the bug it guards is attaching to the wrong gate's
+    // browser, which produces a working gateway answering as the wrong account.
+    cdpProbeOrder,
 };

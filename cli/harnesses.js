@@ -61,10 +61,16 @@ const HARNESSES = [
         // equivalent (only `opencode debug config` reads it) — the file must sit
         // where the agent runs, which is why we write one.
         needsConfigFile: true,
+        // opencode has no --yolo. Its only permission flag is --auto ("auto-approve
+        // permissions that are not explicitly denied"), verified with `opencode --help`
+        // — a flag that does not exist makes the launch fail outright, so the mode
+        // feature looked implemented and was broken for the default harness.
+        // The finer manual/auto distinction lives in the generated opencode.json's
+        // `permission` block, which prepareConfigFiles() writes.
         modes: {
             manual: [],
-            auto: [],
-            yolo: ['--yolo'],
+            auto: ['--auto'],
+            yolo: ['--auto'],
         },
     },
     {
@@ -196,9 +202,18 @@ function reachability(h, gates) {
     };
 }
 
+// opencode expresses permissions in its config file, not on the command line — its
+// only CLI flag is --auto. So the permission MODE has to be written here, or two of
+// the three modes would launch the same agent.
+const OPENCODE_PERMISSION = {
+    manual: { edit: 'ask', bash: 'ask' },
+    auto: { edit: 'allow', bash: 'allow' },
+    yolo: { edit: 'allow', bash: 'allow', webfetch: 'allow', '*': 'allow' },
+};
+
 // Write the config a harness needs before it starts. Only opencode needs one, and it
 // is gitignored because it would otherwise leak this machine's base URL into a clone.
-function prepareConfigFiles(h, gates, cwd, env) {
+function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
     if (h.id !== 'opencode') return null;
     const file = path.join(cwd, 'opencode.json');
     const models = {};
@@ -217,6 +232,7 @@ function prepareConfigFiles(h, gates, cwd, env) {
         // An agent harness is a different product from this gateway: its plugins and
         // permissions must not leak into the webchat lane.
         plugin: [],
+        permission: OPENCODE_PERMISSION[mode] || OPENCODE_PERMISSION.manual,
     };
     try {
         fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
@@ -241,5 +257,6 @@ module.exports = {
     envFor,
     reachability,
     prepareConfigFiles,
+    OPENCODE_PERMISSION,
     argvFor,
 };
