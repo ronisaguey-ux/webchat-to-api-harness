@@ -9,7 +9,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const W = require('../webchat-models');
+const W = require('../src/models/webchat-models.js');
 
 test('DeepSeek publishes exactly the four combinations the owner listed', () => {
     const ids = W.modelIdsFor('deepseek');

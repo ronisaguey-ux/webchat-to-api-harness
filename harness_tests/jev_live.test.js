@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const j = require('../jev.js');
+const j = require('../src/runtime/jev.js');
 
 test('Jev fails open on an empty request (never throws)', async () => {
     const r = await j.decide('', {});
@@ -39,7 +39,7 @@ test('Jev LIVE: a choice answer is always one we declared', async () => {
 // ── the wired interceptor: shadow mode must LOG, not change behaviour ────────
 test('shadow mode never changes the reply, and off mode never calls Jev', async () => {
     const path = require.resolve('../server.js');
-    const browserPath = require.resolve('../browser');
+    const browserPath = require.resolve('../src/browser/browser.js');
     const calls = { openNewChat: 0 };
     const stub = new Proxy({}, { get(_t, k) {
         if (k === 'openNewChat') return async () => { calls.openNewChat += 1; };

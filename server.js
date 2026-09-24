@@ -5,7 +5,7 @@ const { spawn, spawnSync } = require('child_process');
 const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
-const config = require('./config');
+const config = require('./src/core/config');
 
 // 08-16 (user): the gemini webchat lane renders tool receipts in the visible
 // tab, and the deepseek lane (plan executor) runs on the SAME formatToolResult
@@ -17,11 +17,11 @@ const {
     initBrowser, connectToWebchat, sendPrompt, closeBrowser, getPage, probePage,
     buildFullPrompt, openNewChat, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
     resetTeeForHandoff, takeThreadSwap, browserAlive, markShuttingDown,
-} = require('./browser');
-const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
-const { McpPool } = require('./mcp');
-const compactor = require('./compactor');
-const memory = require('./memory');
+} = require('./src/browser/browser');
+const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./src/tools/tools');
+const { McpPool } = require('./src/tools/mcp');
+const compactor = require('./src/runtime/compactor');
+const memory = require('./src/runtime/memory');
 
 // 09-22 (owner): attach ANY MCP server. The pool owns discovery and routing; it is
 // created from config here and discovered lazily at the first request (fail-open).
@@ -34,10 +34,10 @@ const mcpPool = new McpPool(config.mcpServers);
 // to the prompt so the webchat sees them in context. Seen-markers persist
 // per-port so replies are not re-injected after a gateway restart. The
 // telegram responder skips "to"-tagged items (they are gateway-routed).
-const PATHS = require('./paths');
-const ANTI_SPIRAL = require('./anti_spiral');
-const RATE_LIMIT = require('./rate_limit');
-const WEBCHAT_MODELS = require('./webchat-models');
+const PATHS = require('./src/core/paths');
+const ANTI_SPIRAL = require('./src/runtime/anti_spiral');
+const RATE_LIMIT = require('./src/runtime/rate_limit');
+const WEBCHAT_MODELS = require('./src/models/webchat-models');
 const MAIN_REPLY_FILE = PATHS.mainReplyFile();
 const MAIN_REPLY_SEEN_FILE = PATHS.mainReplySeenFile(process.env.PORT);
 let mainReplyLastSeen = '';
@@ -1353,7 +1353,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             try {
                 const _fs = require('fs');
                 const _path = require('path');
-                const _roots = require('./sandbox').roots || [];
+                const _roots = require('./src/tools/sandbox').roots || [];
                 if (_args.path && !_path.isAbsolute(_args.path)) {
                     for (const _root of _roots) {
                         const _cand = _path.join(_root, _args.path);
@@ -2434,8 +2434,8 @@ app.get('/', (req, res) => {
             'POST /__shutdown': 'stop the gateway',
         },
         notes: [
-            'The browser opens minimised on purpose. To sign in, run: ./launch-agent.sh any',
-            'Point any coding agent here with: ./launch-agent.sh <opencode|claude|codex|aider|hermes>',
+            'The browser opens minimised on purpose. To sign in, run: ./scripts/launch-agent.sh any',
+            'Point any coding agent here with: ./scripts/launch-agent.sh <opencode|claude|codex|aider|hermes>',
             'A model sent to /v1/chat/completions must equal the `model` above.',
             'Codex: set model_provider to this base URL and model to "anymodel" or "webchat" (no slash — see /v1/models).',
             `Response format: allowPlainText=${config.allowPlainText} noTools=${config.noTools}`,

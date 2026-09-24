@@ -12,7 +12,7 @@
 //
 const test = require('node:test');
 const assert = require('node:assert');
-const { parseToolCalls } = require('../tools.js');
+const { parseToolCalls } = require('../src/tools/tools.js');
 
 test('the flat form is accepted (this was the bug)', () => {
     const r = parseToolCalls('{"tool":"git_status","repo":"helpotron"}');

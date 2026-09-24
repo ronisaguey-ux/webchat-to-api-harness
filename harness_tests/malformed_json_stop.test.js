@@ -80,7 +80,7 @@ test('the correction quotes a fenced envelope the model can copy', () => {
 });
 
 test('the defaults are the owner-specified ones: 5 / enabled / 100s / 5', () => {
-    const config = require(path.join(__dirname, '..', 'config.js'));
+    const config = require(path.join(__dirname, '..', 'src', 'core', 'config.js'));
     assert.strictEqual(config.maxMalformedRounds, 5);
     assert.strictEqual(config.malformedRetryEnabled, true);
     assert.strictEqual(config.malformedRetryDelaySec, 100);
@@ -90,7 +90,7 @@ test('the defaults are the owner-specified ones: 5 / enabled / 100s / 5', () => 
 test('the delay is read in SECONDS and the settings are CLI-reachable', () => {
     // Configured in seconds because that is how a human thinks about a backoff; the code
     // multiplies at the sleep. A unit mix-up here would be a 100ms wait, not 100s.
-    const config = require(path.join(__dirname, '..', 'config.js'));
+    const config = require(path.join(__dirname, '..', 'src', 'core', 'config.js'));
     assert.ok(config.malformedRetryDelaySec >= 1 && config.malformedRetryDelaySec < 3600,
         'sane seconds range — a ms value here would be a bug');
     const fs = require('fs');

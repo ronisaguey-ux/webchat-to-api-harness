@@ -1,11 +1,11 @@
 const path = require('path');
 const fs = require('fs');
-const PATHS = require('./paths');
+const PATHS = require('../core/paths');
 const os = require('os');
 const { spawn } = require('child_process');
-const config = require('./config');
+const config = require('../core/config');
 const sandbox = require('./sandbox');
-const memory = require('./memory');
+const memory = require('../runtime/memory');
 
 // 08-14 WEDGE ROOT-CAUSE ceiling: tool RESULTS must never round-trip a huge
 // file through the chat tab (read_file on a 5.86MB state file → 6.2M-char
@@ -831,7 +831,7 @@ function loadDisabledTools() {
         }
     }
     try {
-        const MC = require('./master_config');
+        const MC = require('../core/master_config');
         const list = MC.pickList('DISABLED_TOOLS', 'tools', 'disabled');
         for (const n of (Array.isArray(list) ? list : [])) if (n) set.add(String(n));
     } catch { /* no master config — env alone is enough */ }

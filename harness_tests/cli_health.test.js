@@ -21,7 +21,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const D = require('../cli/daemon');
+const D = require('../cli/daemon.js');
 
 function serveHealth(body, status = 200) {
     return new Promise((resolve) => {

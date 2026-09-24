@@ -15,7 +15,7 @@
 // recovered or costs 15 minutes. It is pure, so it is testable without a browser.
 const test = require('node:test');
 const assert = require('node:assert');
-const browser = require('../browser.js');
+const browser = require('../src/browser/browser.js');
 
 // The exact string Chromium produced, copied from the live failure.
 const REAL_DEAD_RENDERER =

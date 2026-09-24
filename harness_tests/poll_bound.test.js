@@ -16,7 +16,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 
-const SRC = fs.readFileSync(path.join(__dirname, '..', 'browser.js'), 'utf8');
+const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'browser', 'browser.js'), 'utf8');
 
 // Pull `const boundPoll = (...) => { ... };` out of the source verbatim.
 function extractBoundPoll() {

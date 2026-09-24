@@ -21,7 +21,7 @@
 //
 const fs = require('fs');
 const path = require('path');
-const d = require('./daemon');
+const d = require('./daemon.js');
 
 // Permission mode. The owner's definition — it is about WHEN the agent asks, not
 // about what the agent is capable of:

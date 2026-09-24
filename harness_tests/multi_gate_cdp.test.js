@@ -24,7 +24,7 @@ function withBrowser(env, fn) {
         if (/(browser|config|master_config)\.js$/.test(k)) delete require.cache[k];
     }
     try {
-        return fn(require(path.join(__dirname, '..', 'browser.js')));
+        return fn(require(path.join(__dirname, '..', 'src', 'browser', 'browser.js')));
     } finally {
         if (saved === undefined) delete process.env.CDP_PORT; else process.env.CDP_PORT = saved;
     }

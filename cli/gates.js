@@ -19,7 +19,7 @@
 //
 const fs = require('fs');
 const path = require('path');
-const d = require('./daemon');
+const d = require('./daemon.js');
 
 // The sites we ship selectors for. `generic` is deliberately first-class and has NO
 // selectors: the owner's model is that generic launches an EMPTY browser, the user

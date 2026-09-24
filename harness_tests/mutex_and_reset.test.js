@@ -16,7 +16,7 @@ const path = require('node:path');
 const calls = { openNewChat: 0, sendPrompt: 0 };
 
 // Stub ./browser BEFORE server.js destructures it, so no chrome is launched.
-const browserPath = require.resolve('../browser');
+const browserPath = require.resolve('../src/browser/browser.js');
 const stub = new Proxy({}, {
     get(_t, k) {
         if (k === 'openNewChat') return async () => { calls.openNewChat += 1; };

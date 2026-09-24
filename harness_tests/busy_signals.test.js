@@ -24,7 +24,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { busyProbe } = require('../browser.js');
+const { busyProbe } = require('../src/browser/browser.js');
 
 // ── A minimal DOM ───────────────────────────────────────────────────────────
 function makeEl(opts = {}) {

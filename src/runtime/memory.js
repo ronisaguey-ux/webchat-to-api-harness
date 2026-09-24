@@ -18,7 +18,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const PATHS = require('./paths');
+const PATHS = require('../core/paths');
 
 const MAX_MEMORY_CHARS = parseInt(process.env.MAX_MEMORY_CHARS || '20000', 10);
 

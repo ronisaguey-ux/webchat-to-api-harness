@@ -30,7 +30,7 @@
 //     guardrail, not a jail — see the caveat in the README.
 
 const fs = require('fs');
-const PATHS = require('./paths');
+const PATHS = require('../core/paths');
 const path = require('path');
 
 // Roots that make sense for the oculus work this harness drives. Override with
@@ -67,7 +67,7 @@ function resolveRoots(raw) {
 // module read the environment only, so setting them there was an INERT CONTROL:
 // the runbook said bash was permitted, the config agreed, and every run_bash was
 // still refused. Prefer config, fall back to env, keep the safe defaults.
-const _cfg = (() => { try { return require('./config'); } catch { return null; } })();
+const _cfg = (() => { try { return require('../core/config'); } catch { return null; } })();
 const _cfgSandbox = (_cfg && _cfg.sandbox) || {};
 const _envBool = (name, dflt) => (process.env[name] === undefined ? dflt : String(process.env[name]) !== 'false');
 const ENABLED = _cfgSandbox.enabled !== undefined

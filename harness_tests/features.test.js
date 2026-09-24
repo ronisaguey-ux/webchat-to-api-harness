@@ -25,11 +25,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const config = require('../config');
-const tools = require('../tools');
-const compactor = require('../compactor');
-const memory = require('../memory');
-const { McpPool, normalizeSpec, normalizeMcpResult } = require('../mcp');
+const config = require('../src/core/config.js');
+const tools = require('../src/tools/tools.js');
+const compactor = require('../src/runtime/compactor.js');
+const memory = require('../src/runtime/memory.js');
+const { McpPool, normalizeSpec, normalizeMcpResult } = require('../src/tools/mcp.js');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-features-'));
 

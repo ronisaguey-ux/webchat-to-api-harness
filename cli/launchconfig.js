@@ -15,7 +15,7 @@
 //
 const fs = require('fs');
 const path = require('path');
-const d = require('./daemon');
+const d = require('./daemon.js');
 
 const file = () => path.join(d.stateDir(), 'launch.json');
 

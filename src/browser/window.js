@@ -82,7 +82,7 @@ async function attach() {
     const ws = await findRunningBrowserWs();
     if (!ws) {
         console.error('window.js: no running harness browser found.');
-        console.error('  Start one first:  webchat connect    (or run `./start.sh`)');
+        console.error('  Start one first:  webchat connect    (or run `./scripts/start.sh`)');
         process.exit(1);
     }
     const puppeteer = require('puppeteer');

@@ -9,17 +9,17 @@
 #  exec the agent.
 #
 #  Usage:
-#      ./launch-agent.sh <agent> [-- <extra agent args>]
+#      ./scripts/launch-agent.sh <agent> [-- <extra agent args>]
 #
 #  Agents:  opencode | claude | codex | aider | hermes | crush | any
 #
 #  Examples:
-#      ./launch-agent.sh opencode
-#      ./launch-agent.sh claude
-#      ./launch-agent.sh aider -- --model whatever
-#      ./launch-agent.sh any            # just print the env, launch nothing
+#      ./scripts/launch-agent.sh opencode
+#      ./scripts/launch-agent.sh claude
+#      ./scripts/launch-agent.sh aider -- --model whatever
+#      ./scripts/launch-agent.sh any            # just print the env, launch nothing
 #
-#  If your agent is not in the table below, run `./launch-agent.sh any` and read
+#  If your agent is not in the table below, run `./scripts/launch-agent.sh any` and read
 #  the printed variables — they are the entire integration surface. Any tool that
 #  lets you set an OpenAI-compatible base URL will work with them.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ case "$HEALTH" in
 
   Start it first, from the repo root:
 
-      ./start.sh                     # or: npm start
+      ./scripts/start.sh                     # or: npm start
 
   Then, in another terminal, point your agent at it with this script.
 
@@ -197,7 +197,7 @@ MSG
   any|"")
     banner
     # STDOUT, not stderr: this is the primary output of this mode, so it must be
-    # capturable (`./launch-agent.sh any > vars.txt`) and pipeable.
+    # capturable (`./scripts/launch-agent.sh any > vars.txt`) and pipeable.
     cat <<MSG
 OPENAI_BASE_URL=$OPENAI_BASE_URL
 OPENAI_API_BASE=$OPENAI_API_BASE
