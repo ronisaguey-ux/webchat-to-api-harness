@@ -317,8 +317,20 @@ const SCHEMA = [
                 advanced: true,
             },
             {
-                path: 'limits.maxMalformedRounds', label: 'Malformed-JSON corrections', type: 'number', env: 'MAX_MALFORMED_ROUNDS',
-                help: 'How many broken tool-JSON replies get a correction before the harness gives up and returns an error.',
+                path: 'limits.maxMalformedRounds', label: 'Malformed-JSON stop threshold', type: 'number', env: 'MAX_MALFORMED_ROUNDS',
+                help: 'How many CONSECUTIVE unparseable tool-JSON replies before the run stops. The counter resets on any good parse, so this bounds a streak, not the total. A malformed reply is always reported back to the model with the exact reason it failed.',
+            },
+            {
+                path: 'limits.malformedRetryEnabled', label: 'Auto-retry after a malformed stop', type: 'bool', env: 'MALFORMED_RETRY_ENABLED',
+                help: 'When the stop threshold is hit, pause and try again by itself instead of ending the run. A model that emitted a bad shape is often fine moments later, so this salvages runs that would otherwise be lost.',
+            },
+            {
+                path: 'limits.malformedRetryDelaySec', label: 'Auto-retry delay (seconds)', type: 'number', env: 'MALFORMED_RETRY_DELAY_SEC',
+                help: 'How long to wait before each automatic retry, in SECONDS — 30, 60, 100. Default 100.',
+            },
+            {
+                path: 'limits.malformedMaxRetries', label: 'Max auto-retries', type: 'number', env: 'MALFORMED_MAX_RETRIES',
+                help: 'How many automatic retries before the run genuinely stops and waits for a wake. 0 stops immediately (same as disabling auto-retry).',
             },
             {
                 path: 'features.toolCompactor', label: 'Compact tool results', type: 'bool', env: 'TOOL_COMPACTOR',

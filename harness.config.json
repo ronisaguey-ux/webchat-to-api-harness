@@ -253,7 +253,10 @@
     "antiSpiralMinWords": 40,
     "execTimeoutMs": 10000,
     "wrapUpRounds": 3,
-    "maxMalformedRounds": 3
+    "maxMalformedRounds": 5,
+    "malformedRetryEnabled": true,
+    "malformedRetryDelaySec": 100,
+    "malformedMaxRetries": 5
   },
   "paths": {
     "workspaceRoot": "",

@@ -244,8 +244,28 @@ const cfg = {
     mcpServers: (MC.raw.mcp && Array.isArray(MC.raw.mcp.servers)) ? MC.raw.mcp.servers : [],
 
     // ── 09-22 (owner): more control over the tool-call loops ────────────────
-    // malformed-tool-JSON correction rounds (was hardcoded at 3).
-    maxMalformedRounds: MC.pickNum('MAX_MALFORMED_ROUNDS', 'limits', 'maxMalformedRounds') || 3,
+    // CONSECUTIVE malformed-tool-JSON attempts before the run STOPS.
+    //
+    // Owner rule (09-24): malformed JSON must never fail silently, and a model stuck in a
+    // shape it cannot produce must not burn the whole round budget — it stops, waits, and
+    // tries again on its own. The counter resets on any successful parse, so this bounds a
+    // STREAK, not the total. 5 is the owner's number.
+    maxMalformedRounds: MC.pickNum('MAX_MALFORMED_ROUNDS', 'limits', 'maxMalformedRounds') || 5,
+
+    // ── auto-retry after a malformed-JSON stop (owner, 09-24) ───────────────
+    // When the streak above is hit the run would otherwise be over until something woke
+    // it. Instead it pauses and tries again by itself, because a model that emitted a bad
+    // shape is often fine moments later — a fresh attempt is cheap and a dead run is not.
+    //
+    // malformedRetryEnabled — master switch for the whole behaviour.
+    // malformedRetryDelaySec — how long to WAIT before retrying, in SECONDS (30, 60, …).
+    //   Configurable in seconds because that is how a human thinks about a backoff; the
+    //   code converts to ms at the sleep.
+    // malformedMaxRetries — how many automatic retries before it genuinely stops and waits
+    //   for an external wake. 0 disables retrying without touching the enable switch.
+    malformedRetryEnabled: MC.pickBool('MALFORMED_RETRY_ENABLED', 'limits', 'malformedRetryEnabled') !== false,
+    malformedRetryDelaySec: MC.pickNum('MALFORMED_RETRY_DELAY_SEC', 'limits', 'malformedRetryDelaySec') || 100,
+    malformedMaxRetries: MC.pickNum('MALFORMED_MAX_RETRIES', 'limits', 'malformedMaxRetries') || 5,
 
     // Session persistence
     cookieFile: MC.pickStr('COOKIE_FILE', 'paths', 'cookieFile') || '.cookies.json',
