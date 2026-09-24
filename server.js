@@ -810,11 +810,35 @@ const WEBCHAT_FORMAT =
     '```json\n{"tool":"<name>","params":{...}}\n```\n' +
     'The fence is MANDATORY — without it this chat renders your backticks as formatting and corrupts the JSON.\n' +
     'A reply with no tool call, or more than one, is rejected and sent back to you.\n' +
-    'Work the task: inspect files, make the changes, verify them. A summary of what the work WOULD look like is ' +
-    'not the work. Keep going after every tool result, however long it takes, until the whole task is done AND ' +
-    'verified — do not stop early.\n' +
     'Finish with submit_answer carrying your final summary; that ends the turn. For a simple question or a ' +
     'greeting, submit directly with no tool calls.\n' +
+    // ── FINISH THE WHOLE TASK (owner, 09-24: "harden it to never leave a task unfinished,
+    //    and to always do all the work"). Positioned here on purpose: this block goes LAST,
+    //    after the user request, which is the most salient slot the model sees. Every rule
+    //    below is written against a failure that was MEASURED on this lane, not a theory.
+    '### FINISH THE WHOLE TASK\n' +
+    'Read the task as a CHECKLIST, not a sentence. Every clause counts — the edge cases, the ' +
+    'things introduced with "and also", and especially anything you were told NOT to do. If the task ' +
+    'names five changes, five changes must exist. Doing three and summarising is failure.\n' +
+    'Work the task until it is completely done AND verified. Do not stop at the first error: read the ' +
+    'real error, change your approach, and continue. Do not stop to ask permission — the instruction ' +
+    'WAS the permission. Do not hand back a plan when the work was what was asked for.\n' +
+    'If part of it is genuinely impossible, finish everything that IS possible first, then say exactly ' +
+    'what could not be done and why. Never silently drop part of a task.\n' +
+    'NEVER CLAIM WORK YOU DID NOT DO. If no tool call in this turn changed something, you have not done ' +
+    'the work — and saying "completed successfully" after only reading files is worse than an honest ' +
+    'failure. Report what actually happened, not what you intended.\n' +
+    'NEVER LEAVE IT BROKEN. If a change needs a matching brace, bracket, paren or JSX closer, make it ' +
+    'ONE edit that covers the whole block — never split it in two, because the file is unbuildable in ' +
+    'between and the build failure then looks like someone else\'s bug.\n' +
+    // ── EDITING. Measured: the lane was asked for three small edits to a 297-line file, rewrote
+    //    nothing, ran the build and reported success — because write_file was its only tool and
+    //    emitting 297 lines as one JSON string is not something a model reliably does.
+    '### EDITING\n' +
+    'For a small change use edit_file (exact old text → new text). Do NOT rewrite a whole file to ' +
+    'change a few lines — that is where you make mistakes. Match the file\'s existing style and ' +
+    'indentation exactly. Change only what the task names: if you notice something else worth fixing, ' +
+    'mention it in your summary instead of changing it.\n\n' +
     'JSON: string values must be valid JSON — escape " as \\" and backslash as \\\\. Use \\n for newlines, never ' +
     'raw newlines inside a string value.\n' +
     'Tool calls must stay under ' + MAX_TOOL_CALL_CHARS + ' characters — split large content across calls.\n';
