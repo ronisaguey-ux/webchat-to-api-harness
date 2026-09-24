@@ -494,8 +494,13 @@ const PENDING_KEYS = [];
 // Arrow-key menu. `items` = [{label, hint, value, disabled}]; returns the chosen
 // item's value, or BACK on Esc, or throws QuitError on Ctrl-C.
   async function menu(items, opts = {}) {
-      const { title, footer, width = termWidth(), pageSize, tickMs = 0, onTick = null } = opts;
-      let index = Math.max(0, items.findIndex((i) => !i.disabled));
+      const { title, footer, width = termWidth(), pageSize, tickMs = 0, onTick = null, startIndex } = opts;
+      // A caller that re-draws the SAME list after an action (toggling a checkbox, say)
+      // passes startIndex so the cursor stays put. Without it the cursor snaps back to
+      // the first row and pressing Enter looks like the menu reset itself.
+      let index = Number.isInteger(startIndex) && startIndex >= 0 && startIndex < items.length
+          ? startIndex
+          : Math.max(0, items.findIndex((i) => !i.disabled));
       const size = pageSize || Math.max(3, Math.min(items.length, termHeight() - 10));
 
       for (;;) {
