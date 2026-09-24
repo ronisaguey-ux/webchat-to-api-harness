@@ -1526,7 +1526,7 @@ async function cmdConnect(argv) {
         } else {
             if (!gw.up) {
                 A.line(`  ${A.dim('…')} ${gate.label.padEnd(10)} gateway starting on :${gate.gatewayPort}`);
-                const res = D.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort });
+                const res = D.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort, profile: gate.profile });
                 if (!res.started && res.reason !== 'already running') {
                     A.line(`  ${A.red('✗')} ${gate.label.padEnd(10)} gateway ${res.reason || 'could not start'}`);
                     A.line(`      see the log:  ${A.dim(shortHome(D.logFile(D.gatewayKey(gate.gatewayPort))))}`);
