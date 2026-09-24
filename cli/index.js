@@ -1681,70 +1681,96 @@ module.exports = {
 // ── Interactive entry point ────────────────────────────────────────────────
 // ── The greeting ────────────────────────────────────────────────────────────
 //
-// Shown the first time the CLI is opened, and reachable later from the main menu.
+// Three beats, in this order, because each one is a question the next depends on:
+//   1. who this is, with the character waving, so the first thing on screen explains
+//      the tool rather than asking the user something they cannot answer yet;
+//   2. which system the agent runs on;
+//   3. how much of the tour they want.
 //
-// The character and the text go through the menu's `above` hook, NOT drawn before the
-// menu is called. menu() clears the screen on every redraw, so anything drawn first is
-// wiped before it can be read - which is exactly why the greeting used to vanish and
-// leave only the menu on screen. `above` is re-rendered every pass, so he STAYS, and
-// because it can be a function he keeps waving while the menu waits.
+// The block goes through the menu's `above` hook, NOT drawn beforehand: menu() clears
+// the screen on every redraw, so anything drawn first is wiped before it can be read.
+// `above` may be a function, which is what keeps the character MOVING while the menu
+// waits.
 async function screenWelcome() {
     const SK = require('./stickman.js');
-    // PARAGRAPHS, not pre-broken lines. Wrapping already-broken text individually leaves
-    // ragged half-lines, because each one is wrapped on its own as if it started fresh.
+
+    // Roughly fifty words: what this is, what it is for, how it works. Long enough to be
+    // a real explanation, short enough to be read instead of skipped.
     const intro = [
-        'Hello, and welcome to the webchat-to-api harness.',
+        'Hello. This is the webchat-to-api harness.',
         '',
-        'This CLI is the control center for the harness. It sets up everything, controls '
-            + 'everything, and is meant to be the only thing you have to drive.',
+        'It runs a real webchat - Claude, ChatGPT, Gemini, DeepSeek - in a browser you '
+            + 'sign in to once, then serves it as an ordinary model API. Any coding agent '
+            + 'can then use that account as if it were an endpoint.',
         '',
-        'It works by putting a real webchat behind an ordinary model API. Claude, ChatGPT, '
-            + 'Gemini, DeepSeek, Kimi and others each run in a real browser window you sign '
-            + 'in to by hand, once. After that any agentic CLI - Claude Code, opencode, '
-            + 'Codex - uses that account as if it were a model endpoint: no API key, no '
-            + 'per-token bill, and the browser stays yours.',
-        '',
-        'Everything here is a setting, and none of it is permanent.',
+        'No API key, no per-token bill, and the browser stays yours.',
     ];
 
     let tick = 0;
     const draw = () => {
-        // He waves for the first few seconds, then settles into a friendly idle so the
-        // screen is not permanently fidgeting while the user reads.
-        const pose = tick < 24 ? 'wave' : 'idle';
-        const art = SK.frameFor(pose, tick);
-        // Wrapped to a fixed column so the character never gets pushed sideways by a
-        // long line - the block has to keep the same width on every row.
-        const COL = Math.max(28, Math.min(66, A.termWidth() - 26));
-        const wide = A.termWidth() >= COL + 24;   // only stand him beside the text if he fits
+        const art = SK.frameFor('wave', tick);
+        const COL = Math.max(28, Math.min(64, A.termWidth() - 26));
+        const wide = A.termWidth() >= COL + 24;
         const text = [];
         intro.forEach((para, i) => {
             const wrapped = A.wrapText(para, COL);
             for (const w of wrapped) text.push(i === 0 && w === wrapped[0] ? A.bold(w) : w);
         });
         const rows = [];
-        for (let i = 0; i < Math.max(art.length, text.length); i++) {
+        for (let i = 0; i < Math.max(text.length, wide ? art.length : 0); i++) {
             const a = wide ? (art[i] || '').padEnd(19) : '';
             const s = text[i] || '';
-            rows.push(s ? `${A.padVisible('  ' + s, COL + 5)}${a}`.replace(/\s+$/, '') : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));
+            rows.push(s ? `${A.padVisible('  ' + s, COL + 5)}${a}`.replace(/\s+$/, '')
+                        : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));
         }
-        return A.centerBlock(rows, { reserve: 10 });
+        return A.centerBlock(rows, { reserve: 6 });
     };
 
     const pick = await A.menu([
-        { label: 'Basic tour', hint: 'the least you need to get it working', value: 'basic' },
-        { label: 'Full tour', hint: 'every screen, and how the whole thing works', value: 'full' },
-        { label: 'I know what I am doing', hint: 'straight to the menu', value: 'skip' },
+        { label: 'Continue', hint: 'the harness, in one paragraph', value: 'ok' },
     ], {
         title: 'Welcome',
         above: draw,
-        tickMs: 170,
+        tickMs: 180,
+        // He waves the WHOLE time. This used to stop after twenty-four ticks and settle
+        // into a still frame, which is why he looked frozen: by the time anyone had read
+        // the paragraph he had already stopped.
         onTick: () => { tick++; return []; },
-        footer: ['The tour is always available again from the main menu.'],
     });
-
-    if (pick === 'basic' || pick === 'full') { await screenTutorial(pick); return true; }
     return pick !== A.BACK;
+}
+
+// ── How much of the tour? ───────────────────────────────────────────────────
+//
+// Asked AFTER the platform question, so the answer can be honest about what each tour
+// covers on the system they just chose.
+async function screenTourChoice() {
+    const SK = require('./stickman.js');
+    const body = [
+        'You can change your mind at any point - the tour never saves anything,',
+        'and it is always available again from the main menu.',
+    ];
+    const rows = [];
+    const art = SK.frameFor('idle', 0);
+    const COL = Math.max(28, Math.min(64, A.termWidth() - 26));
+    const wide = A.termWidth() >= COL + 24;
+    const text = [];
+    for (const para of body) for (const w of A.wrapText(para, COL)) text.push(w);
+    for (let i = 0; i < Math.max(text.length, wide ? art.length : 0); i++) {
+        const a = wide ? (art[i] || '').padEnd(19) : '';
+        const s = text[i] || '';
+        rows.push(s ? `${A.padVisible('  ' + s, COL + 5)}${a}`.replace(/\s+$/, '')
+                    : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));
+    }
+
+    return A.menu([
+        { label: 'Straight to it', hint: 'no tour - I will find my way', value: 'skip' },
+        { label: 'Light tutorial', hint: 'the least it takes to get it working', value: 'basic' },
+        { label: 'Full tutorial', hint: 'every screen, and how the whole thing works', value: 'full' },
+    ], {
+        title: 'Want a tour?',
+        above: () => A.centerBlock(rows, { reserve: 8 }),
+    });
 }
 
 // ── Tutorial mode ───────────────────────────────────────────────────────────
@@ -2060,9 +2086,11 @@ async function interactive() {
     A.enterFullScreen();
     if (!platformChosen()) {
         try {
-            const goOn = await screenWelcome();
-            if (!goOn) { A.restore(); return; }
+            // 1. who this is, 2. which system the agent is on, 3. how much tour.
+            if (!(await screenWelcome())) { A.restore(); return; }
             await screenFirstRun();
+            const tour = await screenTourChoice();
+            if (tour === 'basic' || tour === 'full') await screenTutorial(tour);
         } catch (e) { if (e instanceof A.QuitError) { A.restore(); return; } throw e; }
     }
     for (;;) {
@@ -2212,4 +2240,4 @@ async function main(argv) {
     return 0;
 }
 
-module.exports = { main, interactive, screenFirstRun, platformChosen, screenWelcome, screenTutorial };
+module.exports = { main, interactive, screenFirstRun, platformChosen, screenWelcome, screenTourChoice, screenTutorial };
