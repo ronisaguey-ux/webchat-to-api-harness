@@ -137,9 +137,14 @@ function build(ctx) {
         // Ports: give each gate its own browser and gateway port so two gates can run
         // side by side. Derived from how many already exist, so the first is the
         // classic 9225/8081 and later ones step up.
+        // Harness ports start ABOVE the ranges the rest of this box already uses:
+        // 8081/8082/8083 are oculus gateway units and 9225-9230 are their chromes, so
+        // the old 9225+/8081+ allocation collided with them. `webchat connect` then
+        // reported a healthy gateway that was in fact an oculus lane, and a request for
+        // one webchat's model came back answered by a DIFFERENT webchat's browser.
         const { gates } = G.read();
-        const cdpPort = 9225 + gates.length;
-        const gatewayPort = 8081 + gates.length;
+        const cdpPort = G.CDP_PORT_BASE + gates.length;
+        const gatewayPort = G.GATEWAY_PORT_BASE + gates.length;
 
         const gate = G.add({
             site: site.id,
