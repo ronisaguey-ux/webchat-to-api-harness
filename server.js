@@ -2571,13 +2571,26 @@ app.post('/newchat', async (req, res) => {
                 error: 'a send is in flight — retry when idle',
             });
         }
-        await openNewChat();
-        console.log('🆕 /newchat — fresh thread opened');
-        res.json({ ok: true, message: 'fresh chat opened', page: getPage() ? getPage().url() : null });
-    } catch (e) {
-        console.log('⚠️ /newchat failed:', String(e.message).slice(0, 90));
-        res.status(500).json({ error: String(e.message) });
-    }
+          await openNewChat();
+          console.log('🆕 /newchat — fresh thread opened');
+          res.json({ ok: true, message: 'fresh chat opened', page: getPage() ? getPage().url() : null });
+      } catch (e) {
+          // A reset that did not happen must NOT answer ok:true. openNewChat now
+          // verifies the thread is empty and throws when it is not, so the caller
+          // learns the truth instead of seeding a task into stale history — which is
+          // how a plan job came to run a command that appears in no plan.
+          if (e && e.resetFailed) {
+              console.log(`⚠️ /newchat could not clear the thread: ${String(e.message).slice(0, 90)}`);
+              return res.status(409).json({
+                  ok: false,
+                  resetFailed: true,
+                  remainingRows: e.remainingRows,
+                  error: String(e.message),
+              });
+          }
+          console.log('⚠️ /newchat failed:', String(e.message).slice(0, 90));
+          res.status(500).json({ error: String(e.message) });
+      }
 });
 
 // ── POST /handoff {content} — swap to a fresh thread AND seed it ─────────────
