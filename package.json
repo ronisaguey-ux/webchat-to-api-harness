@@ -8,7 +8,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check browser.js && node --check tools.js && node --check config.js && node --check rate_limit.js",
+    "check": "node --check server.js && node --check src/browser/browser.js && node --check src/tools/tools.js && node --check src/core/config.js && node --check src/runtime/rate_limit.js",
     "test": "node --test harness_tests/*.test.js",
     "webchat": "node bin/webchat.js"
   },
