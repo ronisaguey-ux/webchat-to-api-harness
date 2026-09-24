@@ -170,10 +170,14 @@ function modelIdFor(gate) {
 // process and the extra gates remain reachable by name through it. Being honest about
 // that limit matters more than pretending every tool is multi-provider: the CLI says
 // which of the selected gates the chosen harness can actually reach.
-function envFor(gates, { modelName } = {}) {
+function envFor(gates, { modelName, hubPort } = {}) {
     if (!gates.length) return {};
     const primary = gates[0];
-    const port = primary.gatewayPort || 8081;
+    // With a hub running, the harness gets ONE url and every connected webchat is
+    // reachable through it -- including the toggle ids, which are just more models.
+    // Without one it falls back to the first gate, which is what a single-webchat
+    // setup has always used.
+    const port = hubPort || primary.gatewayPort || 8081;
     const base = `http://127.0.0.1:${port}`;
     return {
         OPENAI_BASE_URL: `${base}/v1`,
@@ -187,11 +191,13 @@ function envFor(gates, { modelName } = {}) {
 }
 
 // Which gates can this harness actually reach, and why not the others?
-function reachability(h, gates) {
-    // Every harness here speaks to ONE base URL, so it reaches the primary gate
-    // directly. The others are reachable only through the gateway process itself —
-    // which means a tool that supports exactly one provider cannot switch accounts.
-    // Saying so is the difference between a working setup and a confusing one.
+function reachability(h, gates, hubPort) {
+    // With the hub, every connected webchat is reachable from the one url because each
+    // is published as its own model id. Without it the harness only sees the primary
+    // gate, and a tool that supports exactly one provider cannot switch accounts.
+    // Saying which of the two you have is the difference between a working setup and a
+    // confusing one.
+    if (hubPort) return { ok: true, direct: gates.length, viaName: 0, hub: true, reason: null };
     if (gates.length <= 1) return { ok: true, direct: gates.length, viaName: 0, reason: null };
     return {
         ok: true,

@@ -207,6 +207,40 @@ function startGateway(opts = {}) {
 }
 
 /** Stop the gateway for one port, and only that one. */
+// The hub is one process serving one url, so it has a single fixed key.
+const HUB_KEY = 'hub';
+
+function hubRunning() {
+    const pid = readPid(HUB_KEY);
+    if (!pid) return 0;
+    try { process.kill(pid, 0); return pid; } catch { return 0; }
+}
+
+function startHub(opts = {}) {
+    const existing = hubRunning();
+    if (existing) return { started: false, reason: 'already running', pid: existing };
+    const port = Number(opts.port);
+    if (!port) return { started: false, reason: 'no port' };
+    ensureStateDir();
+    const out = fs.openSync(path.join(stateDir(), `hub-${port}.log`), 'a');
+    const child = spawn(process.execPath, [path.join(__dirname, 'hub-server.js')], {
+        detached: true,
+        stdio: ['ignore', out, out],
+        env: { ...process.env, HUB_PORT: String(port) },
+    });
+    child.unref();
+    writePid(HUB_KEY, child.pid);
+    return { started: true, pid: child.pid, port };
+}
+
+function stopHub() {
+    const pid = hubRunning();
+    if (!pid) return { stopped: false, reason: 'not running' };
+    try { process.kill(pid, 'SIGTERM'); } catch (e) { return { stopped: false, reason: e.message }; }
+    clearPid(HUB_KEY);
+    return { stopped: true, pid };
+}
+
 function stopGateway(port) {
     const key = gatewayKey(port);
     const pid = gatewayRunning(port);
@@ -545,7 +579,8 @@ module.exports = {
     pidFile, logFile,
     readPid, isAlive, writePid, clearPid,
     httpGet, httpPost, probeGateway,
-    gatewayRunning, startGateway, stopGateway, displayEnv, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
+    gatewayRunning, startGateway, stopGateway, displayEnv,
+    startHub, stopHub, hubRunning, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     tailLines,
     copyToClipboard, restoreForExec,
