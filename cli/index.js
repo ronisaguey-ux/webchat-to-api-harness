@@ -247,7 +247,7 @@ async function screenDashboard() {
           { label: 'Logs', hint: 'gateway output, with a one-click bug report', value: 'logs' },
           { label: 'Doctor', hint: 'check everything and report', value: 'doctor' },
             { label: 'Tour', hint: 'the guided walkthrough, any time', value: 'tutorial' },
-          { label: 'Quit', value: 'quit' },
+          { label: 'Back to the start', hint: 'the greeting, the question and the tour', value: 'restart' },
       ];
 
     // Auto-refresh only while the menu is waiting. A tick re-renders the panel and
@@ -1700,32 +1700,46 @@ async function screenWelcome() {
     const intro = [
         'Hey - welcome to the webchat-to-api harness.',
         '',
-        'It takes any AI webchat you already have - free or paid - Claude, ChatGPT, Gemini, '
-            + 'DeepSeek, Kimi, and others - and turns it into an ordinary model API.',
+        'It turns any AI webchat you have - free or paid - into an ordinary model API.',
         '',
-        'How: it drives a real browser with Puppeteer and sends that webchat a specialised '
-            + 'system prompt, so the tab answers the way an API endpoint would. Sniff the '
-            + 'requests and you would see a normal model API; behind it is your own browser, '
-            + 'signed in as you.',
+        'Puppeteer drives a tab you sign in to; a system prompt makes it answer like an '
+            + 'endpoint.',
         '',
-        'What that means: point any agentic harness at it - Claude Code, opencode, Codex - '
-            + 'or anything else you fancy plugging in, and it runs on the account you already '
-            + 'pay for. No API key, no token meter, no quota to buy.',
+        'Point Claude Code, opencode or Codex at it - free or paid, no API key.',
         '',
-        'This CLI is the control centre: add webchats, choose your agent, set what it may '
-            + 'and may not do, then launch. If you would rather not click at all, there is an '
-            + 'MCP mode that lets an agent already running drive all of this for you.',
+        'This CLI is the control centre; MCP lets an agent drive it.',
     ];
 
     let tick = 0;
-    const draw = () => {
+
+    // The greeting has to FIT. It was authored at 26 rows against a 24-row terminal once
+    // the menu was reserved, so the top scrolled away and the first thing anyone saw was
+    // the middle of a paragraph - which is what "the CLI looks broken" looked like.
+    // Measuring by hand got this wrong twice, so the block measures ITSELF now: if the
+    // paragraphs do not fit the rows it has, it drops whole ones from the end until they
+    // do. Whole paragraphs, never a half-sentence, and the first line always survives.
+    const RESERVE = 9;    // measured in a real 76x24 pane: box + blank line + footer
+    // The greeting is authored as loose lines with '' between them; turn that into
+    // paragraphs once so the shrinker can drop whole ones.
+    const asParas = () => {
+        const out = []; let cur = [];
+        for (const line of intro) {
+            if (line === '') { if (cur.length) out.push(cur.join(' ')); cur = []; }
+            else cur.push(line);
+        }
+        if (cur.length) out.push(cur.join(' '));
+        return out;
+    };
+
+    const build = (paras) => {
         const art = SK.frameFor('wave', tick);
         const COL = Math.max(28, Math.min(64, A.termWidth() - 26));
         const wide = A.termWidth() >= COL + 24;
         const text = [];
-        intro.forEach((para, i) => {
+        paras.forEach((para, i) => {
             const wrapped = A.wrapText(para, COL);
             for (const w of wrapped) text.push(i === 0 && w === wrapped[0] ? A.bold(w) : w);
+            if (i < paras.length - 1) text.push('');
         });
         // Centre him against the paragraph: pinned to the top he stands beside the first
         // nine lines and the rest of the greeting runs on without him.
@@ -1737,21 +1751,49 @@ async function screenWelcome() {
             rows.push(s ? `${A.padVisible('  ' + s, COL + 5)}${a}`.replace(/\s+$/, '')
                         : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));
         }
-        return A.centerBlock(rows, { reserve: 6 });
+        return A.centerBlock(rows, { reserve: RESERVE });
     };
 
+    const draw = () => {
+        let paras = asParas();
+        let rows = build(paras);
+        // Drop the MIDDLE paragraph, not the tail: the how-it-works line is the one a user
+        // can afford to lose on a short terminal. The pricing and MCP lines are what they
+        // are deciding on, so those go last.
+        while (rows.length + RESERVE > A.termHeight() && paras.length > 3) {
+            paras = paras.filter((_, i) => i !== Math.min(2, paras.length - 2));
+            rows = build(paras);
+        }
+        return rows;
+    };
+
+    let current = '';
+    try { current = String(S.resolveAll().platform || ''); } catch { /* unset is fine */ }
+    const mine = (v) => (current === v ? '   (current)' : '');
+
     const pick = await A.menu([
-        { label: 'Continue', hint: 'the harness, in one paragraph', value: 'ok' },
+        { label: 'Linux', hint: `bash, forward slashes, POSIX rules${mine('linux')}`, value: 'linux' },
+        { label: 'Windows', hint: `cmd.exe, backslashes, Windows rules${mine('windows')}`, value: 'windows' },
     ], {
-        title: 'Welcome',
+        title: 'Which system is your agent running on?',
         above: draw,
         tickMs: 180,
         // He waves the WHOLE time. This used to stop after twenty-four ticks and settle
         // into a still frame, which is why he looked frozen: by the time anyone had read
         // the paragraph he had already stopped.
         onTick: () => { tick++; return []; },
+        footer: ['Your agent may be on another machine - this sets its shell and paths.'],
     });
-    return pick !== A.BACK;
+
+    // Esc here is a no-op on purpose: the greeting is the floor of the walk, so this screen
+    // cannot be escaped out of. Ctrl-C is the only way out of the CLI.
+    if (pick !== 'linux' && pick !== 'windows') return A.BACK;
+
+    const res = await S.saveSetting('platform', pick);
+    if (res && res.ok === false) {
+        await A.message('Could not save', [`${res.reason || 'the platform was not written'}`]);
+    }
+    return 'next';
 }
 
 // ── How much of the tour? ───────────────────────────────────────────────────
@@ -2047,39 +2089,6 @@ async function screenTutorial(mode = 'basic') {
 // sense. Guessing it from process.platform is wrong for the case this harness exists for
 // - driving an agent on Windows from a Linux browser - so it is asked once, and after
 // that it is a setting like any other.
-async function screenFirstRun() {
-    const SK = require('./stickman.js');
-    A.clear();
-    A.line('');
-    for (const l of SK.beside([
-        'Last thing before the menu:',
-        '',
-        'which system is your AGENT running on?',
-        '',
-        'Not necessarily this machine - pointing an',
-        'agent on Windows at a browser on Linux is',
-        'exactly what this setting is for.',
-        '',
-        'It decides the shell, how paths are written,',
-        'and which commands are refused. Change it',
-        'any time in Settings -> Platform.',
-    ], 'point', 0)) A.line(l);
-    A.newline();
-
-    const pick = await A.menu([
-        { label: 'Linux', hint: 'bash, forward slashes, POSIX rules', value: 'linux' },
-        { label: 'Windows', hint: 'cmd.exe, backslashes, Windows rules', value: 'windows' },
-    ], { title: 'Which system is your agent running on?' });
-    if (pick !== 'linux' && pick !== 'windows') return null;
-
-    const res = await S.saveSetting('platform', pick);
-    if (res && res.ok === false) {
-        await A.message('Could not save', [`${res.reason || 'the platform was not written'}`]);
-        return null;
-    }
-    return pick;
-}
-
 // Has the user ever answered the platform question? The key being present in the FILE is
 // the signal — a value that only comes from the schema default is not an answer.
 function platformChosen() {
@@ -2098,15 +2107,36 @@ async function interactive() {
     // other — which is what made the editor look broken. The alternate buffer is what
     // every full-screen TUI uses; `restore()` hands the terminal back on any exit path.
     A.enterFullScreen();
-    if (!platformChosen()) {
-        try {
-            // 1. who this is, 2. which system the agent is on, 3. how much tour.
-            if (!(await screenWelcome())) { A.restore(); return; }
-            await screenFirstRun();
-            const tour = await screenTourChoice();
-            if (tour === 'basic' || tour === 'full') await screenTutorial(tour);
-        } catch (e) { if (e instanceof A.QuitError) { A.restore(); return; } throw e; }
+
+    // ── The opening screens are a WALK, and Esc walks back ───────────────────
+    //
+    // Esc used to mean "carry on with whatever is next", which is why it read as
+    // moving FORWARD: on the greeting it went on to the platform question, and on the
+    // tour question it went on to the menu. A back key that advances is worse than no
+    // back key at all.
+    //
+    // Now it is a position, not a one-way run: Esc steps back one screen, and the
+    // GREETING is the floor. At the greeting Esc does nothing, so the CLI cannot be
+    // Escaped out of at all - Ctrl-C is the only way out, and that is deliberate.
+    const OPENING = [
+        async () => screenWelcome(),
+        async () => {
+            const pick = await screenTourChoice();
+            if (pick === A.BACK) return A.BACK;
+            if (pick === 'basic' || pick === 'full') await screenTutorial(pick);
+            return 'next';
+        },
+    ];
+
+    let at = OPENING.length;          // past the walk once it has been completed
+    if (!platformChosen()) at = 0;
+    while (at < OPENING.length) {
+        let step;
+        try { step = await OPENING[at](); }
+        catch (e) { if (e instanceof A.QuitError) { A.restore(); return; } throw e; }
+        at = step === A.BACK ? Math.max(0, at - 1) : at + 1;
     }
+
     for (;;) {
         let choice;
         try {
@@ -2115,7 +2145,12 @@ async function interactive() {
             if (e instanceof A.QuitError) break;
             throw e;
         }
-          if (choice === A.BACK || choice === 'quit') break;
+          // Back on the main menu returns to the opening screens rather than quitting:
+          // the walk is the floor, and only Ctrl-C leaves.
+          if (choice === A.BACK || choice === 'restart') { at = 0; while (at < OPENING.length) {
+              const step = await OPENING[at]();
+              at = step === A.BACK ? Math.max(0, at - 1) : at + 1;
+          } continue; }
           try {
               // `site` is the old single-webchat screen; kept reachable so an older
               // habit still lands somewhere sensible, but the menu advertises Webchats.
@@ -2254,4 +2289,4 @@ async function main(argv) {
     return 0;
 }
 
-module.exports = { main, interactive, screenFirstRun, platformChosen, screenWelcome, screenTourChoice, screenTutorial };
+module.exports = { main, interactive, platformChosen, screenWelcome, screenTourChoice, screenTutorial };

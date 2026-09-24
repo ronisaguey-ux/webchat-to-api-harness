@@ -65,8 +65,8 @@ test('picking Windows writes it, and the CLI then behaves as Windows', async () 
     const realMenu = A.menu;
     A.menu = async () => 'windows';
     try {
-        const picked = await idx.screenFirstRun();
-        assert.strictEqual(picked, 'windows');
+        const picked = await idx.screenWelcome();
+        assert.strictEqual(picked, 'next', 'the greeting asks the question and moves on');
     } finally { A.menu = realMenu; }
 
     // Persisted, so it is not asked again.
@@ -111,7 +111,7 @@ test('a config with no platform yet still renders the picker and offers both', a
     let offered = null;
     const realMenu = A.menu;
     A.menu = async (items) => { offered = items; return A.BACK; };
-    try { await idx.screenFirstRun(); } finally { A.menu = realMenu; }
+    try { await idx.screenWelcome(); } finally { A.menu = realMenu; }
 
     assert.ok(offered, 'the picker must render a menu');
     const values = offered.map((i) => i.value);
