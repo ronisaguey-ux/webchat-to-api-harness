@@ -3,6 +3,35 @@ const path = require('path');
 const { spawn } = require('child_process');
 const puppeteer = require('puppeteer');
 const config = require('./config');
+const RATE_LIMIT = require('./rate_limit');
+
+// ── A webchat stream error, classified so the send gate can act on it ─────────
+//
+// The upstream model being overloaded arrives as a stream error:
+//   "Server busy, please try again later. (finish_reason: generation_timeout)"
+// The site's own text says to retry, and one resend survives it. But the send gate in
+// server.js only resends when `e.retryable` is set, and this message matches none of
+// its patterns — so a transient upstream hiccup surfaced to the caller as a hard 500.
+// Measured: a 75-tool-call plan run died exactly here and the whole job was lost to a
+// condition that a single resend fixes.
+//
+// A THROTTLE IS THE OPPOSITE and must not be retried: resending hammers the same
+// account and deepens the cooldown. It is checked FIRST because a throttle reads
+// "Try again later", which the transient patterns below would otherwise match — that
+// collision would disable the cooldown path for every rate-limit error.
+const TRANSIENT_STREAM_RE = /server busy|generation_timeout|overloaded|service unavailable|please try again later/i;
+
+function streamError(text) {
+    const raw = String(text || '');
+    const err = new Error('DeepSeek stream error: ' + raw + ' — wait ~30s and retry');
+    err.streamError = true;
+    if (RATE_LIMIT.isRateLimitText(raw)) {
+        err.rateLimited = true;
+    } else if (TRANSIENT_STREAM_RE.test(raw)) {
+        err.retryable = true;
+    }
+    return err;
+}
 
 // ── Webchat-mode quirks (09-13) ─────────────────────────────────────────────
 // config.quirks comes from the selected mode in harness.config.json. Every
@@ -2618,7 +2647,7 @@ async function waitForResponse(before, typedText) {
                 // (e.g. "Messages too frequent") — nothing else ever arrives.
                 // Fail fast with the error text; a hung client retries, and
                 // each retry re-hammers the same account limit.
-                if (tee.error) throw new Error('DeepSeek stream error: ' + tee.error + ' — wait ~30s and retry');
+                if (tee.error) throw streamError(tee.error);
                 if (tee.text.trim().length > 0) return tee.text;
                 if (tee.done) throw new Error('Webchat stream ended without content (error status in stream)');
             }
@@ -3512,6 +3541,10 @@ module.exports = {
     closeBrowser,
     getPage: () => page,
     probePage,
+    // Exported for the retry-classification test. Pure (text in, Error out), so it can
+    // be exercised without a browser — and it must be the SHIPPED function, because a
+    // test that re-implements the regex proves only that the regex was copied.
+    streamError,
     // Exported for the busy-signal regression tests. It is pure (DOM in, bool
     // out), so it can be exercised without a browser — which is what would have
     // caught the phantom-stop short-circuit.

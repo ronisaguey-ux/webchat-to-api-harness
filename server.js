@@ -561,8 +561,14 @@ async function countedSend(msg, defs) {
         // 18 stalls on :8080 against 12 retry banners, and the engine burned its full 480s
         // budget on every stall the retry never reached. browser.js now tags the error;
         // the message test stays as a fallback for any other site that throws.
+        // 09-23: the fallback also covers a transient upstream overload
+        // ("Server busy ... generation_timeout"), which browser.js tags as retryable
+        // at the source — this pattern exists only for a site that throws it untagged.
+        // A throttle is excluded here on purpose: it is handled as a cooldown below,
+        // and resending it would deepen the limit.
           const _retryable = !!e.retryable
-              || /Timed out|stalled: no new output|Requesting main frame too early/i.test(String(e.message));
+              || (/Timed out|stalled: no new output|Requesting main frame too early|server busy|generation_timeout/i.test(String(e.message))
+                  && !RATE_LIMIT.isRateLimitText(String(e.message)));
         if (sendRetriesLeft > 0 && _retryable) {
             sendRetriesLeft--;
             console.log(`⏱ send timed out${e.partialAnswerChars != null ? ` (partial answer was ${e.partialAnswerChars} chars)` : ''} — resending with a RETRY banner`);
