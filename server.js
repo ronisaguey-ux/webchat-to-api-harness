@@ -1566,6 +1566,43 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     return exhaustedMarker('[⚠️ webchat model did not submit a final answer within the round budget] ', response);
 }
 
+// The Anthropic SSE sequence a FAILED stream must end with.
+//
+// Pure and exported so the shape is assertable without a browser: the failure this
+// fixes is invisible in a unit test that only checks "did it throw", because the bug
+// is the ABSENCE of the terminal events and the dangling content block.
+//
+// A client that already has an open block only learns the turn is over from
+// message_stop; without it Claude Code reports "Server error mid-response" and the
+// session cannot continue cleanly.
+function streamFailureEvents({ partial = '', openBlock = -1, message = '' } = {}) {
+    const out = [];
+    const emit = (event, data) => out.push({ event, data });
+
+    // ★ DO NOT RE-SEND `partial`. It is only a count for the usage line.
+    //
+    // Every character in it was already streamed as content_block_delta before the
+    // failure, in blocks that were already stopped. Emitting it again duplicates the
+    // whole answer on the client — which is precisely the REPORTED symptom "tool
+    // calls/receipts are rendered twice in the Claude Code terminal". The client has
+    // the text; what it is missing is the end of the message.
+    //
+    // Close a block the loop left open. An unterminated block is the other half of
+    // what the client chokes on, so this is not bookkeeping.
+    if (typeof openBlock === 'number' && openBlock >= 0) {
+        emit('content_block_stop', { type: 'content_block_stop', index: openBlock });
+    }
+
+    emit('error', { type: 'error', error: { type: 'api_error', message: String(message) } });
+    emit('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'error', stop_sequence: null },
+        usage: { output_tokens: String(partial).length },
+    });
+    emit('message_stop', { type: 'message_stop' });
+    return out;
+}
+
 // The exhausted-path markers must never carry a raw broken JSON envelope
 // (08-13: truncation used to leave the client staring at half a tool call).
 function exhaustedMarker(prefix, response) {
@@ -2398,6 +2435,14 @@ app.post('/v1/messages', async (req, res) => {
     // landed in the catch with heartbeat in the const TDZ → ReferenceError →
     // the whole gateway process crashed ("connection refused" for everyone).
     let heartbeat = null;
+    // The index of a content block that has been STARTED but not yet STOPPED, or -1.
+    // Only `ev` writes it; the catch block needs it to close a block the loop had
+    // open when it threw. Tracked here rather than in the catch because the catch
+    // cannot see blockIndex, and re-deriving it would be a guess.
+    let openBlock = -1;
+    // Text produced so far by the loop. The catch streams it so a failure mid-task
+    // still shows the user how far it got, instead of an empty turn plus an error.
+    let partial = '';
     try {
         const { system, messages, tools, model, stream } = req.body || {};
         // 08-14 GATEWAY PICKER: strip the claude/ prefix from discovery-row
@@ -2501,7 +2546,16 @@ app.post('/v1/messages', async (req, res) => {
 
         // Never write after the client left (mid-handoff swaps run long) —
         // res.write on an ended response fires an unhandled stream error.
-        const ev = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+        const ev = (event, data) => {
+            // Keep the catch block's two facts in step with what the client has seen:
+            // which block is still open, and what text has actually been delivered.
+            if (event === 'content_block_start') openBlock = data.index;
+            else if (event === 'content_block_stop') openBlock = -1;
+            else if (event === 'content_block_delta' && data.delta && typeof data.delta.text === 'string' && data.delta.type === 'text_delta') {
+                partial += data.delta.text;
+            }
+            if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        };
 
         // 08-14 KEEPALIVE: the webchat cogitates SILENTLY for minutes before
         // its first chunk (the tab streams no thinking tokens), and the
@@ -2604,6 +2658,23 @@ app.post('/v1/messages', async (req, res) => {
     } catch (error) {
         if (heartbeat) clearInterval(heartbeat);
         console.error('❌ Error:', error);
+        // 09-23 REPORTED (Claude Code against this exact endpoint): "the client
+        // receives partial tool output followed by an SSE/server error. This leaves
+        // Claude Code unable to report results or continue cleanly."
+        //
+        // The cause is the SHAPE of the error, not the error itself. Anthropic's
+        // protocol ends every stream with message_delta + message_stop, and a client
+        // that already has an open content block only learns the turn is over from
+        // message_stop. Writing `event: error` and calling res.end() leaves the block
+        // open with no terminal event, which Claude Code renders as
+        // "API Error: Server error mid-response. The response above may be incomplete."
+        // — it cannot tell a finished turn from a cut cable, so a clean failure looks
+        // like a network fault and the session is left in an unusable state.
+        //
+        // So: close any open block, then end the stream with the SAME terminal
+        // sequence a success uses, carrying the error in the stop_reason. The client
+        // gets a valid finished message it can report on.
+        //
         // 08-13 EVENING: the 08-12 writableEnded guard missed the SSE path —
         // ev() writes had ALREADY sent headers when handleRequest threw (180s
         // waitForResponse timeout mid run-until-done task) → res.json() threw
@@ -2614,7 +2685,10 @@ app.post('/v1/messages', async (req, res) => {
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: error.message } });
         } else if (!res.writableEnded && !res.destroyed) {
             try {
-                res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: error.message } })}\n\n`);
+                const message = String(error && error.message ? error.message : error);
+                for (const frame of streamFailureEvents({ partial, openBlock, message })) {
+                    ev(frame.event, frame.data);
+                }
                 res.end();
             } catch (e) { /* client already gone */ }
         }
@@ -2810,6 +2884,7 @@ module.exports = {
     NEW_CHAT_EVERY_SENDS,
     needsSingleThread,
     __test: {
+        streamFailureEvents,
         setRequestInFlight: (v) => { requestInFlight = !!v; },
         getRequestInFlight: () => requestInFlight,
         setSendCount: (n) => { sendCount = Number(n) || 0; },
