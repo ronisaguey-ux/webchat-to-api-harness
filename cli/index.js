@@ -163,13 +163,19 @@ async function screenDashboard() {
                 ? A.gray(`   last ${fmtDuration(m.lastSendAgoMs)} ago`) : A.gray('   none yet')}`);
 
             const p = m.pacing || {};
-            if (showPacing && p.min != null) {
-                const lo = p.min, elapsed = p.elapsedSinceLastSend;
-                const ready = elapsed == null || elapsed >= lo;
-                body.push(`${A.dim('pacing')}     ${lo / 1000}–${p.max / 1000}s between sends`
-                    + (elapsed != null ? `   ${ready ? A.green('ready') : A.yellow('waiting')}` : ''));
-                if (elapsed != null && !ready) {
-                    body.push(`           ${bar(elapsed / lo)}  ${A.gray(`next send in ~${fmtDuration(Math.max(0, lo - elapsed))}`)}`);
+            if (showPacing) {
+                if (!p.applies) {
+                    // Say WHY there is no wait, so "no pacing" does not read as
+                    // "pacing is broken" on a webchat that never had any.
+                    body.push(`${A.dim('pacing')}     ${A.green('none')}  ${A.gray(p.reason || 'no pacing on this webchat')}`);
+                } else if (p.min != null) {
+                    const lo = p.min, elapsed = p.elapsedSinceLastSend;
+                    const ready = elapsed == null || elapsed >= lo;
+                    body.push(`${A.dim('pacing')}     ${lo / 1000}–${p.max / 1000}s between sends`
+                        + (elapsed != null ? `   ${ready ? A.green('ready') : A.yellow('waiting')}` : ''));
+                    if (elapsed != null && !ready) {
+                        body.push(`           ${bar(elapsed / lo)}  ${A.gray(`next send in ~${fmtDuration(Math.max(0, lo - elapsed))}`)}`);
+                    }
                 }
             }
 
