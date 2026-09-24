@@ -1461,7 +1461,11 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
         // return, so every engine step burned its full timeout on this lane.
         if (!config.allowPlainText && looksLikeBrokenToolJson(response) && malformedRounds < config.maxMalformedRounds) {
             malformedRounds++;
-            console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent`);
+            // Log WHAT the parser saw. Without the text, a reader-side bug (the
+            // renderer losing the code block) is indistinguishable from the model
+            // never emitting a tool call — and the two need opposite fixes. The
+            // reply is short here by definition (a parse failure), so it is safe.
+            console.log(`⚠️ malformed tool JSON (round ${round + 1}) — correction sent. raw=[${String(response).replace(/\s+/g, ' ').slice(0, 400)}]`);
             onProgress?.({ type: 'rejected', text: 'malformed tool JSON — correction sent' });
             response = await countedSend(MALFORMED_MSG, toolDefs);
             continue;
