@@ -146,8 +146,12 @@ function add({ site, label, url, cdpPort, gatewayPort, profile }) {
         // single-instance fight: the second launch fails with "browser already
         // running for this profile" and the user sees a dead button.
         profile: profile || path.join(d.stateDir(), `chrome-profile-${id}`),
-        cdpPort: Number(cdpPort) || 0,
-        gatewayPort: Number(gatewayPort) || 0,
+        // Allocate ports instead of defaulting to 0. The CLI's add-gate screen passes
+        // them explicitly, but the MCP tool (webchat_gate_add) did not, so an agent-created
+        // gate was stored as 0/0 and `webchat connect` dialled CDP :0 — "browser not
+        // answering" on a browser that was open and logged in the whole time.
+        cdpPort: Number(cdpPort) || (9225 + state.gates.length),
+        gatewayPort: Number(gatewayPort) || (8081 + state.gates.length),
         // A gate is only usable once the USER has confirmed the browser is logged in.
         // We cannot detect a login reliably — a signed-out Gemini still renders an
         // input box — so this flag is set by the user, deliberately, and is the only
