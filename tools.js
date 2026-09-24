@@ -814,6 +814,45 @@ async function executeTool(toolName, args, ctx) {
 //      - RAW TRIPLE-QUOTED STRINGS inside the JSON ("content":"""..."""),
 //        which the chat model writes for file content instead of JSON escapes.
 // ──────────────────────────────────────────────────────
+// Escape raw control characters that appear INSIDE a JSON string.
+//
+// A model writing a file emits the content as a JSON string, and it very often leaves
+// the newlines RAW instead of writing \n:
+//
+//     {"tool":"write_file","content":"import React from 'react';
+//     export default function X() {
+//     ..."}
+//
+// That is invalid JSON, so JSON.parse rejects the whole envelope and the write is
+// DISCARDED — the log says only "malformed tool JSON", a correction is sent, the model
+// retries in the same shape, the rounds burn, and it eventually gives up and submits a
+// summary. Measured: this is why the lane read for 34 tool calls and wrote nothing.
+//
+// The repair is safe in one direction only, which is the point: a raw newline, tab or
+// carriage return is NOT legal inside a JSON string, so escaping one can only turn
+// invalid JSON into valid JSON. It can never alter a document that already parsed.
+function escapeRawControlCharsInStrings(s) {
+    let out = '';
+    let inString = false;
+    let escaped = false;
+    let changed = false;
+    for (const ch of s) {
+        if (inString) {
+            if (escaped) { escaped = false; out += ch; continue; }
+            if (ch === '\\') { escaped = true; out += ch; continue; }
+            if (ch === '"') { inString = false; out += ch; continue; }
+            if (ch === '\n') { out += '\\n'; changed = true; continue; }
+            if (ch === '\r') { out += '\\r'; changed = true; continue; }
+            if (ch === '\t') { out += '\\t'; changed = true; continue; }
+            out += ch;
+            continue;
+        }
+        if (ch === '"') inString = true;
+        out += ch;
+    }
+    return { text: out, changed };
+}
+
 function tryParse(s) {
     try { return JSON.parse(s); } catch { return null; }
 }
@@ -894,6 +933,15 @@ function parseToolCalls(response) {
             candidate = text.slice(start, end + 1);
         }
         let obj = tryParse(candidate);
+        if (!obj) {
+            // Repair #0, and the one that matters most for WRITES: raw newlines inside a
+            // JSON string. A model writing a whole file emits multi-line content and
+            // often forgets to escape the line breaks, which makes the envelope invalid
+            // JSON and the entire write is thrown away. See the helper for why escaping
+            // is safe in this direction only.
+            const ctl = escapeRawControlCharsInStrings(candidate);
+            if (ctl.changed) obj = tryParse(ctl.text);
+        }
         if (!obj) {
             // 08-13: the chat model writes file content as a RAW triple-quoted
             // string inside the JSON ("content":"""...""") — invalid JSON that
