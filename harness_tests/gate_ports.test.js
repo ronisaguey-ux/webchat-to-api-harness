@@ -18,28 +18,31 @@ process.env.WEBCHAT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-g
 
 const G = require(path.join(REPO, 'cli', 'gates.js'));
 
-test('a gate added with no ports still gets usable ones', () => {
-    const g = G.add({ site: 'deepseek' });
-    assert.ok(g.cdpPort > 0, `cdpPort must be allocated, got ${g.cdpPort}`);
-    assert.ok(g.gatewayPort > 0, `gatewayPort must be allocated, got ${g.gatewayPort}`);
+test('freePortPair returns ports nothing is listening on', async () => {
+    const net = require('net');
+    const taken = [];
+    for (let i = 0; i < 3; i++) {
+        const { cdpPort, gatewayPort } = await G.freePortPair();
+        taken.push(cdpPort, gatewayPort);
+        // Binding proves the OS handed back a port that was genuinely free.
+        for (const p of [cdpPort, gatewayPort]) {
+            await new Promise((res, rej) => {
+                const s = net.createServer();
+                s.on('error', rej);
+                s.listen(p, '127.0.0.1', () => s.close(res));
+            });
+        }
+    }
+    assert.strictEqual(new Set(taken).size, taken.length, 'a port was handed out twice');
 });
 
-test('the allocated pair matches what the CLI screen computes', () => {
+test('a gate added with no ports is left for the caller to fill', () => {
+    // Ports are picked by the CLI from the OS free list, so add() must not invent a
+    // number of its own -- the old fixed bases collided with other stacks on the box.
     G.write({ gates: [], active: null });
-    const first = G.add({ site: 'deepseek' });
-    assert.strictEqual(first.cdpPort, G.CDP_PORT_BASE, 'first gate -> CDP base');
-    assert.strictEqual(first.gatewayPort, G.GATEWAY_PORT_BASE, 'first gate -> gateway base');
-    const second = G.add({ site: 'chatgpt' });
-    assert.strictEqual(second.cdpPort, G.CDP_PORT_BASE + 1);
-    assert.strictEqual(second.gatewayPort, G.GATEWAY_PORT_BASE + 1);
-});
-
-test('the harness range does not collide with the rest of this machine', () => {
-    // 8081-8083 are oculus gateway units and 9225-9230 their chromes. Allocating the
-    // harness inside those ranges made `webchat connect` report a healthy gateway that
-    // was really another stack's lane.
-    assert.ok(G.GATEWAY_PORT_BASE >= 8181, `gateway base ${G.GATEWAY_PORT_BASE} is in the occupied range`);
-    assert.ok(G.CDP_PORT_BASE >= 9281, `cdp base ${G.CDP_PORT_BASE} is in the occupied range`);
+    const g = G.add({ site: 'deepseek' });
+    assert.strictEqual(g.cdpPort, 0);
+    assert.strictEqual(g.gatewayPort, 0);
 });
 
 test('an explicit port is never overridden by the default', () => {
@@ -49,11 +52,12 @@ test('an explicit port is never overridden by the default', () => {
     assert.strictEqual(g.gatewayPort, 8484);
 });
 
-test('two gates never share a port', () => {
+test('two gates never share a port', async () => {
     G.write({ gates: [], active: null });
     const seen = new Set();
     for (const site of ['deepseek', 'chatgpt', 'gemini', 'kimi']) {
-        const g = G.add({ site });
+        const { cdpPort, gatewayPort } = await G.freePortPair();
+        const g = G.add({ site, cdpPort, gatewayPort });
         assert.ok(!seen.has(g.cdpPort), `cdpPort ${g.cdpPort} reused`);
         seen.add(g.cdpPort);
     }

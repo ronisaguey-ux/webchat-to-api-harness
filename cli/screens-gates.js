@@ -142,9 +142,9 @@ function build(ctx) {
         // the old 9225+/8081+ allocation collided with them. `webchat connect` then
         // reported a healthy gateway that was in fact an oculus lane, and a request for
         // one webchat's model came back answered by a DIFFERENT webchat's browser.
-        const { gates } = G.read();
-        const cdpPort = G.CDP_PORT_BASE + gates.length;
-        const gatewayPort = G.GATEWAY_PORT_BASE + gates.length;
+        // Ports the OS says are free, so the user never has to know which numbers the
+        // rest of the machine is using.
+        const { cdpPort, gatewayPort } = await G.freePortPair();
 
         const gate = G.add({
             site: site.id,
