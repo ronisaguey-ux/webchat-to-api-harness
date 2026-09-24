@@ -263,7 +263,7 @@ function build(ctx) {
     }
 
     // ── Harnesses ────────────────────────────────────────────────────────────
-    async function screenHarnesses() {
+    async function screenHarnesses(startIndex = 0) {
         const cfg = LC.read();
         const chosen = new Set(cfg.harnesses || []);
 
@@ -291,7 +291,8 @@ function build(ctx) {
 
         const pick = await A.menu(items, {
             title: 'Agentic harness',
-            footer: ['Select toggles a harness on or off.'],
+            footer: ['Enter toggles a harness on or off. Esc when you are done.'],
+            startIndex,
         });
         if (pick === A.BACK) return;
         if (pick === 'done') {
@@ -300,7 +301,10 @@ function build(ctx) {
         }
         if (chosen.has(pick)) chosen.delete(pick);
         else chosen.add(pick);
-        return screenHarnesses();
+        // Re-open the list with the cursor still on the row just toggled. Re-entering
+        // at 0 made every Enter look like it had thrown the selection away.
+        const at = items.findIndex((i) => i.value === pick);
+        return screenHarnesses(at >= 0 ? at : startIndex);
     }
 
     async function screenMode() {
