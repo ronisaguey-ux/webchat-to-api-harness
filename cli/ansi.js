@@ -285,12 +285,42 @@ let restored = false;
 function restore() {
     if (restored) return;
     restored = true;
+    exitFullScreen();
     showCursor();
     if (process.stdin.isTTY && process.stdin.isRaw) {
         try { process.stdin.setRawMode(false); } catch { /* already cooked */ }
     }
     process.stdin.pause();
 }
+
+// ── Full-screen mode (the alternate screen buffer) ─────────────────────────
+// Without this the UI is drawn INLINE into the terminal's scrollback: the frame
+// scrolls up with every redraw and the previous screen stays behind it, so a
+// paginated view reads as a small box sitting in the middle of old output rather
+// than as a full-screen app. `CSI ?1049h` switches to the alternate buffer, which
+// is the mechanism every full-screen TUI (vim, less, htop) uses — the terminal
+// gives the app the whole viewport and restores the user's scrollback intact on
+// exit. That is what "take up the full screen" means, and no amount of width or
+// height maths achieves it.
+//
+// Guarded on isTty so a pipe, a test or a log capture is unchanged, and paired
+// with exitFullScreen() in restore() so every exit path — Quit, Ctrl-C, a thrown
+// error, process exit — hands the terminal back.
+let _fullScreen = false;
+function enterFullScreen() {
+    if (!isTty || _fullScreen) return;
+    _fullScreen = true;
+    out.write(`${ESC}?1049h`);
+    out.write(`${ESC}2J${ESC}H`);
+}
+function exitFullScreen() {
+    if (!_fullScreen) return;
+    _fullScreen = false;
+    if (!isTty) return;
+    out.write(`${ESC}?1049l`);
+}
+function isFullScreen() { return _fullScreen; }
+
 function installGuards() {
     process.on('exit', restore);
     for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -595,6 +625,176 @@ async function prompt(label, opts = {}) {
     }
 }
 
+// ── Multi-line text editor ─────────────────────────────────────────────────
+// Replaces `prompt()` for longtext settings. The system prompt is thousands of
+// characters across many lines; `prompt()` is a SINGLE-LINE editor, so it printed
+// the whole thing as one raw run of text — newlines and all — straight through the
+// box frame, which is why editing the system prompt looked broken (overlapping
+// frames, text smeared across the border).
+//
+// This is a real editor: a wrap-aware cursor, vertical movement across wrapped
+// rows, word-wise editing by line, a scrolling viewport so the frame is fixed
+// height, and a clear save/cancel key. Enter inserts a newline here (it does not
+// submit) because the value IS multi-line — Ctrl-S saves, Esc discards.
+async function longText(label, opts = {}) {
+    const { default: initial = '', hint, validate } = opts;
+    const width = termWidth();
+
+    // The buffer is an array of lines; the cursor is {row, col} in CHARACTER space,
+    // not screen space, so wrapping never makes a cursor position ambiguous.
+    let lines = String(initial === undefined || initial === null ? '' : initial).split('\n');
+    if (!lines.length) lines = [''];
+    let row = 0;
+    let col = lines[0].length;
+    let top = 0;                 // first visible buffer row (screen rows scroll separately)
+    let error = '';
+
+    const inner = () => Math.max(20, width - 6);
+    const wrap = (s) => {
+        const w = inner();
+        if (s === '') return [''];
+        const out = [];
+        for (let i = 0; i < s.length; i += w) out.push(s.slice(i, i + w));
+        return out;
+    };
+    const curLine = () => lines[row] || '';
+
+    // Screen rows for the whole buffer, each tagged with its buffer row, so the
+    // viewport can scroll by SCREEN row and the cursor stays visible on a long line.
+    function screenRows() {
+        const out = [];
+        for (let r = 0; r < lines.length; r += 1) {
+            for (const piece of wrap(lines[r])) out.push({ r, text: piece });
+        }
+        return out;
+    }
+    const totalChars = () => lines.join('\n').length;
+
+    function draw() {
+        const sr = screenRows();
+        // Cursor's screen row: count the wrapped pieces of every earlier line plus its
+        // own offset within its line.
+        const before = lines.slice(0, row).reduce((n, l) => n + wrap(l).length, 0);
+        const cursorScreen = before + Math.floor(col / inner());
+        const chrome = 8;
+        const viewH = Math.max(6, termHeight() - chrome);
+        if (cursorScreen < top) top = cursorScreen;
+        if (cursorScreen >= top + viewH) top = cursorScreen - viewH + 1;
+        if (top < 0) top = 0;
+
+        const shown = sr.slice(top, top + viewH).map((x) => x.text);
+        while (shown.length < viewH) shown.push('');
+
+        const body = [];
+        body.push(bold(label));
+        body.push(gray(`${lines.length} line(s) · ${totalChars()} chars`
+            + (hint ? ` · ${truncate(hint, Math.max(10, width - 40))}` : '')));
+        body.push('');
+        const gutter = String(top + shown.length).length;
+        shown.forEach((text, i) => {
+            const real = top + i + 1;
+            const hidden = !sr[top + i];
+            body.push(`${gray(String(real).padStart(gutter))} ${hidden ? '' : text}`);
+        });
+        if (error) body.push('', red(error));
+
+        clear();
+        for (const l of boxLines('', body, { width })) line(l);
+        newline();
+        line(gray('  ctrl-s save · esc cancel · enter newline · arrows move · ctrl-k clear line · ctrl-d reset to default'));
+        showCursor();
+
+        // Park the real terminal cursor on the caret so typing feels native. The box
+        // starts one row after `clear()`, plus the header rows, plus the blank, plus the
+        // caret's offset inside the viewport.
+        const caretScreenRow = 1 /* border */ + 3 /* label, meta, blank */ + (cursorScreen - top);
+        const caretCol = 2 /* border+space */ + gutter + 1 + (col % inner());
+        out.write(`${ESC}${caretScreenRow + 1};${caretCol + 1}H`);
+    }
+
+    for (;;) {
+        draw();
+        // eslint-disable-next-line no-await-in-loop
+        const key = await readKey();
+        if (key.name === 'ctrl-c') throw new QuitError();
+
+        if (key.name === 'ctrl-s') {
+            const value = lines.join('\n');
+            if (validate) {
+                const err = validate(value);
+                if (err) { error = err; continue; }
+            }
+            return value;
+        }
+        if (key.name === 'escape') return BACK;
+
+        if (key.name === 'ctrl-d') {
+            // Reset to the setting's built-in default, in-place, so the operator can see
+            // what it is before saving it. Nothing is written until Ctrl-S.
+            lines = String(opts.defaultValue ?? '').split('\n');
+            if (!lines.length) lines = [''];
+            row = 0; col = lines[0].length; top = 0; error = '';
+            continue;
+        }
+        if (key.name === 'ctrl-k') { lines[row] = ''; col = 0; error = ''; continue; }
+
+        if (key.name === 'enter') {
+            const l = curLine();
+            lines.splice(row, 1, l.slice(0, col), l.slice(col));
+            row += 1; col = 0; error = '';
+            continue;
+        }
+        if (key.name === 'backspace') {
+            error = '';
+            if (col > 0) {
+                const l = curLine();
+                lines[row] = l.slice(0, col - 1) + l.slice(col);
+                col -= 1;
+            } else if (row > 0) {
+                // Join with the previous line, as every editor does.
+                const prev = lines[row - 1];
+                col = prev.length;
+                lines[row - 1] = prev + curLine();
+                lines.splice(row, 1);
+                row -= 1;
+            }
+            continue;
+        }
+        if (key.name === 'left') {
+            if (col > 0) col -= 1;
+            else if (row > 0) { row -= 1; col = curLine().length; }
+            continue;
+        }
+        if (key.name === 'right') {
+            if (col < curLine().length) col += 1;
+            else if (row < lines.length - 1) { row += 1; col = 0; }
+            continue;
+        }
+        if (key.name === 'up') {
+            if (row > 0) { row -= 1; col = Math.min(col, curLine().length); }
+            continue;
+        }
+        if (key.name === 'down') {
+            if (row < lines.length - 1) { row += 1; col = Math.min(col, curLine().length); }
+            continue;
+        }
+        if (key.name === 'home') { col = 0; continue; }
+        if (key.name === 'end') { col = curLine().length; continue; }
+        if (key.name === 'pageup') { row = Math.max(0, row - 10); col = Math.min(col, curLine().length); continue; }
+        if (key.name === 'pagedown') { row = Math.min(lines.length - 1, row + 10); col = Math.min(col, curLine().length); continue; }
+
+        // A paste arrives as one chunk of many characters. readKey hands back one key
+        // per call, so the rest are queued and consumed by later iterations — but a
+        // newline inside a paste must split lines, not submit.
+        if (key.name === 'char' || key.name === 'space' || key.name === 'tab') {
+            const ch = key.name === 'space' ? ' ' : (key.name === 'tab' ? '    ' : key.char);
+            const l = curLine();
+            lines[row] = l.slice(0, col) + ch + l.slice(col);
+            col += ch.length; error = '';
+        }
+    }
+}
+
 async function confirm(label, opts = {}) {
     const answer = await menu([
         { label: 'Yes', value: true },
@@ -620,7 +820,8 @@ module.exports = {
     useColor,
     termWidth, termHeight, visibleWidth, pad, truncate, wrap, boxLines,
     clear, home, hideCursor, showCursor, write, line, newline, restore, installGuards,
-    readKey, menu, multiSelect, prompt, confirm, message,
+    enterFullScreen, exitFullScreen, isFullScreen,
+    readKey, menu, multiSelect, prompt, longText, confirm, message,
     // Exported for the input tests: the splitter is pure, and the bug it guards
     // (a key pressed inside a multi-key read silently doing nothing) is invisible
     // from the outside — the CLI simply ignores you.

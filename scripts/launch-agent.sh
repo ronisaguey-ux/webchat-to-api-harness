@@ -26,7 +26,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$HERE"
+cd "$HERE/.."
 
 # ── resolve the gateway ──────────────────────────────────────────────────────
 # PORT may come from the environment; otherwise read it out of .env so this

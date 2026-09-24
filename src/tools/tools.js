@@ -5,6 +5,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const config = require('../core/config');
 const sandbox = require('./sandbox');
+const platform = require('../core/platform');
 const memory = require('../runtime/memory');
 
 // 08-14 WEDGE ROOT-CAUSE ceiling: tool RESULTS must never round-trip a huge
@@ -266,16 +267,10 @@ const TOOL_DEFINITIONS = [
                 // 08-14 DENY-BY-DEFAULT guard (owner directive): hard-block
                 // dangerous patterns even when BASH_ALLOWED=true. git push is
                 // allowed ONLY to feature branches (explicit branch check).
-                const DANGER = [
-                    "pkill -f",
-                    "node -e",
-                    "node -p",
-                    "rm -rf",
-                    "settings_backup.json",
-                    "ghp_",
-                    "TELEGRAM_TOKEN",
-                    "BOT_TOKEN",
-                ];
+                // Platform-specific: `rm -rf` means nothing to cmd, and
+                // `del /f /s /q` means nothing to bash. One list applied
+                // everywhere would let a destructive Windows command through.
+                const DANGER = platform.dangerPatterns();
                 let denied = null;
                 for (const s of DANGER) {
                     if (cmd.includes(s)) { denied = s; break; }
@@ -324,10 +319,18 @@ const TOOL_DEFINITIONS = [
                 // wrapper itself and SIGTERM'd it → "exit code null" tool
                 // failures. With `bash -s` the wrapper cmdline is just "bash",
                 // so pkill only matches the real target processes.
-                const child = spawn('/bin/bash', ['-s'], {
-                    detached: true,
-                    stdio: ['pipe', outFd, errFd],
-                });
+                // The shell comes from the platform module, not a literal. On Linux this
+                // is `bash -s` exactly as before; on Windows it is cmd.exe, which takes
+                // the script as an ARGUMENT (it has no stdin-script mode), so the spawn
+                // shape follows the shell's declared capability rather than the OS name.
+                const sh = platform.shell();
+                const child = sh.stdinArgs
+                    ? spawn(sh.cmd, sh.stdinArgs, { detached: true, stdio: ['pipe', outFd, errFd] })
+                    : spawn(sh.cmd, sh.args(cmd), { detached: true, stdio: ['ignore', outFd, errFd] });
+                if (sh.stdinArgs) {
+                    child.stdin.write(cmd);
+                    child.stdin.end();
+                }
                 child.stdin.write(cmd);
                 child.stdin.end();
                 let settled = false;

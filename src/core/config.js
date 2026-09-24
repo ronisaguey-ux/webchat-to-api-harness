@@ -4,6 +4,15 @@ require('dotenv').config();
 // Turn features on/off and set their values in that one file.
 const MC = require('./master_config');
 
+// ── Target platform ────────────────────────────────────────────────────────
+// ONE decision that everything platform-shaped reads: which shell runs a command, how a
+// path is spelled, which command patterns are dangerous, which roots the sandbox grants.
+// Precedence is env > harness.config.json `platform` > the real OS. It is explicit rather
+// than taken from process.platform because the harness may be asked to produce work for
+// the OTHER platform while still running here.
+const PLATFORM = require('./platform');
+PLATFORM.setPlatform(process.env.HARNESS_PLATFORM || MC.pickStr(null, 'platform') || '');
+
 // ── Webchat mode ───────────────────────────────────────────────────────────
 // Different webchats need different selectors and submit behaviour. A mode
 // supplies them; anything set explicitly (env or the top-level keys) still wins.
@@ -160,6 +169,12 @@ const cfg = {
     // Security
     apiToken: process.env.API_TOKEN || null,
     bashAllowed: MC.pickBool('BASH_ALLOWED', 'features', 'bashAllowed') === true,
+
+    // The target platform, resolved above. Read it through these so a caller never has to
+    // know the precedence order.
+    platform: PLATFORM.current(),
+    platformIsWindows: PLATFORM.isWindows(),
+    shellHint: PLATFORM.shellHint(),
     execTimeoutMs: MC.pickNum('EXEC_TIMEOUT_MS', 'limits', 'execTimeoutMs') || 10000,
     execMaxBuffer: 4 * 1024 * 1024,
 

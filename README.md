@@ -34,11 +34,15 @@ a webchat session you own, with tool-call support (read/write files, bash, …).
 | **A webchat account** | You log in **once, by hand**, in a normal Chrome window. The harness drives that browser — it never has your password and never solves a login for you. |
 | **A browser** | Puppeteer downloads a matching Chrome on `npm install`. To drive your *own* Chrome instead (which keeps the login), launch it with `--remote-debugging-port=9222` and point `CDP_WS_URL` at it. |
 
-**Nothing else.** No Python, no `xdotool`, no X11, no display server. Window control
-runs over CDP (`webchat window raise|drop|maximize|status`), so it behaves the same on
-Linux, macOS and Windows. It can run with the browser window minimised, off-screen, or
-headless — the browser is not supposed to be in your way, and the default is now to
-leave it where you put it.
+**Nothing else.** No Python, no `xdotool`, no X11 tooling. Window control runs over CDP
+(`webchat window raise|drop|maximize|status`), so it behaves the same on Linux, macOS and
+Windows.
+
+**One caveat: a headed browser needs *a* display.** It does not need to be *your* display.
+Run the gateway with `DISPLAY=:99` (or any Xvfb) and the browser lives on a virtual screen —
+fully functional, and physically incapable of appearing on your monitor. Headless is also
+supported (`HEADLESS=true`) but it gets the account signed out, so it is not the default for
+a webchat you intend to keep logged in. See *Where the browser appears* below.
 
 **Why a webchat at all:** this turns a chat session you already pay for into an
 OpenAI- and Anthropic-compatible endpoint. No API key, no per-token billing — but it is
@@ -209,20 +213,53 @@ Three commands. No editing.
 
 ```bash
 ./scripts/setup.sh                    # asks which webchat, picks a free port, writes .env
-./scripts/start.sh                    # the browser opens MINIMISED
+./scripts/start.sh                    # starts the gateway
 ./scripts/launch-agent.sh opencode    # or claude | codex | aider | hermes | any
 ```
 
 That is the whole setup. `setup.sh` is safe to re-run and backs up your `.env`
 rather than clobbering it.
 
-**To sign in the first time.** The browser opens minimised on purpose — it is a
-real headed browser (headless gets signed out and is a fingerprint tell), just
-kept out of your way. Raise it once, sign in, drop it back:
+**To sign in the first time.** Raise the window, sign in, then drop it:
 
 ```bash
-./scripts/show-window.sh raise      # or: ./scripts/show-window.sh raise && … && ./scripts/show-window.sh drop
+./scripts/show-window.sh raise
+#   … sign in by hand …
+./scripts/show-window.sh drop
 ```
+
+### Where the browser appears — read this before wondering why a window popped up
+
+The browser is **headed**, because headless gets the account signed out and is a
+fingerprint tell. Where that window *appears* is decided by the `DISPLAY` of the
+**gateway process**, not by any request: Puppeteer inherits the environment it was
+launched with, so nothing at request time can move a window that is already on a
+screen.
+
+- `DISPLAY=:0` — the **physical** screen. A headed browser here is visible, and
+  Chrome restores and raises its window when a tab is activated.
+- `DISPLAY=:99` (Xvfb) — a **virtual** screen. A headed browser here is fully
+  functional and can never reach your monitor. This is what you want for an
+  unattended harness.
+
+```bash
+# Start the gateway on a virtual display so nothing can ever pop up:
+DISPLAY=:99 ./scripts/start.sh
+```
+
+**Two things were fixed at the source, and both are needed for a clean run:**
+
+1. **Tab activation.** `page` creation now passes `{ background: true }`, because
+   Puppeteer's default is `background: false`, which *activates* the tab — and
+   activating a tab inside a minimised window makes Chrome restore and raise it.
+   That was the half-second flash on every send.
+2. **The display.** With `DISPLAY=:99` there is no physical screen to appear on.
+
+An xdotool "minimise guard" used to re-minimise the window every 150 ms. It is
+**gone**: it was racing Chrome instead of stopping it, it could not win that race,
+it overrode the user when they deliberately restored the window, and it was X11-only
+so it could never work on Windows. `webchat window` is the explicit, cross-platform
+replacement.
 
 If you already have a browser open with a signed-in webchat tab, you can attach
 to it instead and skip the login entirely:
@@ -301,6 +338,71 @@ plus `read_memory` / `edit_memory` (when memory is enabled) and any tools from
 attached MCP servers. The model is offered only the **executable** set — a tool
 whose requirement is unmet (no `DEEPSEEK_API_KEY`, bash gate off, memory
 disabled) is never advertised, so it cannot be tried and looped on.
+
+## Capabilities added 2026-09-24
+
+**A top-level platform selector (Linux / Windows).** `platform` — `linux` or
+`windows` — is one choice that everything platform-shaped reads, through
+`src/core/platform.js`:
+
+| What follows it | linux | windows |
+|---|---|---|
+| Shell a command runs in | `bash` (script via stdin) | `cmd.exe` (script as an argument) |
+| Path separator | `/` | `\` |
+| Command deny-list | `rm -rf`, `pkill -f`, … | `del /f /s /q`, `rd /s /q`, … |
+| Syntax hint given to the model | POSIX (`ls`, `$VAR`) | `dir`, `%VAR%` |
+
+It is an explicit setting rather than `process.platform` because the harness may be
+asked to produce work for the *other* platform while running on this one — a Linux
+box generating Windows commands. Scattered `process.platform` checks drift (one keeps
+using `/bin/bash`) so they are all replaced by this module. Set it in the CLI under
+**Platform**, or with `HARNESS_PLATFORM`, or as `"platform"` in `harness.config.json`.
+
+**Per-tool enable/disable, generated from the registry.** The CLI's **Tools** section
+lists every tool the model can call with an individual on/off switch, and the list is
+read from the live registry so it cannot drift from what is actually exposed. In MCP:
+`webchat_tool_toggle`. A tool switched off is not offered to the model at all.
+
+**Per-webchat system prompts, editable one at a time.** `systemPrompt.perMode` is a map
+keyed by webchat id. The CLI shows the real webchats, marks which have an override, and
+edits one prompt per screen — previously the whole map was a single JSON textarea that
+rendered as `[object Object]` and gave no way to say which webchat you were editing. In
+MCP: `webchat_prompt` (omit `gate` for the shared prompt).
+
+**Full-screen CLI.** The interface takes the alternate screen buffer, so it occupies the
+whole terminal instead of drawing inline into your scrollback (where every redraw left
+the previous frame behind and the boxes piled up on each other). Every entry point pairs
+the switch with a restore, so the terminal is handed back on Quit, Ctrl-C, an error, or
+process exit.
+
+**A real multi-line editor for long text.** The system prompt is thousands of characters
+across many lines; it used to go through a single-line prompt that printed it as one raw
+run of text straight through the frame. The editor has a wrap-aware cursor, vertical
+movement, a scrolling viewport, Ctrl-S to save, Esc to cancel, Ctrl-K to clear a line and
+Ctrl-D to restore the built-in default.
+
+**Reset to default, per setting and per layer.** Every setting has a **Reset to default**
+action that says what it will strip — the config-file value and/or an overriding
+environment variable — before it acts.
+
+**Background webchat subagents.** A webchat task takes minutes, and asking one blocks for
+the whole answer, so three of them cost the sum of all three. `webchat_subagent_spawn`
+starts the task in a detached process and returns a job id immediately; the caller starts
+more and polls. State lives on disk, so a job survives the MCP server restarting.
+
+| MCP tool | Does |
+|---|---|
+| `webchat_subagent_spawn` | start a task, return a job id at once |
+| `webchat_subagent_list` | every job: running / done / failed, elapsed, preview |
+| `webchat_subagent_result` | the answer, optionally waiting up to 10 min |
+| `webchat_subagent_cancel` | stop one (safe on an already-finished job) |
+
+**MCP control surface — 25 tools.** Any agent can drive the harness: read and write every
+setting (`webchat_config_list` / `_get` / `_set`), switch the platform
+(`webchat_platform`), toggle tools (`webchat_tool_toggle`), edit prompts
+(`webchat_prompt`), move the window (`webchat_window`), manage webchats, ask a webchat
+(`webchat_ask`), and run the subagents above. `node src/tools/mcp-server.js --list`
+prints the surface.
 
 ## Capabilities added 2026-09-22
 

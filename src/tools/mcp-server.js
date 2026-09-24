@@ -478,6 +478,168 @@ const TOOLS = [
             return asText(out);
         },
     ),
+
+    // ── platform & per-item control ──────────────────────────────────────────
+    tool(
+        'webchat_platform',
+        'Read or set the target platform (linux | windows). This ONE choice decides the shell a command runs in, how paths are spelled, which command patterns are refused, and which roots the sandbox grants — call it before generating any command or path, so the work matches the machine it is for rather than the machine the harness happens to run on.',
+        { platform: S('Omit to read. Pass "linux" or "windows" to set.') },
+        null,
+        async (a) => {
+            const plat = safeRequire('../core/platform');
+            if (!plat) return asError('platform module unavailable');
+            if (a.platform === undefined) {
+                return asText({
+                    platform: plat.current(),
+                    host: plat.hostPlatform(),
+                    shell: plat.shell().name,
+                    syntaxHint: plat.shellHint(),
+                    sandboxRoots: plat.defaultRoots(),
+                });
+            }
+            const norm = plat.normalize(a.platform);
+            if (!norm) return asError('platform must be linux or windows, got "' + a.platform + '"');
+            const res = settingsMod ? settingsMod.saveSetting('platform', norm) : { ok: false, reason: 'settings unavailable' };
+            if (!res.ok) return asError(res.reason);
+            plat.setPlatform(norm);
+            return asText({
+                platform: plat.current(),
+                shell: plat.shell().name,
+                syntaxHint: plat.shellHint(),
+                effective: !res.shadowed,
+                note: res.shadowed
+                    ? res.shadowedBy + ' overrides this — clear it for the file value to apply.'
+                    : 'A running gateway picks this up on restart.',
+            });
+        },
+    ),
+    tool(
+        'webchat_tool_toggle',
+        'Switch one of the webchat model\'s own tools on or off (read_file, run_bash, edit_file, …). A tool switched off is NOT offered to the model at all, so it never tries it and loops on the error. Call webchat_tools_list first to see the real names.',
+        { tool: S('Tool name, e.g. run_bash'), enabled: B('true to offer it, false to switch it off.') },
+        ['tool', 'enabled'],
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            const t = safeRequire('../tools/tools');
+            if (t && !t.getToolDefinitions().some((d) => d.name === a.tool)) {
+                return asError('unknown tool "' + a.tool + '" — known: ' + t.getToolDefinitions().map((d) => d.name).join(', '));
+            }
+            const res = settingsMod.saveSetting('tools.disabled::' + a.tool, Boolean(a.enabled));
+            if (!res.ok) return asError(res.reason);
+            return asText({ tool: a.tool, enabled: Boolean(a.enabled), saved: res.shadowed ? 'but env-shadowed' : true });
+        },
+    ),
+    tool(
+        'webchat_prompt',
+        'Read or set a system prompt. Set `gate` to edit that webchat\'s prompt alone; omit it to edit the shared prompt that applies to any webchat without its own. An empty `text` clears the override.',
+        { gate: S('Webchat id — omit for the shared prompt.'), text: S('The prompt. Omit to read it instead of writing.') },
+        null,
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            const dotted = a.gate ? 'systemPrompt.perMode' : 'systemPrompt.text';
+            if (a.text === undefined) {
+                const loaded = settingsMod.loadRaw();
+                const raw = loaded.raw || {};
+                if (!a.gate) return asText({ shared: settingsMod.getPath(raw, 'systemPrompt.text') || '' });
+                const map = settingsMod.getPath(raw, 'systemPrompt.perMode') || {};
+                return asText({ gate: a.gate, prompt: map[a.gate] || '', usesSharedFallback: !map[a.gate] });
+            }
+            const loaded = settingsMod.loadRaw();
+            const raw = loaded.raw || {};
+            if (!a.gate) {
+                settingsMod.setPath(raw, 'systemPrompt.text', String(a.text));
+            } else {
+                const map = Object.assign({}, settingsMod.getPath(raw, 'systemPrompt.perMode') || {});
+                if (String(a.text).trim() === '') delete map[a.gate];
+                else map[a.gate] = String(a.text);
+                settingsMod.setPath(raw, 'systemPrompt.perMode', map);
+            }
+            settingsMod.saveRaw(raw, loaded.file);
+            return asText({ saved: true, scope: a.gate || 'shared (all webchats without their own)' });
+        },
+    ),
+    tool(
+        'webchat_window',
+        'Move the harness browser window: raise, minimise, maximise, or read its state. Cross-platform over CDP, so it is not X11-only. Use raise when the user must log in by hand, then drop so it stays out of their way.',
+        { action: S('status | raise | drop | maximize'), gate: S('Webchat id. Defaults to the active one.') },
+        ['action'],
+        async (a) => {
+            const { spawnSync } = require('child_process');
+            const script = require('path').join(REPO, 'scripts', 'show-window.sh');
+            const gate = activeGate(a.gate);
+            const env = Object.assign({}, process.env);
+            if (gate && gate.cdpPort) env.CDP_PORT = String(gate.cdpPort);
+            const r = spawnSync('bash', [script, a.action], { env, encoding: 'utf-8', timeout: 20000 });
+            const out = ((r.stdout || '') + (r.stderr || '')).trim();
+            if (r.status !== 0) return asError(out || ('window ' + a.action + ' failed'));
+            return asText(out || ('window ' + a.action + ': ok'));
+        },
+    ),
+
+    // ── subagents ────────────────────────────────────────────────────────────
+    // A "webchat subagent" is a task put through a webchat that keeps running while the
+    // caller does something else. webchat_ask BLOCKS for the whole answer (minutes, for a
+    // real task), which makes running three of them impossible from one agent. These
+    // spawn detached processes and hand back a job id instead, so several webchats can
+    // work in parallel and the caller polls for results.
+    tool(
+        'webchat_subagent_spawn',
+        'Start a task on a webchat and return immediately with a job id. The webchat works in the background — this is how you run several webchats in parallel instead of waiting on each. Poll webchat_subagent_list for state, then webchat_subagent_result for the answer.',
+        {
+            prompt: S('The task for the subagent.'),
+            gate: S('Which webchat to use. Defaults to the active one.'),
+            label: S('A short name so you can tell jobs apart.'),
+            timeoutMs: { type: 'number', description: 'Give up after this long. Default 30 min.' },
+        },
+        ['prompt'],
+        async (a) => {
+            const gate = activeGate(a.gate);
+            if (!gate) return asError('no webchat available — call webchat_gate_add then webchat_gate_launch');
+            const sub = safeRequire('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            const job = sub.spawn({ prompt: String(a.prompt), gate: gate.id, label: a.label, timeoutMs: a.timeoutMs });
+            return asText({ jobId: job.id, gate: gate.id, state: job.state, hint: 'Poll webchat_subagent_list, then webchat_subagent_result with this id.' });
+        },
+    ),
+    tool(
+        'webchat_subagent_list',
+        'List every subagent job: which are running, done, failed or timed out, how long each has run, and a one-line preview. Call this before spawning duplicates.',
+        { state: S('Optional filter: running | done | failed | timeout') },
+        null,
+        async (a) => {
+            const sub = safeRequire('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            return asText(sub.list({ state: a.state }));
+        },
+    ),
+    tool(
+        'webchat_subagent_result',
+        'Fetch a subagent job\'s answer, or the error it failed with. Waits up to waitMs for a running job to finish, so you can poll without hammering.',
+        {
+            id: S('Job id from webchat_subagent_spawn.'),
+            waitMs: { type: 'number', description: 'How long to wait for it to finish. Default 0 (return immediately). Max 600000.' },
+        },
+        ['id'],
+        async (a) => {
+            const sub = safeRequire('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            const job = await sub.result(a.id, Math.min(Math.max(Number(a.waitMs) || 0, 0), 600000));
+            if (!job) return asError('no job with id ' + a.id);
+            return asText(job);
+        },
+    ),
+    tool(
+        'webchat_subagent_cancel',
+        'Stop a running subagent job. Safe to call on a job that already finished — it reports that instead of failing.',
+        { id: S('Job id.') },
+        ['id'],
+        async (a) => {
+            const sub = safeRequire('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            const r = sub.cancel(a.id);
+            return r.ok ? asText(r) : asError(r.reason || 'cancel failed');
+        },
+    ),
 ];
 
 // ── JSON-RPC over stdio ───────────────────────────────────────────────────────

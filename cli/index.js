@@ -26,7 +26,6 @@ const H = require('./harnesses.js');
 const LC = require('./launchconfig.js');
 const screensGates = require('./screens-gates.js');
 
-let SHOW_ADVANCED = false;
 
 // The gates/harnesses/launch screens live in their own file; this wires the shared
 // helpers they need. Built once, lazily, because `state`/`rowsOf` are declared below.
@@ -590,56 +589,131 @@ async function screenSettings() {
         for (const l of A.boxLines('', body)) A.line(l);
         A.newline();
 
-        const pick = await A.menu(
-            S.SCHEMA.map((g) => ({
-                label: g.title,
-                hint: `${g.settings.filter((s) => !s.advanced).length} basic`,
-                value: g.id,
-            })).concat([{ label: 'Back', value: 'back' }]),
-            { title: 'Which group?' },
-        );
-        if (pick === A.BACK || pick === 'back') return;
-        await screenSettingsGroup(pick);
+          const pick = await A.menu(
+              S.SCHEMA.map((g) => ({
+                  label: g.title,
+                  hint: `${g.settings.length} setting(s)${g.settings.some((s) => s.risk) ? '  ' + A.yellow('has guardrails') : ''}`,
+                  value: g.id,
+              })).concat([{ label: 'Back', value: 'back' }]),
+              { title: 'Which group?' },
+          );
+          if (pick === A.BACK || pick === 'back') return;
+          await screenSettingsGroup(pick);
     }
 }
 
-async function screenSettingsGroup(groupId) {
-    for (;;) {
-        const st = state();
-        const group = S.SCHEMA.find((g) => g.id === groupId);
-        const rows = rowsOf(st).filter((r) => r.group === groupId);
-        const visible = rows.filter((r) => SHOW_ADVANCED || !r.setting.advanced);
+  async function screenSettingsGroup(groupId) {
+      for (;;) {
+          const st = state();
+          const group = S.SCHEMA.find((g) => g.id === groupId);
+          const rows = rowsOf(st).filter((r) => r.group === groupId);
+          // EVERY setting is shown. The basic/advanced split was a lie of omission: a
+          // setting hidden behind a toggle is one the owner cannot find, and the ones
+          // marked "advanced" here are exactly the ones you reach for when something is
+          // wrong. `advanced` is still read for nothing — the flag no longer hides.
+          const visible = rows;
 
-        A.clear();
-        header([group.title]);
-        const body = visible.map((r) => {
-            const risk = r.setting.risk && r.value ? A.red('  ⚠') : '';
-            const shadow = r.shadowedBy ? A.yellow(`   [env: ${r.shadowedBy}]`) : '';
-            return `${A.bold(r.setting.label)}${risk}\n  ${A.cyan(S.display(r.setting, r.value))}${shadow}`;
-        });
-        for (const l of A.boxLines('', body)) A.line(l);
-        A.newline();
+          A.clear();
+          header([group.title]);
+          const body = visible.map((r) => {
+              const risk = r.setting.risk && r.value ? A.red('  ⚠') : '';
+              const shadow = r.shadowedBy ? A.yellow(`   [env: ${r.shadowedBy}]`) : '';
+              return `${A.bold(r.setting.label)}${risk}\n  ${A.cyan(S.display(r.setting, r.value))}${shadow}`;
+          });
+          for (const l of A.boxLines('', body)) A.line(l);
+          A.newline();
 
-        const items = visible.map((r) => ({
-            label: r.setting.label,
-            hint: S.display(r.setting, r.value).slice(0, 44) + (r.shadowedBy ? '  [env]' : ''),
-            value: r.setting.path,
-        }));
-        const hiddenCount = rows.length - visible.length;
-        items.push({
-            label: SHOW_ADVANCED ? 'Hide advanced' : `Show advanced${hiddenCount ? ` (${hiddenCount} hidden)` : ''}`,
-            value: '__toggle_adv',
-        });
-        items.push({ label: 'Back', value: 'back' });
+          const items = visible.map((r) => ({
+              label: r.setting.label,
+              hint: S.display(r.setting, r.value).slice(0, 44) + (r.shadowedBy ? '  [env]' : ''),
+              value: r.setting.path,
+          }));
+          items.push({ label: 'Back', value: 'back' });
 
-        const pick = await A.menu(items, { title: group.title });
-        if (pick === A.BACK || pick === 'back') return;
-        if (pick === '__toggle_adv') { SHOW_ADVANCED = !SHOW_ADVANCED; continue; }
-        await editSetting(pick);
-    }
-}
+          const pick = await A.menu(items, { title: group.title });
+          if (pick === A.BACK || pick === 'back') return;
+          await editSetting(pick);
+      }
+  }
 
-async function editSetting(settingPath) {
+  // ── Per-webchat prompts ────────────────────────────────────────────────────
+  // Dedicated screen, because the value is a MAP keyed by webchat id and a single JSON
+  // textarea could not say which webchat was being edited — the old field rendered the
+  // whole object as "[object Object]" and offered no picker at all. Here the webchats are
+  // listed by name, the ones with an override are marked, and the prompt for each is
+  // edited in the multi-line editor. Clearing a prompt removes the override.
+  async function screenPerModePrompts(setting) {
+      for (;;) {
+          const st = state();
+          const raw = st.raw || {};
+          const modes = S.listModes(raw);
+          const map = S.getPath(raw, setting.path) || {};
+          const globalPrompt = S.getPath(raw, 'systemPrompt.text') || '';
+
+          A.clear();
+          header(['System prompt', 'Per-webchat']);
+          const body = [
+              globalPrompt
+                  ? `${A.dim('fallback')}  the shared prompt above applies to any webchat without an override`
+                  : `${A.dim('fallback')}  ${A.yellow('no shared prompt set')} — the harness built-in is used where there is no override`,
+              '',
+          ];
+          const ids = modes.map((m) => m.id);
+          for (const id of ids) {
+              const has = typeof map[id] === 'string' && map[id].trim() !== '';
+              body.push(`${has ? A.green('●') : A.gray('○')} ${A.bold(id)}  ${
+                  has ? A.dim(`${map[id].length} chars`) : A.gray('no override — uses the fallback')}`);
+          }
+          if (!ids.length) {
+              body.push(A.yellow('No webchats are configured yet.'));
+              body.push(A.gray('Add one in Webchats first, then come back.'));
+          }
+          const orphans = Object.keys(map).filter((k) => !ids.includes(k));
+          if (orphans.length) {
+              body.push('');
+              body.push(A.yellow(`⚠ override(s) for webchats that no longer exist: ${orphans.join(', ')}`));
+              body.push(A.gray('  They stay until you clear them here — they may be from a renamed webchat.'));
+          }
+          for (const l of A.boxLines('Per-webchat prompts', body)) A.line(l);
+          A.newline();
+
+          const items = ids.map((id) => ({
+              label: id,
+              hint: (typeof map[id] === 'string' && map[id].trim()) ? 'has an override' : 'uses the fallback',
+              value: id,
+          }));
+          for (const o of orphans) items.push({ label: o, hint: 'orphaned override', value: o });
+          items.push({ label: 'Back', value: 'back' });
+
+          const pick = await A.menu(items, { title: 'Which webchat?' });
+          if (pick === A.BACK || pick === 'back') return;
+
+          const current = typeof map[pick] === 'string' ? map[pick] : '';
+          const edited = await A.longText(`Prompt for ${pick}`, {
+              default: current,
+              defaultValue: '',
+              hint: 'Blank uses the shared prompt above. Ctrl-D clears, Ctrl-S saves.',
+          });
+          if (edited === A.BACK) continue;
+
+          const { raw: fileRaw, file } = S.loadRaw();
+          const nextMap = Object.assign({}, S.getPath(fileRaw, setting.path) || {});
+          if (String(edited).trim() === '') delete nextMap[pick];
+          else nextMap[pick] = edited;
+          S.setPath(fileRaw, setting.path, nextMap);
+          S.saveRaw(fileRaw, file);
+
+          await A.message('Saved', [
+              nextMap[pick]
+                  ? `${pick} now has its own prompt (${nextMap[pick].length} chars).`
+                  : `${pick} now uses the shared prompt.`,
+              '',
+              A.dim('A running gateway picks this up on restart.'),
+          ]);
+      }
+  }
+
+  async function editSetting(settingPath) {
     const setting = S.BY_PATH.get(settingPath);
     if (!setting) return;
     const st = state();
@@ -662,19 +736,54 @@ async function editSetting(settingPath) {
     for (const l of A.boxLines('', body)) A.line(l);
     A.newline();
 
-    const items = [{ label: 'Change value', value: 'set' }];
-    if (row.shadowedBy) {
-        items.push({
-            label: `Remove ${row.shadowedBy} from ${path.basename(st.dotenvFile)}`,
-            hint: 'let the config file decide again',
-            value: 'unshadow',
-        });
-    }
-    if (row.source === 'file') items.push({ label: 'Reset', hint: 'remove it from the config file', value: 'reset' });
-    items.push({ label: 'Back', value: 'back' });
+      const items = [{ label: 'Change value', value: 'set' }];
+      if (row.shadowedBy) {
+          items.push({
+              label: `Remove ${row.shadowedBy} from ${path.basename(st.dotenvFile)}`,
+              hint: 'let the config file decide again',
+              value: 'unshadow',
+          });
+      }
+      // "Reset" only appeared when the value came from the FILE, so a setting sitting at a
+      // built-in default had no reset entry at all, and one set by an env var had none
+      // either. There is now always a way back to the built-in default, and it says which
+      // layers it will strip (file value and/or the overriding env var) before it acts.
+      const fromFile = row.source === 'file' || row.shadowedFileValue !== undefined;
+      items.push({
+          label: 'Reset to default',
+          hint: fromFile || row.shadowedBy
+              ? `back to ${A.truncate(S.display(setting, setting.default), 30)}`
+              : 'already at the default',
+          value: '__reset_default',
+      });
+      items.push({ label: 'Back', value: 'back' });
 
-    const action = await A.menu(items, { title: setting.label });
-    if (action === A.BACK || action === 'back') return;
+      const action = await A.menu(items, { title: setting.label });
+      if (action === A.BACK || action === 'back') return;
+
+      if (action === '__reset_default') {
+          const what = [];
+          if (fromFile) what.push(`remove ${setting.path} from the config file`);
+          if (row.shadowedBy) what.push(`remove ${row.shadowedBy} from ${path.basename(st.dotenvFile)}`);
+          const ok = await A.confirm('Reset to default', [
+              `${setting.label} → ${S.display(setting, setting.default)}`,
+              ...(what.length ? ['', 'This will:', ...what.map((w) => `  • ${w}`)] : []),
+              '',
+              'Settings are backed up before they are written.',
+          ]);
+          if (!ok) return;
+          if (fromFile) {
+              const { raw, file } = S.loadRaw();
+              S.setPath(raw, setting.path, undefined);
+              S.saveRaw(raw, file);
+          }
+          if (row.shadowedBy) {
+              const text = fs.readFileSync(st.dotenvFile, 'utf-8');
+              fs.writeFileSync(st.dotenvFile, S.removeEnvVar(text, setting.env), { mode: 0o600 });
+          }
+          await A.message('Reset', [`${setting.label} is now ${S.display(setting, setting.default)}.`]);
+          return;
+      }
 
     if (action === 'unshadow') {
         const text = fs.readFileSync(st.dotenvFile, 'utf-8');
@@ -688,19 +797,13 @@ async function editSetting(settingPath) {
         return;
     }
 
-    if (action === 'reset') {
-        const { raw, file } = S.loadRaw();
-        S.setPath(raw, setting.path, undefined);
-        S.saveRaw(raw, file);
-        await A.message('Reset', [`${setting.path} removed from ${shortHome(file)}`]);
-        return;
-    }
-
-    let next;
-    if (setting.type === 'bool') {
-        next = await A.menu([{ label: 'On', value: true }, { label: 'Off', value: false }], { title: setting.label });
-        if (next === A.BACK) return;
-    } else if (setting.type === 'choice') {
+      let next;
+      if (setting.type === 'bool' || setting.type === 'tooltoggle') {
+          // A tool toggle is on/off like a bool; its storage shape (membership of
+          // tools.disabled) is handled by saveSetting, so it edits the same way.
+          next = await A.menu([{ label: 'On', value: true }, { label: 'Off', value: false }], { title: setting.label });
+          if (next === A.BACK) return;
+      } else if (setting.type === 'choice') {
         // A fixed set, picked from a menu. This is what makes headed/headless an
         // actual choice: a free-text field you have to spell exactly right is how a
         // setting looks applied and silently falls back to the default.
@@ -711,11 +814,34 @@ async function editSetting(settingPath) {
         }));
         next = await A.menu(opts.concat([{ label: 'Back', value: 'back' }]), { title: setting.label });
         if (next === A.BACK || next === 'back') return;
-    } else if (setting.type === 'mode') {
-        const modes = S.listModes(st.raw).map((m) => ({ label: m.id, hint: m.url, value: m.id }));
-        next = await A.menu(modes.concat([{ label: 'Back', value: 'back' }]), { title: 'Webchat' });
-        if (next === A.BACK || next === 'back') return;
-    } else {
+      } else if (setting.type === 'mode') {
+          const modes = S.listModes(st.raw).map((m) => ({ label: m.id, hint: m.url, value: m.id }));
+          next = await A.menu(modes.concat([{ label: 'Back', value: 'back' }]), { title: 'Webchat' });
+          if (next === A.BACK || next === 'back') return;
+      } else if (setting.type === 'permode') {
+          // Straight into its own screen and return: the map is not a scalar, so there is
+          // nothing for the generic "change value" flow below to do with it.
+          await screenPerModePrompts(setting);
+          return;
+      } else if (setting.type === 'longtext') {
+          // A longtext value is multi-line by nature. Routing it through prompt() — a
+          // single-line editor — printed the whole thing as one raw run of text straight
+          // through the frame, which is why editing the system prompt looked broken. The
+          // editor also gets the built-in default so Ctrl-D can restore it in place.
+          const cur = row.value === undefined || row.value === null
+              ? ''
+              : (Array.isArray(row.value) ? row.value.join(', ') : String(row.value));
+          const deflt = setting.default === undefined || setting.default === null
+              ? ''
+              : (Array.isArray(setting.default) ? setting.default.join(', ') : String(setting.default));
+          next = await A.longText(setting.label, {
+              default: cur,
+              defaultValue: deflt,
+              hint: setting.help,
+              validate: setting.validate,
+          });
+          if (next === A.BACK) return;
+      } else {
         const current = Array.isArray(row.value) ? row.value.join(', ') : (row.value === undefined ? '' : String(row.value));
         next = await A.prompt(setting.label, {
             default: current,
@@ -737,7 +863,7 @@ async function editSetting(settingPath) {
 
     // File-backed settings (memory.contents) write the actual file, not config JSON.
     if (setting.fileBacked) {
-        const mem = require('../memory');
+        const mem = require('../src/runtime/memory');
         mem.writeMemory(String(next ?? ''));
         await A.message('Saved', [
             `${setting.label} written to ${shortHome(mem.memoryFile())} (${mem.readMemory().length} chars).`,
@@ -1144,10 +1270,10 @@ async function screenReport(extra = {}) {
 // The harness is reachable as an MCP server so ANY agent can drive it. This screen
 // shows the exact line to paste into a client's config and writes the ones it can.
 async function screenAgentAccess() {
-    const serverPath = path.join(__dirname, '..', 'mcp-server.js');
+    const serverPath = path.join(__dirname, '..', 'src', 'tools', 'mcp-server.js');
     let toolCount = 0;
     try {
-        toolCount = require('../mcp-server').TOOLS.length;
+        toolCount = require('../src/tools/mcp-server').TOOLS.length;
     } catch { /* report 0 rather than guessing */ }
 
     A.clear();
@@ -1186,7 +1312,7 @@ async function screenAgentAccess() {
         A.clear();
         header(['Agent access', 'tools']);
         let tools = [];
-        try { tools = require('../mcp-server').TOOLS; } catch { /* shown empty */ }
+        try { tools = require('../src/tools/mcp-server').TOOLS; } catch { /* shown empty */ }
         for (const t of tools) {
             A.line(`  ${A.bold(t.name)}`);
             A.line(A.gray('    ' + A.truncate(String(t.description).split('.')[0] + '.', A.termWidth() - 8)));
@@ -1535,6 +1661,11 @@ module.exports = {
 // ── Interactive entry point ────────────────────────────────────────────────
 async function interactive() {
     A.installGuards();
+    // Take the whole screen. Without this the UI is drawn INLINE into the scrollback, so
+    // every redraw leaves the previous frame behind and the boxes pile up on top of each
+    // other — which is what made the editor look broken. The alternate buffer is what
+    // every full-screen TUI uses; `restore()` hands the terminal back on any exit path.
+    A.enterFullScreen();
     for (;;) {
         let choice;
         try {
@@ -1632,6 +1763,27 @@ function cmdWindow(args) {
     return r.status === null ? 1 : r.status;
 }
 
+// Run a screen the way the dashboard runs: full-screen, guards installed, and the
+// terminal restored on the way out whatever happens. `main()` covers five entry points
+// that each duplicated this pairing by hand, which is how one of them ends up missing
+// restore() and leaves the user in the alternate buffer with no output.
+async function withScreen(fn) {
+    A.installGuards();
+    A.enterFullScreen();
+    try {
+        await fn();
+        return 0;
+    } catch (e) {
+        if (!(e instanceof A.QuitError)) {
+            A.restore();
+            throw e;
+        }
+        return 0;
+    } finally {
+        A.restore();
+    }
+}
+
 async function main(argv) {
     const cmd = argv[0];
     A.installGuards();
@@ -1649,36 +1801,11 @@ async function main(argv) {
 
     if (cmd === 'connect' && argv[1] !== '--help') return cmdConnect(argv.slice(1));
 
-    if (cmd === 'start') {
-        A.installGuards();
-        try {
-            await screenStart();
-        } catch (e) {
-            if (!(e instanceof A.QuitError)) throw e;
-        }
-        A.restore();
-        return 0;
-    }
-    if (cmd === 'doctor') {
-        try { await screenDoctor(); } catch (e) { if (!(e instanceof A.QuitError)) throw e; }
-        A.restore();
-        return 0;
-    }
-    if (cmd === 'logs') {
-        try { await screenLogs(); } catch (e) { if (!(e instanceof A.QuitError)) throw e; }
-        A.restore();
-        return 0;
-    }
-    if (cmd === 'settings') {
-        try { await screenSettings(); } catch (e) { if (!(e instanceof A.QuitError)) throw e; }
-        A.restore();
-        return 0;
-    }
-    if (cmd === 'setup') {
-        try { await screenSite(); } catch (e) { if (!(e instanceof A.QuitError)) throw e; }
-        A.restore();
-        return 0;
-    }
+    if (cmd === 'start') return withScreen(() => screenStart());
+    if (cmd === 'doctor') return withScreen(() => screenDoctor());
+    if (cmd === 'logs') return withScreen(() => screenLogs());
+    if (cmd === 'settings') return withScreen(() => screenSettings());
+    if (cmd === 'setup') return withScreen(() => screenSite());
     if (cmd === 'window') return cmdWindow(argv.slice(1));
 
     await interactive();
