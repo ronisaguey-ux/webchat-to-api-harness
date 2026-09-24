@@ -32,7 +32,7 @@ const env = (n) => process.env[n];  // kept for readability at the call sites
 // chat.js overrides (paste your tab URL there — it wins over .env)
 let chat = {};
 try {
-    chat = require('./chat.js');
+    chat = require('../browser/chat.js');
 } catch {
     /* chat.js missing — fall back to .env */
 }
