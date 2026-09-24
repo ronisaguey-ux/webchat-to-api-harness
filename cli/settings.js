@@ -777,6 +777,25 @@ function display(setting, value) {
 // Returns what happened rather than assuming success: a value that is SHADOWED by an
 // environment variable is written to the file and still has no effect, and a caller
 // that reports "saved" there is lying to the user. The return says so.
+    // ── Tour / demo mode ────────────────────────────────────────────────────
+    //
+    // While this is on, every write is accepted and reported as saved but NOTHING is
+    // written to disk. The tutorial sends the user into real screens and tells them to
+    // press things - the fastest way to teach a control panel is to let someone use it -
+    // but being shown around must not leave a trail of half-changed settings behind, and
+    // a user who is only exploring should never have to undo anything afterwards.
+    //
+    // It is deliberately a flag on the WRITER rather than a set of fake screens: the
+    // screens the user sees are the real ones, so what they learn applies. Only the
+    // persistence is mocked.
+    let _demoMode = false;
+    function setDemoMode(on) {
+        const was = _demoMode;
+        _demoMode = Boolean(on);
+        return was;
+    }
+    function isDemoMode() { return _demoMode; }
+
     function saveSetting(dotted, value) {
         // A per-tool toggle writes membership of `tools.disabled`, not a key of its own.
         // `dotted` arrives as `tools.disabled::<name>` and is translated here, so the
@@ -811,6 +830,12 @@ function display(setting, value) {
             saveRaw(next, loaded.file);
             return { ok: true, value: !set.has(name), shadowed: false, shadowedBy: null };
         }
+      if (_demoMode) {
+          // Reported as saved so the screen behaves exactly as it would, and marked so a
+          // caller can say "not really" on screen if it wants to.
+          return { ok: true, demo: true, value, shadowed: false, shadowedBy: null };
+      }
+
       const setting = BY_PATH.get(dotted);
       if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
 
@@ -909,5 +934,6 @@ function display(setting, value) {
         envFilePath, loadDotenv,
         configFilePath, loadRaw, saveRaw,
         coerce, resolve, resolveAll, countShadowed, saveSetting, resetSetting,
+        setDemoMode, isDemoMode,
         listModes, display,
     };

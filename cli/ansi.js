@@ -234,6 +234,45 @@ function truncate(s, width) {
 // ── Boxes ──────────────────────────────────────────────────────────────────
 // Pure: returns an array of lines, so callers can compose screens and tests can
 // assert on the drawing without a terminal.
+// Drop a block into the middle of the terminal instead of leaving it stranded at the
+// top. A tall window with the UI pinned to its first six rows reads as "the program is
+// tiny"; centring it uses the screen the user actually has.
+// Pad to a column by VISIBLE width. `String.padEnd` counts ANSI escapes as characters,
+// so a bold line - which carries colour codes - ends up shorter than the plain lines
+// beside it and the whole block shifts sideways on exactly the line that matters most.
+function padVisible(text, width) {
+    const s = String(text == null ? '' : text);
+    const gap = width - visibleWidth(s);
+    return gap > 0 ? s + ' '.repeat(gap) : s;
+}
+
+// Wrap prose to a column. Used so text and the character can share a row without the
+// text pushing him off to the right on its longest line - the block has to be a fixed
+// width or the alignment slips on exactly the lines that carry the most.
+function wrapText(text, width) {
+    const out = [];
+    for (const para of String(text == null ? '' : text).split('\n')) {
+        if (!para.trim()) { out.push(''); continue; }
+        let line = '';
+        for (const word of para.split(/\s+/)) {
+            if (!line) { line = word; continue; }
+            if (line.length + 1 + word.length <= width) line += ` ${word}`;
+            else { out.push(line); line = word; }
+        }
+        if (line) out.push(line);
+    }
+    return out;
+}
+
+function centerBlock(lines, opts = {}) {
+    const list = (lines || []).map(String);
+    if (opts.center === false) return list;
+    const rows = termHeight();
+    const used = list.length + (opts.reserve || 0);
+    const pad = Math.max(0, Math.floor((rows - used) / 2));
+    return new Array(pad).fill('').concat(list);
+}
+
 function boxLines(title, body, opts = {}) {
     const width = opts.width || termWidth();
     const inner = width - 4; // "│ " + content + " │"
@@ -494,7 +533,7 @@ const PENDING_KEYS = [];
 // Arrow-key menu. `items` = [{label, hint, value, disabled}]; returns the chosen
 // item's value, or BACK on Esc, or throws QuitError on Ctrl-C.
   async function menu(items, opts = {}) {
-      const { title, footer, width = termWidth(), pageSize, tickMs = 0, onTick = null, startIndex } = opts;
+      const { title, footer, width = termWidth(), pageSize, tickMs = 0, onTick = null, startIndex, above } = opts;
       // A caller that re-draws the SAME list after an action (toggling a checkbox, say)
       // passes startIndex so the cursor stays put. Without it the cursor snaps back to
       // the first row and pressing Enter looks like the menu reset itself.
@@ -526,11 +565,20 @@ const PENDING_KEYS = [];
           clear();
           // Anything the caller wants drawn above the menu is re-rendered on every
           // pass, including a timer tick — that is what keeps a live panel live.
-          let above = [];
+          //
+          // THIS IS THE ONLY WAY TO PUT ANYTHING ABOVE A MENU. Drawing before calling
+          // menu() does not work: clear() runs on every pass, so the text is wiped
+          // before the user can read it and only the menu is left on screen. `above`
+          // may be an array or a function, and a function is called each pass, which is
+          // what lets an animation keep moving while the menu waits.
+          let head = [];
+          try {
+              head = typeof above === 'function' ? (above() || []) : (above || []);
+          } catch { head = []; }
           if (onTick) {
-              try { above = onTick() || []; } catch { above = []; }
+              try { head = head.concat(onTick() || []); } catch { /* a broken tick must not kill the menu */ }
           }
-          if (above.length) { for (const l of above) line(l); newline(); }
+          if (head.length) { for (const l of head) line(l); newline(); }
           for (const l of boxLines(title ? '' : '', body, { width })) line(l);
           if (footer) { newline(); for (const f of [].concat(footer)) line(gray(`  ${f}`)); }
           hideCursor();
@@ -820,6 +868,7 @@ async function message(title, body, opts = {}) {
 }
 
 module.exports = {
+    centerBlock, wrapText, padVisible,
     ESC, BACK, QUIT, QuitError,
     bold, dim, italic, underline, red, green, yellow, blue, magenta, cyan, gray, bgBlue, bgGray,
     useColor,
