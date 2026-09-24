@@ -265,6 +265,46 @@ function withRaw(fn) {
 // registers, which is the standard trade every terminal UI makes.
 const ESC_SEQUENCE_MS = 60;
 
+const KEY_SEQUENCES = {
+    '\u001b[A': 'up', '\u001b[B': 'down', '\u001b[C': 'right', '\u001b[D': 'left',
+    '\u001b[5~': 'pageup', '\u001b[6~': 'pagedown', '\u001b[H': 'home', '\u001b[F': 'end',
+    '\u001bOA': 'up', '\u001bOB': 'down', '\u001bOC': 'right', '\u001bOD': 'left',
+    '\u001b[1~': 'home', '\u001b[4~': 'end',
+};
+
+// Longest first, so `\u001b[5~` is matched as page-up rather than as a lone ESC
+// followed by garbage. Two sequences share prefixes (`\u001b[A` and `\u001bOA` do not,
+// but `\u001b[H` and `\u001b[1~` both start `\u001b[`), and the longest match wins.
+const SEQUENCES_BY_LENGTH = Object.keys(KEY_SEQUENCES).sort((a, b) => b.length - a.length);
+
+/**
+ * Split ONE stdin read into the keys it actually contains.
+ *
+ * A terminal is free to deliver several keystrokes in a single read — a paste, a fast
+ * typist, or an arrow key and an Enter arriving together. Resolving a chunk as one key
+ * throws the rest away, which reads as dropped input: press down-down-Enter quickly
+ * and only the first registers. Measured while testing: a piped file of arrow keys
+ * produced a "passing" smoke run in which no key after the first had any effect.
+ */
+function splitKeys(s) {
+    const keys = [];
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] === '\u001b') {
+            const hit = SEQUENCES_BY_LENGTH.find((seq) => s.startsWith(seq, i));
+            if (hit) { keys.push(hit); i += hit.length; continue; }
+            keys.push('\u001b'); i += 1; continue;
+        }
+        // Iterate by CODE POINT, not by index: an emoji or accented character is one
+        // key to the user but two UTF-16 units to a naive slice.
+        const cp = s.codePointAt(i);
+        const ch = String.fromCodePoint(cp);
+        keys.push(ch);
+        i += ch.length;
+    }
+    return keys;
+}
+
 function decodeChunk(s) {
     if (s === '\u0003') return { name: 'ctrl-c' };
     if (s === '\r' || s === '\n') return { name: 'enter' };
@@ -272,16 +312,14 @@ function decodeChunk(s) {
     if (s === '\u001b') return { name: 'escape' };
     if (s === ' ') return { name: 'space' };
     if (s === '\t') return { name: 'tab' };
-    const seq = {
-        '\u001b[A': 'up', '\u001b[B': 'down', '\u001b[C': 'right', '\u001b[D': 'left',
-        '\u001b[5~': 'pageup', '\u001b[6~': 'pagedown', '\u001b[H': 'home', '\u001b[F': 'end',
-        '\u001bOA': 'up', '\u001bOB': 'down', '\u001bOC': 'right', '\u001bOD': 'left',
-        '\u001b[1~': 'home', '\u001b[4~': 'end',
-    };
-    if (seq[s]) return { name: seq[s] };
+    if (KEY_SEQUENCES[s]) return { name: KEY_SEQUENCES[s] };
     if (s.length === 1) return { name: 'char', char: s };
     return { name: 'unknown', raw: s };
 }
+
+// Keys read in one chunk but not yet consumed. A paste or a fast double-tap must not
+// lose the tail, so the remainder is held here and handed out by later readKey calls.
+const PENDING_KEYS = [];
 
   function readKey(opts = {}) {
       // `tickMs` lets a caller redraw on a timer while still waiting for a key.
@@ -289,6 +327,13 @@ function decodeChunk(s) {
       // raced readKey leaves its stdin `data` listener registered, so the next call
       // stacks a second listener and one keypress resolves two promises.
       const tickMs = Number(opts.tickMs) || 0;
+
+      // Anything buffered from an earlier read is delivered first, without touching
+      // stdin — otherwise a key that already arrived waits for the next one. It must
+      // go through decodeChunk like any other key: handing back the raw bytes gives
+      // the caller an object with no `name` and the keypress is silently ignored.
+      if (PENDING_KEYS.length) return Promise.resolve(decodeChunk(PENDING_KEYS.shift()));
+
       return new Promise((resolve) => {
           const stdin = process.stdin;
           const wasRaw = stdin.isRaw;
@@ -306,7 +351,12 @@ function decodeChunk(s) {
           }
           function finish(seq) {
               cleanup(false);
-              resolve(decodeChunk(seq));
+              // One read can carry several keys. Resolve the first and keep the rest
+              // in order, so nothing the user pressed is discarded.
+              const keys = splitKeys(seq);
+              if (!keys.length) { resolve({ name: 'unknown', raw: seq }); return; }
+              for (let i = keys.length - 1; i >= 1; i--) PENDING_KEYS.unshift(keys[i]);
+              resolve(decodeChunk(keys[0]));
           }
           function onData(buf) {
               buffer += buf.toString('utf8');
@@ -499,4 +549,8 @@ module.exports = {
     termWidth, termHeight, visibleWidth, pad, truncate, wrap, boxLines,
     clear, home, hideCursor, showCursor, write, line, newline, restore, installGuards,
     readKey, menu, multiSelect, prompt, confirm, message,
+    // Exported for the input tests: the splitter is pure, and the bug it guards
+    // (a key pressed inside a multi-key read silently doing nothing) is invisible
+    // from the outside — the CLI simply ignores you.
+    splitKeys, decodeChunk,
 };
