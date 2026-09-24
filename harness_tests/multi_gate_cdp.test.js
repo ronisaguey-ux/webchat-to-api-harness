@@ -30,12 +30,29 @@ function withBrowser(env, fn) {
     }
 }
 
-test('a gateway configured for its own gate probes THAT port first', () => {
-    // Gate #2 lives on 9226. The conventional list starts at 9225, which is gate #1.
+test('a gateway configured for its own gate probes ONLY that port', () => {
+    // Gate #2 lives on 9226. Probing the conventional list as a fallback is what let a gate
+    // whose own browser had not launched attach to gate #1's browser instead: the wrong
+    // account answering, with no error anywhere, and — because attaching removed the need to
+    // launch — its own browser never started either. Two gates then shared one browser, one
+    // DISPLAY and one renderer, so a wedged tab in either lane blocked both.
+    // A gate that cannot find its own port must launch its own browser, never borrow another
+    // profile's. This assertion used to require 9225 to remain reachable as a fallback, which
+    // is the defect stated as a requirement.
     withBrowser('9226', (b) => {
         const order = b.cdpProbeOrder();
-        assert.strictEqual(order[0], 9226, 'the configured port must be tried before any conventional port');
-        assert.ok(order.indexOf(9225) > 0, '9225 is still reachable, but only as a fallback');
+        assert.deepStrictEqual(order, [9226], 'a configured gate must probe its own port and nothing else');
+        assert.ok(!order.includes(9225), 'gate #1 port must never be a fallback for gate #2');
+    });
+});
+
+test('an explicitly-configured port is recognisable as claimed', () => {
+    // The predicate that decides whether the fallback list applies at all.
+    withBrowser('9227', (b) => {
+        assert.strictEqual(b.cdpPortIsExplicit(), true, 'CDP_PORT in the environment means this gate owns a browser');
+    });
+    withBrowser(undefined, (b) => {
+        assert.strictEqual(b.cdpPortIsExplicit(), false, 'with nothing configured there is no claim to protect');
     });
 });
 

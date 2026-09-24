@@ -506,7 +506,19 @@ const JEV_INTERCEPT = String(process.env.JEV_INTERCEPT || 'off').toLowerCase();
 let jevStats = { checked: 0, unusable: 0, failed: 0 };
 let _jev = null;
 function jev() {
-    if (_jev === null) { try { _jev = require('./jev.js'); } catch (e) { _jev = false; console.warn('⚠️ jev.js unavailable:', e.message); } }
+    // jev.js moved to src/runtime/ in the layout refactor; this path was never updated, and
+    // the bare `catch` swallowed the module-not-found and printed a warning nobody reads —
+    // so the router was silently DISABLED in every deployment (measured 2026-09-24). A
+    // failed optional require must not read as "feature off"; the warn now says where it
+    // looked.
+    if (_jev === null) {
+        try {
+            _jev = require('./src/runtime/jev.js');
+        } catch (e) {
+            _jev = false;
+            console.warn('⚠️ jev.js unavailable at ./src/runtime/jev.js:', e.message);
+        }
+    }
     return _jev || null;
 }
 // The contract a PASSTHROUGH_FORMAT caller ships is the edits JSON; the prompt

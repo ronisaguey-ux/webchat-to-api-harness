@@ -278,6 +278,18 @@ const TOOLS = [
 
     // ── putting work through the webchat ─────────────────────────────────────
     tool(
+        'webchat_config_reset',
+        'Reset one setting to its built-in default. Removes BOTH the config-file value and any environment variable overriding it, and says which it removed — clearing only the file would leave the env var in charge and the setting unchanged, which reads as "reset did nothing".',
+        { path: S('Dotted setting path, e.g. permission.mode. Use webchat_config_list to see them.') },
+        ['path'],
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            if (typeof settingsMod.resetSetting !== 'function') return asError('this build has no resetSetting');
+            const r = settingsMod.resetSetting(a.path);
+            return r.ok ? asText(r) : asError(r.reason);
+        },
+    ),
+    tool(
         'webchat_ask',
         "Send a prompt through a webchat and get the model's answer — this is the 'use a webchat as a subagent' tool. The question goes to the real webchat through the user's own logged-in account, with the harness's tools available to it.",
         {
@@ -735,6 +747,21 @@ if (require.main === module) {
         }
     });
     process.stdin.on('end', () => process.exit(0));
+}
+
+// The operational half of the surface (lifecycle, logs, health, memory, sandbox, swarm,
+// the local decision model). Kept in its own file so this one stays readable; merged here
+// so a client sees ONE tool list.
+const EXTRA = (() => {
+    try { return require('./mcp-tools-extra').TOOLS || []; } catch (e) {
+        // A failure here must not take the whole server down, or the client cannot even be
+        // told what is missing — but it must be visible, not silent.
+        process.stderr.write('mcp-server: extra tools failed to load: ' + (e && e.message) + '\n');
+        return [];
+    }
+})();
+for (const t of EXTRA) {
+    if (!TOOLS.some((x) => x.name === t.name)) TOOLS.push(t);
 }
 
 module.exports = { TOOLS, handle };

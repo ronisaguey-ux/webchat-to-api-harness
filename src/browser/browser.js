@@ -184,14 +184,38 @@ function cdpPort() {
 }
 
 /**
+ * Was this gateway's CDP port CONFIGURED for it, rather than defaulted?
+ *
+ * True when CDP_WS_URL names a port or CDP_PORT is set in the environment. In a
+ * multi-webchat deployment the CLI sets CDP_PORT for every gate, so this is how a
+ * gate announces "I have my own browser and must not borrow anyone else's".
+ */
+function cdpPortIsExplicit() {
+    if (/^ws:\/\/(?:127\.0\.0\.1|localhost):(\d+)\//.test(config.cdpWsUrl || '')) return true;
+    return Boolean(Number(process.env.CDP_PORT || 0));
+}
+
+/**
  * The ports to try, in order, when looking for a browser to attach to.
  *
  * Pure and exported so the ORDER can be tested without a network: with several
  * webchats connected, getting this order wrong means gate #2's gateway attaches to
  * gate #1's browser — the wrong account answering, with no error anywhere.
+ *
+ * An explicitly-configured port is probed ALONE. Probing a wider list "just in case"
+ * was the fallback of a fixed bug rather than a safety net: when gate #2's own browser
+ * had not launched, it found gate #1's browser on the conventional list, attached to it,
+ * and answered as the wrong account — while its own browser never started, because
+ * attaching had made a launch unnecessary. The two gates then shared one browser, one
+ * DISPLAY and one renderer, so a wedged tab in either lane blocked both. A gateway that
+ * cannot find its own port must launch its own browser; a different profile's browser is
+ * never a usable substitute.
  */
 function cdpProbeOrder() {
     const mine = cdpPort();
+    if (cdpPortIsExplicit()) return [mine];
+    // Unconfigured (single-gate / legacy): nothing has been claimed for us, so the
+    // conventional list is the only way to find an already-running browser to attach to.
     return [mine, ...CDP_PROBE_PORTS, ...CDP_EXTRA_PORTS].filter((p, i, a) => p && a.indexOf(p) === i);
 }
 
@@ -915,20 +939,77 @@ async function connectToWebchatOnce(webchatUrl) {
     return page;
 }
 
-// Login gate: the chat input's presence means the session is logged in
-async function waitForChatInput() {
+// Login gate.
+//
+// ⚠️ The presence of the chat input is NOT a login signal, and treating it as one cost
+// real throughput: gemini and chatgpt both render a usable-looking composer to a
+// LOGGED-OUT visitor. waitForChatInput() found it, logged '✅ Chat input found — logged
+// in.', and the send then typed into a composer that could never submit — the prompt sat
+// in the box, no response ever arrived, and the request died on its timeout. Measured on
+// a logged-out gemini: composer present, 12584 chars stuck in it, a visible 'Sign in'
+// button, and the log claiming it was logged in. A lane that lies about being ready is
+// worse than one that reports it is not: the caller spends the whole timeout instead of
+// being told to log in.
+//
+// So the gate now requires BOTH: a composer, and no visible logged-out CTA. The signals
+// are read from the DOM (visibility, not mere presence) because these SPAs keep the
+// signed-out markup in the tree.
+const LOGGED_OUT_SELECTORS = [
+    'button[aria-label="Sign in"]',
+    'a[href*="accounts.google.com/ServiceLogin"]',
+    'a[href*="/auth/login"]',
+    '[data-testid="login-button"]',
+    'button[data-testid="login-button"]',
+];
+const LOGGED_OUT_TEXT = /\b(sign in|log in|sign up to|log in to get answers|sign in to save activity)\b/i;
+
+async function isLoggedOut(p) {
+    try {
+        const state = await p.evaluate((sels, reSrc) => {
+            const re = new RegExp(reSrc, 'i');
+            const visible = (el) => !!el && el.offsetParent !== null && (el.innerText || el.textContent || '').trim() !== '';
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                if (visible(el)) return { loggedOut: true, why: 'selector ' + s };
+            }
+            // A sign-in CTA that is on screen and near the top is the account gate.
+            const top = (document.body.innerText || '').slice(0, 1200);
+            if (re.test(top)) return { loggedOut: true, why: 'sign-in copy near top' };
+            return { loggedOut: false, why: null };
+        }, LOGGED_OUT_SELECTORS, LOGGED_OUT_TEXT.source);
+        return state;
+    } catch {
+        // Cannot tell — do NOT claim logged in, but do not fail the gate on a flaky read
+        // either. The send path has its own guard.
+        return { loggedOut: false, why: null, unknown: true };
+    }
+}
+
+async function waitForChatInput(targetPage) {
+    const p = targetPage || page;
     const deadline = Date.now() + config.loginWaitMs;
+    let warned = false;
     while (Date.now() < deadline) {
         const el = await firstMatch(config.selectors.input);
         if (el) {
-            console.log('✅ Chat input found — logged in.');
-            return;
+            const out = await isLoggedOut(p);
+            if (!out.loggedOut) {
+                console.log('✅ Chat input found — logged in.');
+                return;
+            }
+            if (!warned) {
+                console.log(`🟡 Chat input present but the page is SIGNED OUT (${out.why}) — not treating that as ready.`);
+                warned = true;
+            }
+        } else if (!warned) {
+            console.log('🟡 Waiting for login — log into the browser window if prompted...');
+            warned = true;
         }
-        console.log('🟡 Waiting for login — log into the browser window if prompted...');
         await sleep(3000);
     }
     throw new Error(
-        `Login wait timed out after ${config.loginWaitMs / 1000}s — no chat input found. ` +
+        `Login wait timed out after ${config.loginWaitMs / 1000}s — no usable chat input. ` +
+        'A composer was found but the page is signed out, so a send would never submit. ' +
         'Log in manually, then POST /connect.'
     );
 }
@@ -3808,6 +3889,7 @@ module.exports = {
     // harness is using instead of probing its own idea of the port order.
     findRunningBrowserWs,
     cdpProbeOrder,
+    cdpPortIsExplicit,
     // Exported for the retry-classification test. Pure (text in, Error out), so it can
     // be exercised without a browser — and it must be the SHIPPED function, because a
     // test that re-implements the regex proves only that the regex was copied.
@@ -3834,4 +3916,5 @@ module.exports = {
     // can be asserted directly — the bug it guards is attaching to the wrong gate's
     // browser, which produces a working gateway answering as the wrong account.
     cdpProbeOrder,
+    cdpPortIsExplicit,
 };
