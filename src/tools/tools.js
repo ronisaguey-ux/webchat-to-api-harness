@@ -328,11 +328,19 @@ const TOOL_DEFINITIONS = [
                     ? spawn(sh.cmd, sh.stdinArgs, { detached: true, stdio: ['pipe', outFd, errFd] })
                     : spawn(sh.cmd, sh.args(cmd), { detached: true, stdio: ['ignore', outFd, errFd] });
                 if (sh.stdinArgs) {
-                    child.stdin.write(cmd);
-                    child.stdin.end();
+                    // An 'error' on a pipe whose child already exited is emitted as a stream
+                    // error, and an UNHANDLED one takes the whole process down — measured
+                    // 2026-09-24: a duplicate write here raised ERR_STREAM_WRITE_AFTER_END,
+                    // crashed the gateway, and every later request got a 502 that read as
+                    // "the lane is slow". A dead child is an ordinary outcome; it must never
+                    // be able to kill the server. The guard and the listener are both here
+                    // because either one alone still leaves a crash path.
+                    child.stdin.on('error', () => { /* child gone mid-write — finish() reports it */ });
+                    if (child.stdin.writable) {
+                        child.stdin.write(cmd);
+                        child.stdin.end();
+                    }
                 }
-                child.stdin.write(cmd);
-                child.stdin.end();
                 let settled = false;
                 const finish = (extra) => {
                     if (settled) return;
