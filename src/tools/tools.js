@@ -830,6 +830,8 @@ function isToolAvailable(toolName) {
     return typeof tool.available === 'function' ? tool.available() : true;
 }
 
+const LIMITS = require('./limits');
+
 let _disabledTools = null;
 
 function loadDisabledTools() {
@@ -876,6 +878,16 @@ async function executeTool(toolName, args, ctx) {
             success: false,
             error: `Tool "${toolName}" is not available on this install (its requirement is unmet).`,
         };
+    }
+    // ── Per-tool limits ───────────────────────────────────────────────────────
+    // Checked here, on the arguments, because this is the last point where the action can
+    // still be stopped and the first point where its real arguments are known. A limit is
+    // either a hard ban or an ask-the-user, and an ask applies in EVERY permission mode —
+    // that is the whole point of it, so this deliberately does not consult the mode.
+    const verdict = LIMITS.checkLimits(toolName, args);
+    if (!verdict.allowed) {
+        console.warn(`⛔ ${toolName} blocked by a ${verdict.enforce} limit (${verdict.pattern})`);
+        return { success: false, error: LIMITS.refusalMessage(toolName, verdict), limit: verdict };
     }
     console.log(`🔧 Executing: ${toolName}(${JSON.stringify(args)})`);
     try {
@@ -1099,6 +1111,8 @@ module.exports = {
     getExecutableToolDefinitions,
     isToolAvailable,
     executeTool,
+    checkLimits: LIMITS.checkLimits,
+    limitsFor: LIMITS.limitsFor,
     parseToolCall,
     parseToolCalls,
     cleanProse,
