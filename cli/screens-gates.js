@@ -16,6 +16,9 @@ const path = require('path');
 
 function build(ctx) {
     const { A, D, G, H, LC, header, shortHome, panel } = ctx;
+    // The settings layer, so a screen can read a raw dotted path (the limits map has no
+    // per-tool schema entry to resolve through).
+    const S = ctx.S || require('./settings.js');
 
     // ── Gates ────────────────────────────────────────────────────────────────
     //
@@ -469,6 +472,128 @@ function build(ctx) {
     // "Cannot read properties of undefined (reading 'value')" before it drew anything.
     const toolPath = (name) => `tools.disabled::${name}`;
 
+    // ── Per-tool limits ──────────────────────────────────────────────────────
+    // A tool is either on or off; a LIMIT is the finer switch: this tool, but not when
+    // the arguments look like this. Each limit is either a hard ban or an ask-the-user,
+    // and an ask applies in every permission mode — which is what makes it worth having.
+    const LIMIT_PATH = 'tools.limits';
+
+    function readLimits() {
+        const st = ctx.state();
+        const list = S.getPath(st.raw, LIMIT_PATH);
+        const out = {};
+        if (list && typeof list === 'object' && !Array.isArray(list)) {
+            for (const [k, v] of Object.entries(list)) {
+                if (Array.isArray(v)) {
+                    out[k] = v.filter((x) => x && typeof x === 'object' && String(x.match || '').trim())
+                        .map((x) => ({
+                            match: String(x.match),
+                            enforce: x.enforce === 'ask' ? 'ask' : 'ban',
+                            note: x.note ? String(x.note) : '',
+                        }));
+                }
+            }
+        }
+        return out;
+    }
+
+    function limitHint(limits, tool) {
+        const list = limits[tool] || [];
+        if (!list.length) return '';
+        const bans = list.filter((l) => l.enforce === 'ban').length;
+        const asks = list.length - bans;
+        return [bans ? `${bans} ban` : '', asks ? `${asks} ask` : ''].filter(Boolean).join(' · ');
+    }
+
+    async function writeLimits(limits) {
+        // Drop a tool that has no limits left, so the config does not accumulate empty
+        // keys the screen would then have to explain.
+        const clean = {};
+        for (const [k, v] of Object.entries(limits)) if (v && v.length) clean[k] = v;
+        await ctx.saveSetting(LIMIT_PATH, clean);
+    }
+
+    async function screenLimits() {
+        for (;;) {
+            const limits = readLimits();
+            let names = [];
+            try {
+                names = require('../src/tools/tools').getToolDefinitions().map((t) => t.name);
+            } catch { names = []; }
+
+            const items = names.map((n) => ({
+                label: n,
+                hint: limitHint(limits, n) || 'no limits',
+                value: n,
+            }));
+            items.push({ label: 'Back', value: 'back' });
+
+            const pick = await A.menu(items, {
+                title: 'Limits — which tool?',
+                footer: ['A limit applies to the arguments of one tool. Enter opens its limits.'],
+            });
+            if (pick === A.BACK || pick === 'back') return;
+            await screenToolLimits(pick);
+        }
+    }
+
+    async function screenToolLimits(tool) {
+        for (;;) {
+            const limits = readLimits();
+            const list = limits[tool] || [];
+            const items = list.map((l) => ({
+                label: `${l.enforce === 'ban' ? 'BAN' : 'ASK'}  ${l.match}`,
+                hint: l.enforce === 'ban' ? 'refused outright' : 'refused until the user approves',
+                value: `edit:${list.indexOf(l)}`,
+            }));
+            items.push({ label: 'Add a limit', hint: 'a substring, or /a regex/', value: 'add' });
+            items.push({ label: 'Back', value: 'back' });
+
+            const pick = await A.menu(items, {
+                title: `${tool} — limits`,
+                footer: ['BAN refuses the call. ASK refuses it until a human approves, in every mode.'],
+            });
+            if (pick === A.BACK || pick === 'back') return;
+
+            if (pick === 'add') {
+                const match = await A.prompt(`Text to match in ${tool}'s arguments (substring, or /regex/)`, {
+                    footer: ['Matched against every value the model passes to this tool.'],
+                });
+                if (!match || !String(match).trim()) continue;
+                const enforce = await A.menu([
+                    { label: 'Hard ban', hint: 'refuse the call outright', value: 'ban' },
+                    { label: 'Ask permission', hint: 'refuse until the user approves, in every mode', value: 'ask' },
+                    { label: 'Back', value: 'back' },
+                ], { title: `How should "${String(match).slice(0, 40)}" be enforced?` });
+                if (enforce !== 'ban' && enforce !== 'ask') continue;
+                const next = readLimits();
+                next[tool] = (next[tool] || []).concat([{ match: String(match).trim(), enforce }]);
+                await writeLimits(next);
+                continue;
+            }
+
+            const idx = Number(String(pick).split(':')[1]);
+            const current = (readLimits()[tool] || [])[idx];
+            if (!current) continue;
+            const action = await A.menu([
+                { label: current.enforce === 'ban' ? 'Change to ASK' : 'Change to BAN', value: 'flip' },
+                { label: 'Delete this limit', value: 'del' },
+                { label: 'Back', value: 'back' },
+            ], { title: `${current.enforce.toUpperCase()}  ${current.match}` });
+            const next = readLimits();
+            const arr = next[tool] || [];
+            if (action === 'flip') {
+                arr[idx] = { ...current, enforce: current.enforce === 'ban' ? 'ask' : 'ban' };
+                next[tool] = arr;
+                await writeLimits(next);
+            } else if (action === 'del') {
+                arr.splice(idx, 1);
+                next[tool] = arr;
+                await writeLimits(next);
+            }
+        }
+    }
+
     async function screenTools(startIndex = 0) {
         const st = ctx.state();
         const rows = ctx.rowsOf(st);
@@ -491,11 +616,20 @@ function build(ctx) {
             names = require('../src/tools/tools').getToolDefinitions().map((t) => t.name);
         } catch { names = []; }
 
+        const limits = readLimits();
         const items = names.map((n) => ({
-            label: `${isOn(n) ? '[x]' : '[ ]'} ${n}`,
-            hint: isOn(n) ? 'available' : 'switched off',
+            // `= true` because the switch IS the fact, and a tick is easy to misread at a
+            // glance when the whole list is ticks.
+            label: `${isOn(n) ? '[x]' : '[ ]'} ${n} = ${isOn(n) ? 'true' : 'false'}`,
+            hint: limitHint(limits, n) || (isOn(n) ? 'available' : 'switched off'),
             value: n,
         }));
+        const withLimits = Object.keys(limits).filter((k) => limits[k] && limits[k].length).length;
+        items.push({
+            label: 'Limits…',
+            hint: withLimits ? `${withLimits} tool(s) have limits` : 'ban or ask per tool',
+            value: '__limits__',
+        });
         items.push({ label: 'Done', hint: `${names.filter((n) => !isOn(n)).length} switched off`, value: 'done' });
 
         const pick = await A.menu(items, {
@@ -505,6 +639,7 @@ function build(ctx) {
         });
         if (pick === A.BACK) return;
         if (pick === 'done') return;
+        if (pick === '__limits__') { await screenLimits(); return screenTools(startIndex); }
 
         // Persist NOW, on the setting that owns this tool. `isOff` is rebuilt from the
         // settings on the next call, so an in-memory-only toggle was lost as soon as the
@@ -524,6 +659,8 @@ function build(ctx) {
         screenPlan,
         screenPickGates,
         screenTools,
+        screenLimits,
+        screenToolLimits,
     };
 }
 

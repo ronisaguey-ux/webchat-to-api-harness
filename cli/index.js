@@ -1678,6 +1678,60 @@ module.exports = {
 };
 
 // ── Interactive entry point ────────────────────────────────────────────────
+// ── First run: which system is the agent on? ────────────────────────────────
+//
+// Everything platform-shaped reads from `platform`: which shell a command runs in, how a
+// path is spelled, which command patterns are refused, and which sandbox roots make
+// sense. Guessing it from process.platform is wrong for the case this harness exists for
+// — driving an agent on a Windows box while the browser runs on Linux — so it is asked
+// once, at the start, and then it is just a setting like any other.
+//
+// Shown only when the config has no `platform` of its own. Once it is answered the key is
+// in the file and this never appears again.
+async function screenFirstRun() {
+    A.clear();
+    const body = [
+        A.bold('Welcome to the webchat harness.'),
+        '',
+        'This puts a real webchat — Claude, ChatGPT, Gemini, DeepSeek, Kimi and',
+        'others — behind an ordinary model API, so any agentic CLI can use the',
+        'account you already pay for as if it were a model endpoint.',
+        '',
+        'It drives a real browser window. You sign in once, by hand, and from',
+        'then on the agent works through that tab: no API key, no per-token bill.',
+        '',
+        A.dim('First, one question about the machine your AGENT will run on.'),
+        A.dim('It is not necessarily this one — pointing an agent on Windows at a'),
+        A.dim('browser on Linux is exactly what this setting is for.'),
+    ];
+    for (const l of A.boxLines('Welcome', body, { width: A.termWidth() })) A.line(l);
+    A.newline();
+
+    const pick = await A.menu([
+        { label: 'Linux', hint: 'bash, forward slashes, POSIX rules', value: 'linux' },
+        { label: 'Windows', hint: 'cmd.exe, backslashes, Windows rules', value: 'windows' },
+    ], { title: 'Which system is your agent running on?' });
+    if (pick !== 'linux' && pick !== 'windows') return null;
+
+    const res = await S.saveSetting('platform', pick);
+    if (res && res.ok === false) {
+        await A.message('Could not save', [`${res.reason || 'the platform was not written'}`]);
+        return null;
+    }
+    return pick;
+}
+
+// Has the user ever answered the platform question? The key being present in the FILE is
+// the signal — a value that only comes from the schema default is not an answer.
+function platformChosen() {
+    try {
+        const { raw } = S.loadRaw();
+        return raw && raw.platform !== undefined && raw.platform !== null && raw.platform !== '';
+    } catch {
+        return true;   // an unreadable config is not a first run; do not block the CLI
+    }
+}
+
 async function interactive() {
     A.installGuards();
     // Take the whole screen. Without this the UI is drawn INLINE into the scrollback, so
@@ -1685,6 +1739,10 @@ async function interactive() {
     // other — which is what made the editor look broken. The alternate buffer is what
     // every full-screen TUI uses; `restore()` hands the terminal back on any exit path.
     A.enterFullScreen();
+    if (!platformChosen()) {
+        try { await screenFirstRun(); }
+        catch (e) { if (e instanceof A.QuitError) { A.restore(); return; } throw e; }
+    }
     for (;;) {
         let choice;
         try {
@@ -1831,4 +1889,4 @@ async function main(argv) {
     return 0;
 }
 
-module.exports = { main, interactive };
+module.exports = { main, interactive, screenFirstRun, platformChosen };

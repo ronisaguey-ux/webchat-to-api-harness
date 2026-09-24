@@ -150,6 +150,16 @@ const SCHEMA = [
         // tools were available.
         settings: toolSettings([
             {
+                // The storage behind the per-tool limits editor. It needs a schema entry so
+                // it is a known setting: without one saveSetting() refuses it as unknown and
+                // the editor's write would silently do nothing.
+                path: 'tools.limits', label: 'Per-tool limits', type: 'longtext', env: 'TOOLS_LIMITS',
+                default: {}, group: 'tools', groupTitle: 'Tools',
+                help: 'Limits attached to one tool, matched against its arguments. Each limit is '
+                    + 'either a hard ban or an ask-the-user, and an ask applies in every permission '
+                    + 'mode. Edited from the Tools screen; shown here so it can be copied between installs.',
+            },
+            {
                 path: 'tools.bashAllowed', label: 'Allow run_bash at all', type: 'bool', env: 'BASH_ALLOWED',
                 default: false, group: 'tools', groupTitle: 'Tools',
                 help: 'The master switch for shell access. With this off, run_bash is unavailable no matter what else is set.',
