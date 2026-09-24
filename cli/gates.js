@@ -132,12 +132,33 @@ function nextId(gates, siteId) {
     return `${base}-${n}`;
 }
 
-// Port ranges the harness OWNS. They deliberately sit above the ports the rest of
-// this machine already uses (8081-8083 are oculus gateways, 9225-9230 their chromes):
-// a collision made `webchat connect` report a healthy gateway that was really another
-// stack's lane, and a model request came back answered by the wrong browser.
-const CDP_PORT_BASE = 9281;
-const GATEWAY_PORT_BASE = 8181;
+// Ports are CHOSEN, not derived. A fixed base (8181/9281, or the earlier 8081/9225)
+// collides with whatever else is running on the machine — on this box 8081-8083 are
+// oculus gateways and 9225-9230 their chromes, so a derived port handed out a lane
+// that belonged to another stack and a model request came back answered by the wrong
+// browser. Asking the OS for a free port makes that impossible without the user
+// having to know or care which numbers are taken.
+const net = require('net');
+
+// Ask the OS for a port nobody holds. Binding to 0 and reading back the assigned
+// port is the only reliable test: a "is this number taken" check races anything that
+// binds between the check and the use.
+function freePort() {
+    return new Promise((resolve, reject) => {
+        const srv = net.createServer();
+        srv.unref();
+        srv.on('error', reject);
+        srv.listen(0, '127.0.0.1', () => {
+            const { port } = srv.address();
+            srv.close(() => resolve(port));
+        });
+    });
+}
+
+// A CDP port and a gateway port that nothing is listening on right now.
+async function freePortPair() {
+    return { cdpPort: await freePort(), gatewayPort: await freePort() };
+}
 
 function add({ site, label, url, cdpPort, gatewayPort, profile }) {
     const state = read();
@@ -157,8 +178,10 @@ function add({ site, label, url, cdpPort, gatewayPort, profile }) {
         // them explicitly, but the MCP tool (webchat_gate_add) did not, so an agent-created
         // gate was stored as 0/0 and `webchat connect` dialled CDP :0 — "browser not
         // answering" on a browser that was open and logged in the whole time.
-        cdpPort: Number(cdpPort) || (CDP_PORT_BASE + state.gates.length),
-        gatewayPort: Number(gatewayPort) || (GATEWAY_PORT_BASE + state.gates.length),
+        // Ports MUST be supplied by the caller (the CLI screen picks free ones) or the
+        // gate is unusable: the old default of 0 made 'webchat connect' dial CDP :0.
+        cdpPort: Number(cdpPort) || 0,
+        gatewayPort: Number(gatewayPort) || 0,
         // A gate is only usable once the USER has confirmed the browser is logged in.
         // We cannot detect a login reliably — a signed-out Gemini still renders an
         // input box — so this flag is set by the user, deliberately, and is the only
@@ -218,8 +241,8 @@ async function probe(gate) {
 }
 
 module.exports = {
-    CDP_PORT_BASE,
-    GATEWAY_PORT_BASE,
+    freePort,
+    freePortPair,
     SITES,
     siteById,
     siteForUrl,
