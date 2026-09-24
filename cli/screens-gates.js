@@ -301,8 +301,11 @@ function build(ctx) {
         }
         if (chosen.has(pick)) chosen.delete(pick);
         else chosen.add(pick);
-        // Re-open the list with the cursor still on the row just toggled. Re-entering
-        // at 0 made every Enter look like it had thrown the selection away.
+        // Persist NOW, not on 'done'. The next call rebuilds `chosen` from this file, so
+        // a toggle held only in memory was discarded the moment the list redrew — which
+        // is exactly why Enter appeared to do nothing.
+        LC.write({ harnesses: [...chosen] });
+        // Re-open the list with the cursor still on the row just toggled.
         const at = items.findIndex((i) => i.value === pick);
         return screenHarnesses(at >= 0 ? at : startIndex);
     }
@@ -418,6 +421,8 @@ function build(ctx) {
         }
         if (chosen.has(pick)) chosen.delete(pick);
         else chosen.add(pick);
+        // Persist NOW — the next call rebuilds `chosen` from this file.
+        LC.write({ gates: [...chosen] });
         const at = items.findIndex((i) => i.value === pick);
         return screenPickGates(at >= 0 ? at : startIndex);
     }
@@ -455,6 +460,9 @@ function build(ctx) {
         }
         if (disabled.has(pick)) disabled.delete(pick);
         else disabled.add(pick);
+        // Persist NOW — `disabled` is rebuilt from the setting on the next call, so an
+        // in-memory-only toggle was lost as soon as the list redrew.
+        await ctx.saveSetting('tools.disabled', [...disabled]);
         const at = items.findIndex((i) => i.value === pick);
         return screenTools(at >= 0 ? at : startIndex);
     }
