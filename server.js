@@ -964,13 +964,59 @@ function claimsWorkDone(text) {
     return WORK_CLAIM_RE.test(String(text || ''));
 }
 
-function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun }) {
-    // Only when work tools were OFFERED, none ran, AND the answer claims the job was
-    // done. A bare answer asserts nothing, so there is nothing to contradict.
-    if (offeredWorkTools && workToolsRun === 0 && claimsWorkDone(text)) {
-        return { marked: true, text: UNVERIFIED_MARKER + (text || '') };
+// Tools that CHANGE something on disk. Reading and listing are work, but they cannot
+// make a claim about a change true.
+const MUTATING_TOOLS = new Set(['write_file', 'edit_memory']);
+
+// A bash command that changes a repository. Deliberately narrow: a false positive adds
+// a warning to an honest answer, so only unambiguous verbs count.
+const MUTATING_BASH_RE = /(^|[;&|]\s*)(git\s+(commit|push|merge|rebase|cherry-pick|add)|rm\s|mv\s|cp\s|sed\s+-i|tee\s|>>?\s*\S)/;
+
+// An answer that says the work LANDED. Distinct from claimsWorkDone, which matches any
+// "done" — this is specifically about changes being written or committed somewhere.
+const MUTATION_CLAIM_RE = new RegExp(
+    '\\b(committed|pushed|wrote|written|saved|applied|created|updated|modified|edited|' +
+    'hashed|installed|deployed|migrated|patched|replaced|removed|deleted|added)\\b', 'i');
+
+function claimsMutation(text) {
+    return MUTATION_CLAIM_RE.test(String(text || ''));
+}
+
+function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun, mutationsRun = null }) {
+    const answer = String(text || '');
+
+    // Case 1: nothing ran at all, and the answer claims the job was done.
+    // A bare answer asserts nothing, so there is nothing to contradict.
+    if (offeredWorkTools && workToolsRun === 0 && claimsWorkDone(answer)) {
+        return { marked: true, text: UNVERIFIED_MARKER + answer };
     }
-    return { marked: false, text };
+
+    // Case 2: the answer says it CHANGED something (committed, pushed, wrote, hashed)
+    // but no tool that can change anything was called. This is the failure the
+    // zero-tool check cannot see, and it is the one that actually happened: a run made
+    // 25 read-only calls — read_file, list_dir, run_bash pytest — then submitted
+    // "changes committed and pushed … session tokens hashed, cost routes guarded".
+    // `git log` in both repositories showed no commit, no such code, and no diff. The
+    // caller had a confident summary of work that does not exist.
+    //
+    // Read-only work is not evidence of a change, so the two counts are kept apart:
+    // workToolsRun says "it did something", mutationsRun says "something can differ now".
+    if (
+        offeredWorkTools &&
+        mutationsRun === 0 &&
+        workToolsRun > 0 &&
+        claimsMutation(answer)
+    ) {
+        return {
+            marked: true,
+            text:
+                '[⚠️ no file was written and no command was run that changes anything — this answer ' +
+                'describes changes, but nothing in this turn could have made one. Verify before trusting it.] ' +
+                answer,
+        };
+    }
+
+    return { marked: false, text: answer };
 }
 
 // Route a tool call to the right executor: an external MCP tool goes to the pool,
@@ -1326,6 +1372,9 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     // A submit that follows no tool work is not proof of anything, and the gateway
     // is the only layer that can see it, so it says so.
     let workToolsRun = 0;
+    // Work that can actually CHANGE something. workToolsRun counts reads too, so it
+    // cannot answer "did this run alter any state?" — see markUnverifiedSubmit case 2.
+    let mutationsRun = 0;
     let wrapUpSent = false; // 09-13: near the round budget, demand a final submit_answer
     let spiralStrikes = 0; // 09-13: repeated reasoning loops in the tab
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
@@ -1446,7 +1495,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 // The rationale lives with markUnverifiedSubmit, so the rule is stated
                 // once instead of drifting in two places.
                 const offeredWorkTools = !config.noTools && !config.allowPlainText;
-                const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun });
+                const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun, mutationsRun });
                 if (verdict.marked) {
                     console.log('⚠️ submit_answer arrived having run ZERO tools — marking the answer as unverified (possible phantom completion)');
                     onProgress?.({ type: 'rejected', text: 'submit after zero tool calls — answer marked unverified' });
@@ -1471,6 +1520,12 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 // Count only real work: send_message is conversation and the submit
                 // aliases end the turn, so neither is evidence the task was touched.
                 workToolsRun++;
+                // And separately, whether anything here could have changed state at all.
+                // A run_bash only counts when its command actually mutates — `pytest` and
+                // `git log` are reads, and treating them as writes is what let
+                // "changes committed and pushed" pass unchallenged.
+                if (MUTATING_TOOLS.has(call.toolName)) mutationsRun++;
+                else if (call.toolName === 'run_bash' && MUTATING_BASH_RE.test(String(call.args?.command || ''))) mutationsRun++;
             }
             // 08-16 (user): stream a readable receipt to the client — the exact
             // command / file / output, not a bare "🔧 toolname" — so anyone
