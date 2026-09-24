@@ -1826,6 +1826,69 @@ app.get('/status', async (req, res) => {
     });
 });
 
+// ── GET /metrics — live numbers for the dashboard ───────────────────────────
+// The CLI polls this to render "time since last send", "average latency",
+// "waiting for the browser", "cooling down until…" and so on. Kept separate from
+// /health on purpose: /health is a liveness probe with a status code that other
+// tooling depends on (503 when not attached), while /metrics is an observation
+// surface that must always answer 200 and never lie about readiness.
+app.get('/metrics', (req, res) => {
+    const now = Date.now();
+    const sinceLastSend = lastSendAt > 0 ? now - lastSendAt : null;
+
+    // How long until the next send is permitted, per the pacing gate. Computed the
+    // same way countedSend does, so the number shown is the one that will apply.
+    const account = process.env.WEBCHAT_ACCOUNT || String(process.env.PORT || '');
+    const nextGapMs = (() => {
+        try {
+            const lo = Math.max(0, Math.min(SEND_GAP_MIN_MS, SEND_GAP_MAX_MS));
+            const hi = Math.max(lo, SEND_GAP_MAX_MS);
+            // The gate picks a random gap per send; report the RANGE, since the
+            // exact value is not chosen until the send happens.
+            return { min: lo, max: hi, elapsedSinceLastSend: sinceLastSend };
+        } catch { return null; }
+    })();
+
+    const rateLimit = (() => {
+        try {
+            const remain = RATE_LIMIT.remainingMs(account);
+            return {
+                enabled: RATE_LIMIT.enabled(),
+                coolingDown: remain > 0,
+                cooldownRemainingMs: Math.max(0, remain),
+                account,
+            };
+        } catch (e) {
+            return { enabled: false, error: String(e && e.message) };
+        }
+    })();
+
+    res.status(200).json({
+        // identity
+        uptimeMs: typeof processStartAt === 'number' ? now - processStartAt : null,
+        webchat: config.webchatUrl,
+        model: config.modelName || null,
+        // liveness (mirrors /health, but as data)
+        browserAlive: (() => {
+            try { const pg = getPage(); return !!pg && !pg.isClosed(); } catch { return false; }
+        })(),
+        requestInFlight,
+        inFlightMs: requestInFlight && lastSendAt > 0 ? now - lastSendAt : 0,
+        // activity
+        sendCount,
+        lastSendAgoMs: sinceLastSend,
+        pacing: nextGapMs,
+        rateLimit,
+        // send bookkeeping
+        sendRetriesLeft,
+        lastBodyChars: lastReqBodyChars,
+        handoffAgoMs: lastHandoffAt > 0 ? now - lastHandoffAt : null,
+        jev: jevStats,
+        tools: (() => { try { return getToolDefinitions().length; } catch { return 0; } })(),
+        timestamp: new Date().toISOString(),
+    });
+});
+
 app.get('/tools', (req, res) => {
     res.json(getToolDefinitions());
 });
