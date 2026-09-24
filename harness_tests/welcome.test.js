@@ -82,18 +82,30 @@ test('the greeting explains what the harness is, not just that it exists', async
     const realMenu = A.menu;
     A.menu = async (items, opts) => {
         text = (typeof opts.above === 'function' ? opts.above() : opts.above || []).join('\n');
-        return 'skip';
+        return 'ok';
     };
     try { await idx.screenWelcome(); } finally { A.menu = realMenu; }
-    assert.match(text, /hello/i, 'it must greet');
-    assert.match(text, /harness/i, 'it must name the thing');
+    // Collapse the wrapping: the assertions are about what it SAYS, and a phrase like
+    // The character is drawn on the SAME rows as the text, so a phrase like "signed in"
+    // arrives as "signed <art> in". Keep the text column only: everything before the
+    // run of spaces that separates it from the art.
+    const textCol = (row) => String(row).replace(/\u001b\[[0-9;]*m/g, '').split(/\s{3,}/)[0];
+    text = text.split('\n').map(textCol).join('\n').replace(/\s+/g, ' ');
+    // what is this, does it work with my setup, what does it cost me.
+    assert.match(text, /hey|hello|welcome/i, 'it must greet warmly');
     assert.match(text, /webchat/i, 'it must name what it drives');
     assert.match(text, /API/i, 'it must say what the webchat becomes');
-    assert.match(text, /sign in/i, 'it must say the sign-in is the user\'s job');
-    assert.match(text, /agent/i, 'it must say who benefits');
-    // Roughly fifty words: enough to explain, short enough to be read rather than skipped.
+    assert.match(text, /free or paid/i, 'it must say a free account works as well as a paid one');
+    assert.match(text, /Puppeteer/i, 'it must say how it drives the browser');
+    assert.match(text, /system prompt/i, 'it must say how the tab is made to behave like an endpoint');
+    assert.match(text, /Claude Code|opencode|Codex/, 'it must name the agents it feeds');
+    assert.match(text, /MCP/i, 'it must say an agent can drive this without the user clicking');
+    assert.match(text, /signed in|sign in/i, 'it must say the sign-in is the user\'s job');
+    assert.match(text, /No API key/i, 'it must answer "what does this cost me"');
+
     const words = text.replace(/[^A-Za-z0-9' -]/g, ' ').split(/\s+/).filter(Boolean).length;
-    assert.ok(words >= 35 && words <= 90, `the greeting is ${words} words - aim for about 50`);
+    assert.ok(words >= 90 && words <= 260,
+        `the greeting is ${words} words - detailed, but still a greeting`);
 });
 
 test('the greeting is the FIRST thing, and the tour question comes after the platform', async () => {
