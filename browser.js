@@ -3296,6 +3296,43 @@ async function clickNewChatControl() {
 
 
 
+// How many conversation turns are on the page right now?
+//
+// The reset below MUST be verified with this rather than assumed from a successful
+// click. Measured: on Gemini, /newchat clicked the sparkle control, slept, and
+// reported ok:true while the thread still held 5 user and 5 assistant rows and 42KB
+// of prior context — every reset silently did nothing. Seeding a task into that
+// thread is how a plan job ends up answering a prompt from a conversation that has
+// nothing to do with it.
+//
+// Counts ROWS, not elements: Gemini renders a user row and a model row per turn, and
+// the sites differ on which wrapper they use, so a "no turns" result is the only
+// thing that means "fresh thread" across all of them.
+async function conversationRowCount() {
+    const pg = await resolveTargetPage();
+    if (!pg) return null;
+    const sel = (config.selectors && config.selectors.message) || '';
+    const out = await pg.evaluate((messageSel) => {
+        // User rows are site-specific and there is no single selector for them, so
+        // count the things that only exist in a conversation: the message blocks plus
+        // the known user-row elements.
+        const parts = [];
+        if (messageSel) {
+            try { parts.push(...document.querySelectorAll(messageSel)); } catch { /* ignore a bad selector */ }
+        }
+        try { parts.push(...document.querySelectorAll('user-query')); } catch { /* gemini */ }
+        try {
+            parts.push(...document.querySelectorAll('[class*="ds-virtual-list"] > *'));
+        } catch { /* deepseek virtualised list */ }
+        // Count only VISIBLE nodes: a hidden template or a cached pane is not a turn.
+        return parts.filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        }).length;
+    }, sel).catch(() => null);
+    return typeof out === 'number' ? out : null;
+}
+
 async function openNewChat() {
     // Fresh CDP session like every send (stale-session refresh).
     await initBrowser({ reconnect: true });
@@ -3359,6 +3396,38 @@ async function openNewChat() {
         await waitForChatInput();
         await sleep(2500); // let the SPA settle the composer
     }
+
+    // ---- PROVE the thread actually reset ------------------------------------
+    // A click that found its control is not a click that worked, and reporting a
+    // fresh thread over a stale one is the failure this harness keeps paying for:
+    // the next prompt lands in a conversation full of unrelated history. Measured
+    // on Gemini - the sparkle control was found and clicked, ok:true was returned,
+    // and the thread still held 5 turns and 42KB of prior context.
+    let rows = await conversationRowCount();
+    if (rows !== null && rows > 0) {
+        console.log(`[reset] new chat still shows ${rows} row(s) - forcing navigation to clear it`);
+        const pg2 = await resolveTargetPage();
+        if (pg2) {
+            await pg2.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await waitForChatInput();
+            await sleep(2500);
+        }
+        rows = await conversationRowCount();
+    }
+    if (rows !== null && rows > 0) {
+        // Say so rather than return normally: returning is what made /newchat
+        // report ok:true over a thread it never touched.
+        const err = new Error(`thread did not reset - ${rows} row(s) still present after click and navigation`);
+        err.resetFailed = true;
+        err.remainingRows = rows;
+        throw err;
+    }
+    // Distinguish "measured and empty" from "could not measure". Collapsing the two
+    // would let an unmeasurable page report a verified reset, which is the same class
+    // of lie this whole check exists to remove.
+    console.log(rows === null
+        ? '[reset] thread state UNKNOWN (could not read the conversation) - not verified'
+        : '[reset] thread verified empty');
     // 08-14 (user rule): mode is locked at thread creation — select EXPERT
     // on the fresh new-chat composer BEFORE the first message creates the
     // thread (instant threads can never become expert afterwards).
