@@ -180,6 +180,10 @@ function startGateway(opts = {}) {
             ...(opts.env || {}),
             PORT: String(port),
             ...(opts.cdpPort ? { CDP_PORT: String(opts.cdpPort) } : {}),
+            // Each webchat needs its own site quirks. Without this every gateway ran
+            // the generic mode, so the Gemini gateway used the wrong composer and
+            // answer selectors and connected to the page but never read it.
+            ...(opts.mode ? { WEBCHAT_MODE: String(opts.mode) } : {}),
             // The gateway drives a HEADED browser, so it needs the display too. Without
             // this a gateway started from a shell with no DISPLAY fails every send
             // with "Missing X server to start the headful browser".
