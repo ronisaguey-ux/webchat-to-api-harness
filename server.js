@@ -867,6 +867,27 @@ async function ensureMcpDiscovered() {
     }
 }
 
+// Is a submit_answer credible?
+//
+// Measured: a real run executed ZERO tools and then answered
+//   "Remediation plan execution completed successfully. All active waves and steps
+//    have been addressed, verified, and logged in accordance with the specifications."
+// The gateway returned HTTP 200 with that text, so the caller could not tell a
+// finished job from a fabricated one. The gateway cannot know whether the model is
+// lying, but it does know nothing ran, and saying so is the difference between a
+// caller being misled and being informed.
+//
+// Deliberately narrow: only when work tools were OFFERED and none ran. A direct
+// answer that needed no tools is left alone, so conversation callers are unaffected.
+const UNVERIFIED_MARKER = '[⚠️ no tools were run in this turn — this answer contains no work the harness could verify]\n\n';
+
+function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun }) {
+    if (offeredWorkTools && workToolsRun === 0) {
+        return { marked: true, text: UNVERIFIED_MARKER + (text || '') };
+    }
+    return { marked: false, text };
+}
+
 // Route a tool call to the right executor: an external MCP tool goes to the pool,
 // everything else to the harness's own tools.js. Both fail soft (a bad call
 // returns {success:false,...}, never throws out of the loop).
@@ -1197,6 +1218,20 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     let malformedRounds = 0;  // broken tool-JSON attempts (both modes)
     let narrationNudged = false; // strict mode: send_message narration taught once per request
     let emptyAnswerNudged = false; // 08-16: empty submit_answer retried once before the placeholder
+    // Work tools actually EXECUTED in this request. send_message and the submit
+    // aliases are conversation, not work, so they do not count.
+    //
+    // Why this exists: measured on a real run, the model spent six rounds emitting
+    // prose and malformed envelopes, was asked to wrap up, and then called
+    // submit_answer with
+    //   "Remediation plan execution completed successfully. All active waves and
+    //    steps have been addressed, verified, and logged..."
+    // having executed ZERO tools. The gateway returned HTTP 200 and that paragraph
+    // as the answer, so the caller had no way to tell a completed job from a
+    // fabricated one — the plan script reported success and nothing had happened.
+    // A submit that follows no tool work is not proof of anything, and the gateway
+    // is the only layer that can see it, so it says so.
+    let workToolsRun = 0;
     let wrapUpSent = false; // 09-13: near the round budget, demand a final submit_answer
     let spiralStrikes = 0; // 09-13: repeated reasoning loops in the tab
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
@@ -1300,7 +1335,8 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             }
 
             // The model delivered its final answer through submit_answer / submit_message.
-            // Accepted unconditionally: ends the tool loop and delivers the final answer.
+            // A submit ENDS the loop, but it is only evidence of a finished job if
+            // work actually ran — so it passes through markUnverifiedSubmit first.
             const isSubmit = call.toolName === SUBMIT_TOOL || call.toolName === 'submit_message' || call.toolName === 'task_complete' || call.toolName === 'done';
             if (isSubmit) {
                 const answer = cleanWebchatText(call.args?.text ?? call.args?.message ?? call.args?.content ?? call.args?.summary ?? '');
@@ -1313,7 +1349,15 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                     response = await countedSend(EMPTY_ANSWER_MSG, toolDefs);
                     continue;
                 }
-                return final || '[webchat model completed the task]';
+                // The rationale lives with markUnverifiedSubmit, so the rule is stated
+                // once instead of drifting in two places.
+                const offeredWorkTools = !config.noTools && !config.allowPlainText;
+                const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun });
+                if (verdict.marked) {
+                    console.log('⚠️ submit_answer arrived having run ZERO tools — marking the answer as unverified (possible phantom completion)');
+                    onProgress?.({ type: 'rejected', text: 'submit after zero tool calls — answer marked unverified' });
+                }
+                return verdict.text || '[webchat model completed the task]';
             }
             if (call.toolName !== 'send_message') {
                 onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
@@ -1330,6 +1374,9 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 result = { success: true, delivered: true, instruction: 'Message delivered to user. Now proceed with your work tool call (read_file, run_bash, etc.) or deliver final answer via submit_answer.' };
             } else {
                 result = await runTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
+                // Count only real work: send_message is conversation and the submit
+                // aliases end the turn, so neither is evidence the task was touched.
+                workToolsRun++;
             }
             // 08-16 (user): stream a readable receipt to the client — the exact
             // command / file / output, not a bare "🔧 toolname" — so anyone
@@ -1836,17 +1883,28 @@ app.get('/metrics', (req, res) => {
     const now = Date.now();
     const sinceLastSend = lastSendAt > 0 ? now - lastSendAt : null;
 
-    // How long until the next send is permitted, per the pacing gate. Computed the
-    // same way countedSend does, so the number shown is the one that will apply.
+    // How long until the next send is permitted, per the pacing gate. Mirrors the
+    // gate in countedSend, including its conditions — reporting a gap that the gate
+    // does not actually apply is worse than reporting nothing, because the dashboard
+    // is what a user watches while a run looks slow.
+    //
+    // The random gap is a DeepSeek anti-ban measure and is NOT applied to other
+    // webchats (see countedSend). Gemini therefore has NO pacing gap, and the
+    // dashboard said "20-80s between sends" for it — a wait that never happens.
     const account = process.env.WEBCHAT_ACCOUNT || String(process.env.PORT || '');
-    const nextGapMs = (() => {
-        try {
-            const lo = Math.max(0, Math.min(SEND_GAP_MIN_MS, SEND_GAP_MAX_MS));
-            const hi = Math.max(lo, SEND_GAP_MAX_MS);
-            // The gate picks a random gap per send; report the RANGE, since the
-            // exact value is not chosen until the send happens.
-            return { min: lo, max: hi, elapsedSinceLastSend: sinceLastSend };
-        } catch { return null; }
+    const pacing = (() => {
+        const lo = Math.max(0, Math.min(SEND_GAP_MIN_MS, SEND_GAP_MAX_MS));
+        const hi = Math.max(lo, SEND_GAP_MAX_MS);
+        const applies = usesDeepSeek();
+        return {
+            applies,
+            // Only meaningful when it applies; 0 otherwise, so a consumer can read
+            // min/max unconditionally without inventing a wait.
+            min: applies ? lo : 0,
+            max: applies ? hi : 0,
+            reason: applies ? 'deepseek anti-bot spacing' : 'no pacing on this webchat',
+            elapsedSinceLastSend: sinceLastSend,
+        };
     })();
 
     const rateLimit = (() => {
@@ -1877,7 +1935,7 @@ app.get('/metrics', (req, res) => {
         // activity
         sendCount,
         lastSendAgoMs: sinceLastSend,
-        pacing: nextGapMs,
+        pacing,
         rateLimit,
         // send bookkeeping
         sendRetriesLeft,
@@ -2650,5 +2708,10 @@ module.exports = {
         getRequestInFlight: () => requestInFlight,
         setSendCount: (n) => { sendCount = Number(n) || 0; },
         getSendCount: () => sendCount,
+        // The phantom-completion guard. Exported so the test drives the SHIPPED
+        // decision rather than re-implementing its condition — a copy would keep
+        // passing after the real one changed.
+        markUnverifiedSubmit,
+        UNVERIFIED_MARKER,
     },
 };
