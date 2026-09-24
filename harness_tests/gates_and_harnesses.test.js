@@ -219,3 +219,50 @@ test('adding a webchat makes it the active one', async () => {
     assert.ok(!before.includes(created.id), 'should be a new gate');
     assert.strictEqual(G.read().active, created.id, 'the gate just created must become active');
 });
+
+// ── the flags must be REAL, and they must actually differ ────────────────────
+test('opencode is never given --yolo, which it does not have', () => {
+    // Verified with `opencode --help`: its options are --auto, --model, --pure, …
+    // and there is no --yolo. A flag that does not exist fails the launch outright,
+    // so the mode feature looked implemented and was broken for the default harness.
+    const opencode = H.harnessById('opencode');
+    for (const mode of ['manual', 'auto', 'yolo']) {
+        assert.ok(!H.argvFor(opencode, mode).includes('--yolo'),
+            `opencode ${mode} passed --yolo, which opencode does not accept`);
+    }
+    assert.ok(H.argvFor(opencode, 'auto').includes('--auto'), 'opencode auto-approves with --auto');
+});
+
+test('the permission modes are observably different for opencode', () => {
+    // opencode has ONE permission flag, so the manual/auto distinction has to be in
+    // the config file — otherwise two of three modes launch an identical agent.
+    const manual = H.OPENCODE_PERMISSION.manual;
+    const auto = H.OPENCODE_PERMISSION.auto;
+    const yolo = H.OPENCODE_PERMISSION.yolo;
+    assert.notDeepStrictEqual(manual, auto, 'manual and auto must not be the same');
+    assert.strictEqual(manual.edit, 'ask');
+    assert.strictEqual(auto.edit, 'allow');
+    assert.strictEqual(yolo['*'], 'allow', 'yolo allows what the others merely permit');
+});
+
+test('the generated opencode config carries the chosen mode', () => {
+    const dir = fs.mkdtempSync(path.join(TMP, 'perm-'));
+    const env = { OPENAI_BASE_URL: 'http://127.0.0.1:8081/v1', HARNESS_MODEL_NAME: 'webchat/gemini' };
+    const gates = [{ id: 'gemini', label: 'Gemini', site: 'gemini' }];
+    const f = H.prepareConfigFiles(H.harnessById('opencode'), gates, dir, env, 'yolo');
+    const cfg = JSON.parse(fs.readFileSync(f, 'utf-8'));
+    assert.deepStrictEqual(cfg.permission, H.OPENCODE_PERMISSION.yolo);
+
+    const dir2 = fs.mkdtempSync(path.join(TMP, 'perm2-'));
+    const f2 = H.prepareConfigFiles(H.harnessById('opencode'), gates, dir2, env, 'manual');
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f2, 'utf-8')).permission, H.OPENCODE_PERMISSION.manual);
+});
+
+test('a permission mode maps to flags the tool documents', () => {
+    // Each of these was read out of the tool's own --help, not guessed.
+    const claude = H.harnessById('claude');
+    assert.ok(H.argvFor(claude, 'auto').includes('acceptEdits'), 'claude --permission-mode choices include acceptEdits');
+    const codex = H.harnessById('codex');
+    assert.deepStrictEqual(H.argvFor(codex, 'auto').slice(0, 2), ['--sandbox', 'workspace-write'],
+        'codex -s choices are read-only | workspace-write | danger-full-access');
+});

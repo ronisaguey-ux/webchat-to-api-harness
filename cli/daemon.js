@@ -39,6 +39,28 @@ function ensureStateDir() {
 }
 const pidFile = (name) => path.join(stateDir(), `${name}.pid`);
 const logFile = (name) => path.join(stateDir(), `${name}.log`);
+
+// ── Per-gate gateways ───────────────────────────────────────────────────────
+//
+// One gateway serves one browser. With several webchats connected at once there has
+// to be one gateway PER gate, on that gate's port — otherwise every model would send
+// through whichever browser the single gateway attached to.
+//
+// The primary gate keeps the historic unsuffixed names ('gateway.pid', 'gateway.log')
+// so an already-running gateway is still found, not duplicated onto its own port.
+//
+// Read lazily from PORT rather than hardcoded: server.js binds the CONFIGURED port,
+// so a box whose config says 8080 would otherwise look for 'gateway-8080' and miss
+// the instance it already has.
+const DEFAULT_GATEWAY_PORT = 8081;
+function defaultGatewayPort() {
+    const fromEnv = Number(process.env.PORT || 0);
+    return fromEnv > 0 ? fromEnv : DEFAULT_GATEWAY_PORT;
+}
+function gatewayKey(port) {
+    const p = Number(port) || defaultGatewayPort();
+    return p === defaultGatewayPort() ? 'gateway' : `gateway-${p}`;
+}
 const profileDir = () => process.env.CHROME_PROFILE || path.join(stateDir(), 'chrome-profile');
 
 // ── pidfiles ───────────────────────────────────────────────────────────────
@@ -121,20 +143,31 @@ async function probeGateway(host, port) {
 }
 
 // ── the gateway (server.js) ────────────────────────────────────────────────
-function gatewayRunning() {
-    const pid = readPid('gateway');
-    if (!isAlive(pid)) { if (pid) clearPid('gateway'); return null; }
+function gatewayRunning(port) {
+    const key = gatewayKey(port);
+    const pid = readPid(key);
+    if (!isAlive(pid)) { if (pid) clearPid(key); return null; }
     return pid;
 }
 
+/**
+ * Start a gateway for one gate.
+ *
+ * `port` is the port it must bind, `cdpPort` is the browser it must attach to, and
+ * both are passed as environment rather than written to the config file: the config
+ * is shared by every gate, so writing them would make the gates fight over one file
+ * and the last writer would silently win for everybody.
+ */
 function startGateway(opts = {}) {
-    const existing = gatewayRunning();
+    const port = Number(opts.port) || defaultGatewayPort();
+    const key = gatewayKey(port);
+    const existing = gatewayRunning(port);
     if (existing) return { started: false, pid: existing, reason: 'already running' };
 
     ensureStateDir();
-    const out = fs.openSync(logFile('gateway'), 'a');
-    fs.writeSync(out, `\n─── gateway start ${new Date().toISOString()} ───\n`);
-    const err = fs.openSync(logFile('gateway.err'), 'a');
+    const out = fs.openSync(logFile(key), 'a');
+    fs.writeSync(out, `\n─── gateway start ${new Date().toISOString()} (port ${port}) ───\n`);
+    const err = fs.openSync(logFile(`${key}.err`), 'a');
 
     const child = spawn(process.execPath, ['server.js'], {
         cwd: REPO,
@@ -142,13 +175,47 @@ function startGateway(opts = {}) {
         stdio: ['ignore', out, err],
         // The config CLI is not the harness, so pass the environment through
         // unchanged: server.js loads .env itself and must see the same config.
-        env: { ...process.env, ...(opts.env || {}) },
+        env: {
+            ...process.env,
+            ...(opts.env || {}),
+            PORT: String(port),
+            ...(opts.cdpPort ? { CDP_PORT: String(opts.cdpPort) } : {}),
+        },
     });
     child.unref();
-    writePid('gateway', child.pid);
+    writePid(key, child.pid);
     fs.closeSync(out);
     fs.closeSync(err);
-    return { started: true, pid: child.pid };
+    return { started: true, pid: child.pid, port };
+}
+
+/** Stop the gateway for one port, and only that one. */
+function stopGateway(port) {
+    const key = gatewayKey(port);
+    const pid = gatewayRunning(port);
+    if (!pid) return { stopped: false, reason: 'not running' };
+    try {
+        process.kill(pid, 'SIGTERM');
+    } catch (e) {
+        return { stopped: false, reason: e.message };
+    }
+    clearPid(key);
+    return { stopped: true, pid };
+}
+
+/** Every gateway this box knows about, running or not. */
+function listGateways() {
+    const out = [];
+    let files = [];
+    try { files = fs.readdirSync(stateDir()); } catch { return out; }
+    for (const f of files) {
+        const m = /^gateway(-(\d+))?\.pid$/.exec(f);
+        if (!m) continue;
+        const port = m[2] ? Number(m[2]) : defaultGatewayPort();
+        const pid = readPid(gatewayKey(port));
+        out.push({ port, pid, alive: !!isAlive(pid) });
+    }
+    return out.sort((a, b) => a.port - b.port);
 }
 
 function stopProcess(name, { graceMs = 4000 } = {}) {
@@ -384,7 +451,7 @@ module.exports = {
     pidFile, logFile,
     readPid, isAlive, writePid, clearPid,
     httpGet, httpPost, probeGateway,
-    gatewayRunning, startGateway, stopProcess,
+    gatewayRunning, startGateway, stopGateway, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     tailLines,
     copyToClipboard, restoreForExec,
