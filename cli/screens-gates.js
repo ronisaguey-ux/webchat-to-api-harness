@@ -22,6 +22,7 @@ function build(ctx) {
     // The list of webchats. This replaces the old single "connection": a user can hold
     // several, see which browser is actually running, and mark each connected.
     async function screenGates() {
+        let menuStart = 0;
         for (;;) {
             const { gates, active } = G.read();
 
@@ -51,30 +52,57 @@ function build(ctx) {
             A.newline();
             A.line(A.gray(`  Add a webchat offers every site: ${siteNames}, Generic.`));
 
-            const items = [{ label: 'Add a webchat', hint: 'pick a site (or Generic for any site)', value: 'add' }];
-            for (const g of gates) {
+            // Connected webchats are a checkbox list: they are what the agent may use.
+            // A connected webchat is FINISHED — offering "Reconnect" on it made the
+            // screen read as a to-do list and dead-ended on a Back button.
+            const launch = LC.read();
+            const picked = new Set(launch.gates || []);
+            const ready = gates.filter((g) => g.connected);
+            const needsConnect = gates.filter((g) => !g.connected);
+
+            const items = ready.map((g) => ({
+                label: `${picked.has(g.id) ? '[x]' : '[ ]'} ${g.label}`,
+                hint: `connected · gateway :${g.gatewayPort || '—'}`,
+                value: `pick:${g.id}`,
+            }));
+            for (const g of needsConnect) {
                 items.push({
-                    label: `${g.connected ? 'Reconnect' : 'Connect'} ${g.label}`,
-                    hint: g.connected ? 're-verify the tab and re-save' : 'launch, log in, then confirm',
+                    label: `Connect ${g.label}`,
+                    hint: 'opens the browser so you can log in',
                     value: `conn:${g.id}`,
                 });
             }
+            items.push({
+                label: 'Add a webchat',
+                hint: 'pick a site (or Generic for any site), then log in',
+                value: 'add',
+            });
             if (gates.length) {
-                items.push({
-                    label: 'Choose which one to use',
-                    hint: `currently: ${active || 'none'}`,
-                    value: 'active',
-                });
                 items.push({ label: 'Remove a webchat', hint: 'forgets it here; the Chrome profile is left alone', value: 'remove' });
             }
             items.push({ label: 'Back', value: 'back' });
 
-            const choice = await A.menu(items, { title: 'Webchats' });
+            const total = ready.length + needsConnect.length;
+            const choice = await A.menu(items, {
+                title: 'Webchats',
+                startIndex: menuStart,
+                footer: ready.length
+                    ? ['Enter picks the webchats your agent may use — pick more than one if you like.']
+                    : ['Connect a webchat first: press Enter on it, log in, then confirm.'],
+            });
             if (choice === A.BACK || choice === 'back') return;
-            if (choice === 'add') await screenAddGate();
-            else if (choice === 'active') await screenPickActive();
-            else if (choice === 'remove') await screenRemoveGate();
-            else if (String(choice).startsWith('conn:')) await screenConnectGate(String(choice).slice(5));
+            if (choice === 'add') { await screenAddGate(); continue; }
+            if (choice === 'remove') { await screenRemoveGate(); continue; }
+            if (String(choice).startsWith('conn:')) { await screenConnectGate(String(choice).slice(5)); continue; }
+            if (String(choice).startsWith('pick:')) {
+                const id = String(choice).slice(5);
+                if (picked.has(id)) picked.delete(id); else picked.add(id);
+                LC.write({ gates: [...picked] });
+                // Keep the cursor on the row just toggled instead of snapping to the top.
+                menuStart = items.findIndex((i) => i.value === `pick:${id}`);
+                if (menuStart < 0) menuStart = 0;
+                continue;
+            }
         }
     }
 
@@ -280,36 +308,36 @@ function build(ctx) {
         for (const l of A.boxLines('Agentic harness', body)) A.line(l);
         A.newline();
 
+        // ONE harness (radio, not checkbox): an agentic harness takes over the
+        // terminal, so running two at once is not a thing you can do.
         const items = H.HARNESSES.map((h) => {
             const has = H.installed(h);
             return {
-                label: `${chosen.has(h.id) ? '[x]' : '[ ]'} ${h.label}`,
+                label: `${chosen.has(h.id) ? '(●)' : '( )'} ${h.label}`,
                 hint: has ? h.note : `${h.bin} is not installed`,
                 value: h.id,
-                disabled: false,
             };
         });
-        items.push({ label: 'Done', hint: chosen.size ? `${chosen.size} selected` : 'nothing selected', value: 'done' });
+        items.push({ label: 'Back', value: 'back' });
 
         const pick = await A.menu(items, {
             title: 'Agentic harness',
-            footer: ['Enter toggles a harness on or off. Esc when you are done.'],
+            footer: ['Enter picks the agent to run — one at a time.'],
             startIndex,
         });
-        if (pick === A.BACK) return;
-        if (pick === 'done') {
-            LC.write({ harnesses: [...chosen] });
-            return;
+        if (pick === A.BACK || pick === 'back') return;
+        if (!H.installed(H.harnessById(pick))) {
+            await panel('Not installed', [
+                `${A.bold(H.harnessById(pick).label)} is not installed.`,
+                '',
+                A.dim(`Install ${H.harnessById(pick).bin} first, then pick it here.`),
+            ], 'Back');
+            return screenHarnesses(items.findIndex((i) => i.value === pick));
         }
-        if (chosen.has(pick)) chosen.delete(pick);
-        else chosen.add(pick);
-        // Persist NOW, not on 'done'. The next call rebuilds `chosen` from this file, so
-        // a toggle held only in memory was discarded the moment the list redrew — which
-        // is exactly why Enter appeared to do nothing.
-        LC.write({ harnesses: [...chosen] });
-        // Re-open the list with the cursor still on the row just toggled.
-        const at = items.findIndex((i) => i.value === pick);
-        return screenHarnesses(at >= 0 ? at : startIndex);
+        // Replace, never accumulate — and persist immediately, because the re-entrant
+        // call rebuilds the choice from this file.
+        LC.write({ harnesses: [pick] });
+        return screenHarnesses(items.findIndex((i) => i.value === pick));
     }
 
     async function screenMode() {
