@@ -216,10 +216,32 @@ const OPENCODE_PERMISSION = {
 function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
     if (h.id !== 'opencode') return null;
     const file = path.join(cwd, 'opencode.json');
+
+    // Do NOT clobber a config we did not write. opencode merges a config it finds in
+    // the working directory with the user's global one, so overwriting someone's
+    // opencode.json would silently change how THEIR agent behaves — and we only ever
+    // want to add a provider and a permission block. The marker is how the second run
+    // recognises its own file; without it we refuse and say so.
+    if (fs.existsSync(file)) {
+        let existing = null;
+        try { existing = JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { existing = null; }
+        if (!existing || existing._webchatHarness !== true) {
+            const err = new Error(
+                `${file} already exists and was not written by the webchat CLI — refusing to overwrite it. ` +
+                `Move it aside, or launch from a different directory.`,
+            );
+            err.code = 'REFUSE_OVERWRITE';
+            throw err;
+        }
+    }
+
     const models = {};
     for (const g of gates) models[modelIdFor(g)] = { name: `${g.label} (${g.site})` };
     const cfg = {
         $schema: 'https://opencode.ai/config.json',
+        // Marks the file as ours. opencode ignores unknown keys, so this is a comment
+        // that only the CLI reading it back can see.
+        _webchatHarness: true,
         provider: {
             webchat: {
                 npm: '@ai-sdk/openai-compatible',

@@ -266,3 +266,29 @@ test('a permission mode maps to flags the tool documents', () => {
     assert.deepStrictEqual(H.argvFor(codex, 'auto').slice(0, 2), ['--sandbox', 'workspace-write'],
         'codex -s choices are read-only | workspace-write | danger-full-access');
 });
+
+test('the generated config is marked as ours, and a stranger\'s is never overwritten', () => {
+    const dir = fs.mkdtempSync(path.join(TMP, 'guard-'));
+    const env = { OPENAI_BASE_URL: 'http://127.0.0.1:8081/v1', HARNESS_MODEL_NAME: 'webchat/gemini' };
+    const gates = [{ id: 'gemini', label: 'Gemini', site: 'gemini' }];
+
+    // First run writes, and marks the file.
+    const f = H.prepareConfigFiles(H.harnessById('opencode'), gates, dir, env, 'manual');
+    assert.strictEqual(JSON.parse(fs.readFileSync(f, 'utf-8'))._webchatHarness, true);
+
+    // Second run over its OWN file is fine — that is the normal repeat.
+    assert.doesNotThrow(() => H.prepareConfigFiles(H.harnessById('opencode'), gates, dir, env, 'auto'));
+
+    // A hand-written opencode.json in the launch directory must NOT be flattened.
+    // opencode merges a directory config with the user's global one, so clobbering it
+    // would silently change how their own agent behaves.
+    const other = fs.mkdtempSync(path.join(TMP, 'stranger-'));
+    const precious = path.join(other, 'opencode.json');
+    fs.writeFileSync(precious, JSON.stringify({ model: 'deepseek/deepseek-flash', plugin: ['x.js'] }, null, 2));
+    assert.throws(
+        () => H.prepareConfigFiles(H.harnessById('opencode'), gates, other, env, 'manual'),
+        (e) => e.code === 'REFUSE_OVERWRITE',
+    );
+    assert.strictEqual(JSON.parse(fs.readFileSync(precious, 'utf-8')).model, 'deepseek/deepseek-flash',
+        'the existing file must be untouched');
+});

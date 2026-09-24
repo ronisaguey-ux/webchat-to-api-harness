@@ -1420,7 +1420,12 @@ async function cmdConnect(argv) {
         }
         if (!dryRun) {
             try { H.prepareConfigFiles(h, chosen, cwd, env, cfg.mode); } catch (e) {
-                A.line(`  ${A.red('✗')} ${h.label}  could not write its config: ${e.message}`);
+                // Refusing to overwrite a stranger's config is a user decision, not a
+                // crash — say which file and let them choose.
+                A.line(`  ${A.red('✗')} ${h.label}  ${e.message}`);
+                if (e.code === 'REFUSE_OVERWRITE') {
+                    A.line(`      ${A.dim('Or set a different launch directory in')} ${A.bold('Launch')}${A.dim('.')}`);
+                }
                 return 1;
             }
         }
