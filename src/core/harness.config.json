@@ -1,6 +1,6 @@
 {
   "_README": [
-    "MASTER CONFIG — one place to turn every harness feature on or off and to",
+    "MASTER CONFIG \u2014 one place to turn every harness feature on or off and to",
     "pick the webchat it is talking to.",
     "",
     "Precedence, highest first:",
@@ -22,7 +22,7 @@
     "a dedicated mode.",
     "",
     "Features marked EXPERIMENTAL are off by default and have not been proven in",
-    "daily use — read the README section before enabling one.",
+    "daily use \u2014 read the README section before enabling one.",
     "",
     "limits.maxToolRounds = the hard cap on tool-execution rounds per request.",
     "limits.wrapUpRounds  = how many rounds before that cap the harness stops the model and demands its final answer (default 3).",
@@ -91,7 +91,7 @@
   },
   "webchatModes": {
     "generic": {
-      "_comment": "No assumptions. Use this if your webchat is not listed — if it does not work, open an issue and it gets its own mode.",
+      "_comment": "No assumptions. Use this if your webchat is not listed \u2014 if it does not work, open an issue and it gets its own mode.",
       "url": "",
       "tabUrlSubstring": "",
       "selectors": {
@@ -222,9 +222,9 @@
       "quirks": {
         "verified": "2026-09-24",
         "login": "signed in on CDP :9231 (headed, DISPLAY=:2); title reads 'New chat - Claude'",
-        "composer": "div.tiptap.ProseMirror — a ProseMirror contenteditable, so the CDP Ctrl+A clear works (same class as Kimi's editor)",
+        "composer": "div.tiptap.ProseMirror \u2014 a ProseMirror contenteditable, so the CDP Ctrl+A clear works (same class as Kimi's editor)",
         "send": "button[aria-label='Send message']; starts disabled and enables once the composer holds text, so a click must be retried after typing",
-        "UNVERIFIED": "the answer node was NOT observed — a fresh chat has no assistant turn in the DOM yet, so all three message selectors returned 0. Confirm on a real send before trusting this mode.",
+        "UNVERIFIED": "the answer node was NOT observed \u2014 a fresh chat has no assistant turn in the DOM yet, so all three message selectors returned 0. Confirm on a real send before trusting this mode.",
         "cloudflare": "the unauthenticated page returns 'Just a moment...' with a Ray ID; a signed-in persistent profile is required"
       }
     }
@@ -252,7 +252,7 @@
     "tailItems": 2
   },
   "memory": {
-    "_comment": "Persistent memory file (features.memory). Bounded — it rides into every request's system prompt. File path: paths.memoryFile (env MEMORY_FILE).",
+    "_comment": "Persistent memory file (features.memory). Bounded \u2014 it rides into every request's system prompt. File path: paths.memoryFile (env MEMORY_FILE).",
     "maxChars": 20000
   },
   "mcp": {
@@ -284,7 +284,8 @@
     "blockedUrlsExtra": [],
     "sandboxRoots": [
       "/home/roni/Roni_workspace/oculus",
-      "/home/roni/Roni_workspace/audits_plans"
+      "/home/roni/Roni_workspace/audits_plans",
+      "/tmp/opencode"
     ]
   },
   "tools": {
