@@ -15,73 +15,45 @@
 // Five lines each, one expression, arm moving through a wave. Widths are padded to the
 // widest line so the block sits still while the arm moves.
 
+// A body with a chosen arm position. Building every pose from ONE body is what keeps
+// them interchangeable: arms change, nothing else moves, so the animation reads as a
+// wave rather than as the character jumping about.
+const body = (arm) => [
+    '      .-------.  ',
+    '     /  ^   ^  \\ ',
+    '    |    ___    |',
+    '     \\  \\___/  / ',
+    "      '-------'  ",
+    arm,
+    '        | |      ',
+    '       /   \\     ',
+    '      /     \\    ',
+];
+
+// The arm rises through these, so cycling them is a wave.
 const WAVE = [
-    [
-        '  .---.   ',
-        ' ( ^_^ )  ',
-        '  /| |    ',
-        '  /   \\   ',
-        '          ',
-    ],
-    [
-        '  .---.   ',
-        ' ( ^_^ )/ ',
-        '  /| |    ',
-        '  /   \\   ',
-        '          ',
-    ],
-    [
-        '  .---.\\_ ',
-        ' ( ^_^ )  ',
-        '  /| |    ',
-        '  /   \\   ',
-        '          ',
-    ],
-    [
-        '  .---.   ',
-        ' ( ^_^ )/ ',
-        '  /| |    ',
-        '  /   \\   ',
-        '          ',
-    ],
+    body('       /| |\\     '),   // down
+    body('       /| | \\    '),
+    body('       /| |  \\   '),
+    body('       /| |   \\  '),   // up
+    body('       /| |  \\   '),
+    body('       /| | \\    '),
 ];
 
-// Arm down, both feet planted: the resting pose, and the one to use when there is a
-// speech bubble beside him.
-const IDLE = [
-    '  .---.   ',
-    ' ( ^_^ )  ',
-    '  /| |\\   ',
-    '  /   \\   ',
-    '          ',
-];
-
-// Points to the right, for "click that one".
-const POINT = [
-    '  .---.   ',
-    ' ( ^_^ )->',
-    '  /| |    ',
-    '  /   \\   ',
-    '          ',
-];
-
-// Thoughtful, for a screen that needs explaining.
+const IDLE = body('       /| |\\     ');
+const POINT = body('       /| |----> ');
 const THINK = [
-    '  .---.   ',
-    ' ( o_o )  ',
-    '  /| |\\   ',
-    '  /   \\   ',
-    '          ',
+    '      .-------.  ',
+    '     /  o   o  \\ ',
+    '    |     _     |',
+    '     \\   ---   / ',
+    "      '-------'  ",
+    '     ? /| |\\     ',
+    '        | |      ',
+    '       /   \\     ',
+    '      /     \\    ',
 ];
-
-// Cheering, for the end of the tour.
-const CHEER = [
-    '  .---.   ',
-    ' ( ^o^ )  ',
-    ' \\/| |\\/  ',
-    '  /   \\   ',
-    '          ',
-];
+const CHEER = body('      \\| |/      ');
 
 const POSES = { idle: IDLE, wave: WAVE, point: POINT, think: THINK, cheer: CHEER };
 

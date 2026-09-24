@@ -1681,182 +1681,310 @@ module.exports = {
 // ── Interactive entry point ────────────────────────────────────────────────
 // ── The greeting ────────────────────────────────────────────────────────────
 //
-// Shown the first time the CLI is opened, and reachable later from the main menu. The
-// character waves, says hello, and offers to show the user around before dropping them
-// into the menu - a control panel with this many screens is worth ten seconds of
-// orientation, and the ten seconds are the difference between "I do not know what to
-// click" and using it.
+// Shown the first time the CLI is opened, and reachable later from the main menu.
+//
+// The character and the text go through the menu's `above` hook, NOT drawn before the
+// menu is called. menu() clears the screen on every redraw, so anything drawn first is
+// wiped before it can be read - which is exactly why the greeting used to vanish and
+// leave only the menu on screen. `above` is re-rendered every pass, so he STAYS, and
+// because it can be a function he keeps waving while the menu waits.
 async function screenWelcome() {
-    A.clear();
-    A.line('');
-
-    // The wave, drawn in place. Blocking here is deliberate: this is before anything else
-    // has happened, and a greeting that races the text under it looks broken.
     const SK = require('./stickman.js');
-    const anim = SK.makeAnimator(A, (tick) => SK.frameFor('wave', tick), { lines: 5 });
-    const waves = 8;
-    for (let i = 0; i < waves; i++) {
-        anim.step(i);
-        await new Promise((r) => setTimeout(r, 170));
-    }
-    anim.done();
-    A.newline();
-
+    // PARAGRAPHS, not pre-broken lines. Wrapping already-broken text individually leaves
+    // ragged half-lines, because each one is wrapped on its own as if it started fresh.
     const intro = [
         'Hello, and welcome to the webchat-to-api harness.',
         '',
-        'This CLI is the control center for the harness. It sets up and controls',
-        'everything, and it is meant to be the only thing you have to drive.',
+        'This CLI is the control center for the harness. It sets up everything, controls '
+            + 'everything, and is meant to be the only thing you have to drive.',
         '',
-        'It works by putting a real webchat - Claude, ChatGPT, Gemini, DeepSeek,',
-        'Kimi and others - behind an ordinary model API. You sign in to the',
-        'webchat by hand once; from then on any agentic CLI (Claude Code,',
-        'opencode, Codex) can use that account as if it were a model endpoint.',
+        'It works by putting a real webchat behind an ordinary model API. Claude, ChatGPT, '
+            + 'Gemini, DeepSeek, Kimi and others each run in a real browser window you sign '
+            + 'in to by hand, once. After that any agentic CLI - Claude Code, opencode, '
+            + 'Codex - uses that account as if it were a model endpoint: no API key, no '
+            + 'per-token bill, and the browser stays yours.',
         '',
-        'No API key, no per-token bill, and the browser stays yours.',
+        'Everything here is a setting, and none of it is permanent.',
     ];
-    for (const l of intro) A.line(l);
-    A.newline();
+
+    let tick = 0;
+    const draw = () => {
+        // He waves for the first few seconds, then settles into a friendly idle so the
+        // screen is not permanently fidgeting while the user reads.
+        const pose = tick < 24 ? 'wave' : 'idle';
+        const art = SK.frameFor(pose, tick);
+        // Wrapped to a fixed column so the character never gets pushed sideways by a
+        // long line - the block has to keep the same width on every row.
+        const COL = 66;
+        const text = [];
+        intro.forEach((para, i) => {
+            const wrapped = A.wrapText(para, COL);
+            for (const w of wrapped) text.push(i === 0 && w === wrapped[0] ? A.bold(w) : w);
+        });
+        const rows = [];
+        for (let i = 0; i < Math.max(art.length, text.length); i++) {
+            const a = (art[i] || '').padEnd(19);
+            const s = text[i] || '';
+            rows.push(s ? `${A.padVisible('  ' + s, COL + 5)}${a}`.replace(/\s+$/, '') : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));
+        }
+        return A.centerBlock(rows, { reserve: 10 });
+    };
 
     const pick = await A.menu([
-        { label: 'Show me around', hint: 'a short guided tour - start here', value: 'tutorial' },
+        { label: 'Basic tour', hint: 'the least you need to get it working', value: 'basic' },
+        { label: 'Full tour', hint: 'every screen, and how the whole thing works', value: 'full' },
         { label: 'I know what I am doing', hint: 'straight to the menu', value: 'skip' },
-    ], { title: 'Want the tour?', footer: ['You can open it again from the main menu at any time.'] });
+    ], {
+        title: 'Welcome',
+        above: draw,
+        tickMs: 170,
+        onTick: () => { tick++; return []; },
+        footer: ['The tour is always available again from the main menu.'],
+    });
 
-    if (pick === 'tutorial') { await screenTutorial(); return true; }
+    if (pick === 'basic' || pick === 'full') { await screenTutorial(pick); return true; }
     return pick !== A.BACK;
 }
 
 // ── Tutorial mode ───────────────────────────────────────────────────────────
 //
-// One card per thing worth knowing, each with the character beside it, and - where there
-// is a screen to look at - a "Take me there" that opens the real screen rather than
-// describing it. Teaching by description is how a manual gets ignored; the point of
-// having the CLI open is that it can show you the actual thing.
+// Two lengths, because they are two different jobs:
 //
-// Every step writes nothing. The tour is the one place a user is encouraged to poke at
-// settings, so it must not be the place that changes them.
-async function screenTutorial() {
+//   basic - the least it takes to get a working setup. Add a webchat, sign in, pick a
+//           harness, launch. Nothing else, so the shortest path to a result is short.
+//   full  - every screen, what each setting actually does, and how the pieces fit
+//           together underneath, for someone who wants to understand it rather than
+//           just use it.
+//
+// Where there is a real screen, "Take me there" opens the actual screen instead of
+// describing it. Describing a control panel is how a manual gets ignored; the point of
+// having the CLI open is that it can show you the thing itself.
+//
+// The tour writes nothing. It is the one place the user is invited to poke at settings,
+// so it must be the place that quietly changes none.
+async function screenTutorial(mode = 'basic') {
     const SK = require('./stickman.js');
-    const steps = [
+
+    const BASIC = [
         {
             pose: 'wave',
-            title: 'The idea',
+            title: 'What this is',
             lines: [
-                'Every webchat here is a real browser tab, signed in as you.',
-                'The harness turns it into an API, so your agent talks to the',
-                'tab instead of to a paid endpoint.',
-                '',
-                'That is the whole trick. No key, no bill, no quota to buy.',
+                'A webchat running in a real browser window, turned into an API.',
+                'Your agent talks to that window instead of to a paid endpoint,',
+                'so it uses the account you already have.',
             ],
         },
         {
             pose: 'point',
-            title: 'Webchats',
+            title: '1. Add a webchat',
             lines: [
-                'Start here. Each webchat you add gets its own browser and its',
-                'own port, picked for it so nothing clashes with anything else',
-                'on your machine.',
+                'Webchats is where you add one. Pick a site, and a browser window',
+                'opens for you to sign in to. Do that by hand, once.',
                 '',
-                'Add one, sign in in the window that opens, and it is ready.',
+                'Each webchat gets its own browser and its own port, chosen',
+                'automatically so nothing on your machine clashes.',
             ],
             goto: 'webchats',
+            press: 'Click Webchats. Press Enter on Add a webchat, pick a site, sign in in the window that opens.',
         },
         {
             pose: 'idle',
-            title: 'One url for all of them',
+            title: '2. Pick your agent',
             lines: [
-                'When you have more than one webchat, the harness puts a hub in',
-                'front of them. You point your agent at that single url and it',
-                'sees every webchat - and every toggle combination - as its own',
-                'model. Pick a different model and you have switched webchat.',
-            ],
-            goto: 'webchats',
-        },
-        {
-            pose: 'think',
-            title: 'Tools and limits',
-            lines: [
-                'Tools is where you decide what your agent may do. Each tool is',
-                'true or false, and behind each one are LIMITS.',
+                'Harness is which agentic CLI runs against it - Claude Code,',
+                'opencode or Codex. One at a time.',
                 '',
-                'A limit is a hard ban, or an ask-the-user. An ask stops the call',
-                'even in yolo mode - that is the point of it.',
-            ],
-            goto: 'tools',
-        },
-        {
-            pose: 'idle',
-            title: 'Harness and mode',
-            lines: [
-                'Pick which agent runs - Claude Code, opencode, Codex - and how',
-                'much it is allowed to do without asking.',
-                '',
-                'This is a setting, so poke at it. Nothing here is permanent.',
+                'If one is not installed it is shown greyed out with the reason,',
+                'instead of failing later in a confusing way.',
             ],
             goto: 'harnesses',
+            press: 'Press Enter on Agentic harness, then Enter on the one you want. One only.',
         },
         {
             pose: 'point',
-            title: 'Launch',
+            title: '3. Launch',
             lines: [
-                'Launch starts the webchats, wires the harness to the hub, and',
-                'opens your agent in a terminal.',
+                'Launch starts the webchats, connects your agent to them, and',
+                'opens it in a terminal.',
                 '',
-                'If an agent cannot be reached, its name is shown greyed out with',
-                'the reason, instead of failing later in a confusing way.',
+                'That is the whole path. The full tour explains the rest.',
             ],
             goto: 'launch',
-        },
-        {
-            pose: 'idle',
-            title: 'Doctor and Logs',
-            lines: [
-                'If something looks wrong, Doctor checks every moving part and',
-                'says which one is unhappy. Logs shows what the webchats have',
-                'been doing, and can build a bug report.',
-            ],
-            goto: 'doctor',
-        },
-        {
-            pose: 'cheer',
-            title: 'That is everything',
-            lines: [
-                'Go and poke at it - nothing in here is destructive, and any',
-                'setting can be put back.',
-                '',
-                'You can reopen this tour from the main menu whenever you like.',
-            ],
+            press: 'Press Enter on Launch. Read the summary it prints before it starts.',
         },
     ];
 
+    const FULL = BASIC.concat([
+        {
+            pose: 'think',
+            title: 'How the pieces fit',
+            lines: [
+                'A browser per webchat, a gateway per browser, and a hub in front.',
+                '',
+                'The gateway is what speaks the model API. The hub is one url that',
+                'forwards each request to the gateway that owns that webchat, so',
+                'you point your agent at a single address and it sees all of them.',
+            ],
+        },
+        {
+            pose: 'idle',
+            title: 'Models and toggles',
+            lines: [
+                'A webchat has options the API has no word for: DeepSeek has',
+                'DeepThink and Search, ChatGPT has a thinking toggle.',
+                '',
+                'So every combination is published as its own model name. Switch',
+                'model, and the harness flips the right switches for you.',
+            ],
+            goto: 'webchats',
+            press: 'In Webchats, press Enter to open a webchat and look at its model names.',
+        },
+        {
+            pose: 'think',
+            title: 'Tools',
+            lines: [
+                'Tools decides what your agent may actually do: read files, write',
+                'them, run shell commands, search the web.',
+                '',
+                'Each shows true or false. Switching one off removes it from what',
+                'the model is even offered, so it cannot waste a turn trying.',
+            ],
+            goto: 'tools',
+            press: 'In Tools, press Enter on a tool and watch true turn into false.',
+        },
+        {
+            pose: 'point',
+            title: 'Limits - the important part',
+            lines: [
+                'Every tool takes LIMITS. A limit is text matched against that',
+                'tool arguments, and it is enforced one of two ways.',
+                '',
+                'Hard ban: refused outright, and the model is told that rewording',
+                'it is not allowed. Ask: refused until YOU approve, in every mode.',
+                '',
+                'So you can leave shell access on but ban curl, or let files be',
+                'edited but never .env.',
+            ],
+            goto: 'tools',
+            press: 'Pick Tools, then Limits., choose a tool, then Add a limit. Try BAN, then ASK.',
+        },
+        {
+            pose: 'think',
+            title: 'Mode',
+            lines: [
+                'Mode is how much your agent may do without asking.',
+                '',
+                'A limit marked ASK overrides it. That is deliberate: yolo mode',
+                'exists to skip prompts, and an ask limit is the one thing that',
+                'must not be skipped.',
+            ],
+            goto: 'harnesses',
+            press: 'Open Permission mode and read what each one lets through.',
+        },
+        {
+            pose: 'idle',
+            title: 'Config',
+            lines: [
+                'Every setting, grouped, each showing WHERE its value comes from.',
+                '',
+                'An environment variable beats the config file. A setting shown as',
+                'shadowed will ignore anything you type here, which is why the CLI',
+                'says so instead of pretending the edit worked.',
+            ],
+            goto: 'settings',
+            press: 'Open Config and press Enter on any setting to see where its value comes from.',
+        },
+        {
+            pose: 'point',
+            title: 'Doctor and Logs',
+            lines: [
+                'Doctor checks every moving part and names the unhappy one.',
+                '',
+                'Logs shows what the webchats have been doing, and can build a bug',
+                'report for you.',
+            ],
+            goto: 'doctor',
+            press: 'Press Enter on Doctor. Green means that part is happy.',
+        },
+        {
+            pose: 'idle',
+            title: 'Platform and MCP',
+            lines: [
+                'Platform says which system your AGENT is on, not this machine. It',
+                'decides the shell, how paths are written, and what is refused.',
+                '',
+                'Agent access (MCP) exposes all of this over MCP, so an agent can',
+                'drive the harness itself - add a webchat, read a log, change a',
+                'setting - instead of you clicking.',
+            ],
+            goto: 'agentaccess',
+            press: 'Open Agent access (MCP) to see how an agent drives this harness itself.',
+        },
+    ]);
+
+    const steps = mode === 'full' ? FULL : BASIC;
+
+    // EVERY write the tour provokes is mocked while it runs. The user is sent into the
+    // real screens and told to press real buttons - that is how you teach a control panel
+    // - but being shown around must not leave a trail of changed settings behind, and
+    // someone who is only exploring should never have to undo anything.
+    //
+    // The restore is in a finally so it survives every way out: finishing the tour, the
+    // Exit button, Esc, or an error thrown by a screen. A demo flag left on would mean
+    // the CLI silently stopped saving, which is far worse than the tour not running.
+    const demoWas = S.setDemoMode(true);
+    try {
     for (let i = 0; i < steps.length; i++) {
         const s = steps[i];
-        A.clear();
-        A.line('');
-        for (const l of SK.beside(s.lines, s.pose, i)) A.line(l);
-        A.newline();
+        const art = SK.frameFor(s.pose, i);
+        const COL = 60;
+        // A card is written as readable lines, but those breaks are the AUTHOR's, not the
+        // screen's: wrapping them individually leaves a stranded word ("reason,") whenever
+        // a hand-written line runs a little past the column. Merging consecutive lines
+        // into paragraphs first lets the wrapper place every break itself.
+        const paras = [];
+        for (const line of s.lines) {
+            const last = paras.length - 1;
+            if (!line.trim()) { paras.push(''); continue; }
+            if (last >= 0 && paras[last] && !/\n$/.test(paras[last])) paras[last] += ` ${line.trim()}`;
+            else paras.push(line.trim());
+        }
+        const text = [];
+        for (const para of paras) for (const w of A.wrapText(para, COL)) text.push(w);
+        const rows = [];
+        for (let r = 0; r < Math.max(art.length, text.length); r++) {
+            const a = (art[r] || '').padEnd(19);
+            const line = text[r] || '';
+            rows.push(line ? `${A.padVisible('  ' + line, COL + 5)}${a}`.replace(/\s+$/, '') : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));
+        }
 
         const items = [];
         if (s.goto) items.push({ label: 'Take me there', hint: `open ${s.title}`, value: 'go' });
         items.push({ label: i + 1 < steps.length ? 'Next' : 'Finish', hint: `${i + 1} of ${steps.length}`, value: 'next' });
-        items.push({ label: 'Exit the tour', hint: 'back to the menu', value: 'exit' });
+        // Always last and always present, so leaving is never a hunt. Esc does the same
+        // thing, and both are named on screen rather than left to be discovered.
+        items.push({ label: 'Exit the tour', hint: 'leave now — Esc does the same', value: 'exit' });
 
         const pick = await A.menu(items, {
             title: `${s.title}   (${i + 1}/${steps.length})`,
-            footer: ['Nothing in this tour changes a setting. Poke freely.'],
+            above: () => A.centerBlock(rows.concat(s.press ? ['', A.cyan(`  ▸ ${s.press}`)] : []), { reserve: 11 }),
+            footer: [
+                A.cyan('Tour mode: nothing is saved.') + A.dim(' Change anything you like.'),
+                A.dim('Exit the tour at any time with this button or by pressing Esc.'),
+            ],
         });
 
         if (pick === A.BACK || pick === 'exit') return false;
         if (pick === 'go') {
-            // The real screen, not a description of it. Whatever the user does there is
-            // their own doing and is saved normally; the tour just takes them to it.
             try {
                 if (s.goto === 'webchats') await gatesScreens().screenGates();
                 else if (s.goto === 'tools') await gatesScreens().screenTools();
                 else if (s.goto === 'harnesses') await gatesScreens().screenHarnesses();
                 else if (s.goto === 'launch') await screenStart();
                 else if (s.goto === 'doctor') await screenDoctor();
+                else if (s.goto === 'settings') await screenSettings();
+                else if (s.goto === 'agentaccess') await screenAgentAccess();
             } catch (e) {
                 if (e instanceof A.QuitError) throw e;
                 await A.message('That screen could not open', [String(e.message || e)]);
@@ -1864,6 +1992,10 @@ async function screenTutorial() {
         }
     }
     return true;
+    } finally {
+        // Put the writer back exactly as it was, whatever happened above.
+        S.setDemoMode(demoWas);
+    }
 }
 
 // ── Which system is the agent on? ───────────────────────────────────────────
