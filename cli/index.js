@@ -1500,7 +1500,7 @@ async function cmdConnect(argv) {
 
     const chosen = cfg.gates.map((id) => allGates.find((g) => g.id === id)).filter(Boolean);
     const primary = chosen[0];
-    const cwd = cfg.cwd && fs.existsSync(cfg.cwd) ? cfg.cwd : process.cwd();
+    const cwd = cfg.cwd && fs.existsSync(cfg.cwd) ? cfg.cwd : LC.ensureAgentDir();
     const env = H.envFor(chosen);
 
     A.line('');
@@ -1586,7 +1586,7 @@ async function cmdConnect(argv) {
                 return 1;
             }
         }
-        launches.push({ h, argv: H.argvFor(h, cfg.mode) });
+        launches.push({ h, argv: H.argvFor(h, cfg.mode, cfg.args, env) });
     }
     if (problems.length) {
         for (const p of problems) A.line(`  ${A.red('✗')} ${p}`);

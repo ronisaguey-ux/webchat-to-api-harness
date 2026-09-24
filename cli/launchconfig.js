@@ -14,8 +14,24 @@
 // it by hand and skip the menus entirely.
 //
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const d = require('./daemon.js');
+
+// The directory the agent is launched INTO, and the only place this CLI writes an
+// agent config. It used to default to the user's HOME, which was wrong in two ways:
+// the generated opencode.json landed in ~ where opencode merges it with the user's
+// OWN global config, and the agent then started on a paid provider while the harness
+// sat unused. One private folder per install, created on demand.
+function agentDir() {
+    return path.join(os.homedir(), '.webchat', 'agent');
+}
+
+function ensureAgentDir() {
+    const dir = agentDir();
+    try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { /* exists */ }
+    return dir;
+}
 
 const file = () => path.join(d.stateDir(), 'launch.json');
 
@@ -29,8 +45,9 @@ const DEFAULT = {
     mode: 'auto',
     // Extra argv appended to every harness launch.
     args: [],
-    // Working directory the harness starts in.
-    cwd: process.env.HOME || '/',
+    // Working directory the harness starts in. NOT the user's home: the agent gets its
+    // own folder holding only the config we generate for it.
+    cwd: agentDir(),
     updatedAt: null,
 };
 
@@ -39,7 +56,11 @@ function read() {
     if (!fs.existsSync(f)) return { ...DEFAULT };
     try {
         const parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
-        return { ...DEFAULT, ...parsed };
+        const merged = { ...DEFAULT, ...parsed };
+        // Migrate a saved config that still points at HOME (the old default). Leaving it
+        // would keep writing opencode.json into the user's home directory forever.
+        if (merged.cwd === process.env.HOME) merged.cwd = agentDir();
+        return merged;
     } catch {
         return { ...DEFAULT, error: 'launch.json is not valid JSON — using defaults' };
     }
@@ -49,6 +70,8 @@ function write(cfg) {
     d.ensureStateDir();
     const f = file();
     const next = { ...DEFAULT, ...read(), ...cfg, updatedAt: new Date().toISOString() };
+    if (!next.cwd || next.cwd === process.env.HOME) next.cwd = agentDir();
+    ensureAgentDir();
     const tmp = `${f}.tmp`;
     // Atomic: `webchat connect` may be reading this at the moment the menu writes it.
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
@@ -84,4 +107,4 @@ function summarize(cfg) {
     return parts.join('  ·  ');
 }
 
-module.exports = { read, write, clear, validate, summarize, DEFAULT, file };
+module.exports = { read, write, clear, validate, summarize, DEFAULT, file, agentDir, ensureAgentDir };

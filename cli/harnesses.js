@@ -67,6 +67,13 @@ const HARNESSES = [
         // feature looked implemented and was broken for the default harness.
         // The finer manual/auto distinction lives in the generated opencode.json's
         // `permission` block, which prepareConfigFiles() writes.
+        // The MODEL is pinned on the command line, not only in the config file. opencode
+        // merges ./opencode.json with the user's own global config, and the global one
+        // names a paid provider - so a launch that relied on the config file alone came up
+        // on the paid API while the webchat sat unused. Live: the agent's status bar read
+        // "DeepSeek V4.1 Flash (paid API)" with `model: webchat/deepseek` sitting in the
+        // config right beside it. An explicit -m cannot be out-voted by a merge.
+        modelFlag: (env) => ['-m', env.HARNESS_MODEL_NAME],
         modes: {
             manual: [],
             auto: ['--auto'],
@@ -249,7 +256,12 @@ function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
     }
 
     const models = {};
-    for (const g of gates) models[modelIdFor(g)] = { name: `${g.label} (${g.site})` };
+    for (const g of gates) {
+        // Provider is `webchat`, so the MODEL key must be bare. Writing `webchat/deepseek`
+        // here produced webchat/webchat/deepseek and the launch silently fell back to the
+        // paid API. The harness env keeps the full id; only this key is stripped.
+        models[g.id] = { name: `${g.label} (${g.site})` };
+    }
     const cfg = {
         $schema: 'https://opencode.ai/config.json',
         // Marks the file as ours. opencode ignores unknown keys, so this is a comment
@@ -278,9 +290,12 @@ function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
 }
 
 // The argv for a harness: its own binary, the mode's flags, then the user's extras.
-function argvFor(h, mode, extra = []) {
+function argvFor(h, mode, extra = [], env = {}) {
     const flags = (h.modes && h.modes[mode]) || [];
-    return [...flags, ...extra];
+    // A harness may need to name its model explicitly (see opencode above). Kept here so
+    // every caller - the real launch and the tests - builds the same command line.
+    const pin = typeof h.modelFlag === 'function' ? h.modelFlag(env) : (h.modelFlag || []);
+    return [...pin, ...flags, ...extra];
 }
 
 module.exports = {
