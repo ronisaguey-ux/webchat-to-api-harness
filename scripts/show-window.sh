@@ -38,4 +38,6 @@ case "$ACTION" in
     exit 2 ;;
 esac
 
-exec node "$HERE/window.js" "$ACTION"
+# window.js moved to src/browser/ in the layout refactor; this path still pointed at
+# scripts/window.js, so `webchat window status` died with MODULE_NOT_FOUND.
+exec node "$HERE/../src/browser/window.js" "$ACTION"

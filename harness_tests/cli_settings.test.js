@@ -188,7 +188,10 @@ test('saveRaw writes valid JSON, backs up the previous file, and leaves no temp 
 // ── schema integrity ───────────────────────────────────────────────────────
 
 test('the schema is coherent: unique paths, every group titled, every type known', () => {
-    const TYPES = new Set(['bool', 'number', 'string', 'list', 'enum', 'secret', 'longtext', 'envbool', 'mode', 'choice']);
+      // `permode` is a MAP edited one entry at a time, and `tooltoggle` is membership of
+      // tools.disabled — both are real editors, not a scalar, so they are legitimate
+      // types rather than a mistake in the schema.
+      const TYPES = new Set(['bool', 'number', 'string', 'list', 'enum', 'secret', 'longtext', 'envbool', 'mode', 'choice', 'permode', 'tooltoggle']);
     const seen = new Set();
     for (const g of S.SCHEMA) {
         assert.ok(g.id && g.title && g.blurb, `group ${g.id} needs id/title/blurb`);

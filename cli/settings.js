@@ -29,12 +29,61 @@ const path = require('path');
 // The memory file is file-backed, not config-JSON-backed: its `memory.contents`
 // setting reads/writes the actual file. Load it lazily so a broken memory module
 // cannot take the CLI down.
-const memoryMod = (() => { try { return require('../memory'); } catch { return null; } })();
+const memoryMod = (() => { try { return require('../src/runtime/memory'); } catch { return null; } })();
 
 // ── The schema ─────────────────────────────────────────────────────────────
 // type: bool | number | string | list | enum | secret | longtext
 // risk: shown as a warning banner; these loosen a guardrail.
+// Build one settings entry per tool, read from the live registry.
+//
+// `tools.disabled` stores the names that are OFF, so each entry's writer adds or removes
+// itself from that list. The entries are generated rather than written out because a
+// hand-maintained catalogue is exactly what made the Tools section look empty: the model
+// had seventeen tools and the screen showed one switch.
+function toolSettings(extra) {
+    let defs = [];
+    try {
+        defs = require('../src/tools/tools').getToolDefinitions() || [];
+    } catch (e) {
+        defs = [];
+    }
+    const perTool = defs.map((t) => ({
+        path: `tools.disabled::${t.name}`,
+        label: t.name,
+        type: 'tooltoggle',
+        toolName: t.name,
+        group: 'tools',
+        groupTitle: 'Tools',
+        default: false,          // false = NOT disabled = available
+        help: String(t.description || '').replace(/\s+/g, ' ').trim(),
+    }));
+    return [].concat(extra, perTool);
+}
+
 const SCHEMA = [
+    {
+        // FIRST in the list on purpose: this is the selector that decides what "compatible"
+        // means for everything below it. The shell a command runs in, how a path is spelled,
+        // which command patterns are refused and which roots the sandbox grants are all
+        // derived from it — see src/core/platform.js. It is a top-level key, not a nested
+        // one, so it reads as a property of the harness rather than of a feature.
+        id: 'platform',
+        title: 'Platform',
+        blurb: 'Which operating system this harness targets. Everything platform-shaped — shell, paths, command safety — follows this one choice.',
+        settings: [
+            {
+                path: 'platform',
+                label: 'Target platform',
+                type: 'choice',
+                options: ['linux', 'windows'],
+                env: 'HARNESS_PLATFORM',
+                default: 'linux',
+                help: 'linux: commands run in bash, paths use forward slashes, POSIX command safety rules. '
+                    + 'windows: commands run in cmd.exe, paths use backslashes, Windows command safety rules. '
+                    + 'Set it to the machine your agent will actually run on — not necessarily this one.',
+            },
+        ],
+    },
     {
         id: 'dashboard',
         title: 'Dashboard',
@@ -94,20 +143,19 @@ const SCHEMA = [
     {
         id: 'tools',
         title: 'Tools',
-        blurb: 'Which tools the model is allowed to use. A tool switched off is not even offered to it.',
-        settings: [
-            {
-                path: 'tools.disabled', label: 'Disabled tools', type: 'list',
-                default: [],
-                help: 'Tool names to switch off completely, on top of whatever requirement they already have.',
-            },
+        blurb: 'Every tool the model can call, one toggle each. A tool switched off is not offered to it at all.',
+        // The list is GENERATED from the tool registry (see toolSettings() below), so it
+        // cannot drift from what the harness actually exposes. A hand-written copy of the
+        // catalogue is how this section ended up showing only "run bash" while seventeen
+        // tools were available.
+        settings: toolSettings([
             {
                 path: 'tools.bashAllowed', label: 'Allow run_bash at all', type: 'bool', env: 'BASH_ALLOWED',
-                default: false,
+                default: false, group: 'tools', groupTitle: 'Tools',
                 help: 'The master switch for shell access. With this off, run_bash is unavailable no matter what else is set.',
                 risk: true,
             },
-        ],
+        ]),
     },
     {
         id: 'prompt',
@@ -119,12 +167,15 @@ const SCHEMA = [
                 default: '',
                 help: 'Left blank, the harness uses its built-in prompt. Set it to override for this harness.',
             },
-            {
-                path: 'systemPrompt.perMode', label: 'Per-webchat prompts', type: 'longtext',
-                default: {},
-                help: 'JSON keyed by webchat id, e.g. {"gemini": "...", "deepseek": "..."}. Overrides the prompt above for that webchat.',
-                advanced: true,
-            },
+              {
+                  // A dedicated editor, not a JSON textarea. The old version showed the raw
+                  // object (it rendered as "[object Object]") and gave no way to say WHICH
+                  // webchat you were editing. The screen lists the real webchats, marks the
+                  // ones that already have an override, and edits one at a time.
+                  path: 'systemPrompt.perMode', label: 'Per-webchat prompts', type: 'permode',
+                  default: {},
+                  help: 'Overrides the prompt above for one webchat. Pick the webchat, then write its prompt.',
+              },
         ],
     },
     {
@@ -611,6 +662,14 @@ function coerce(setting, value) {
 // it, and change nothing — on this install WEBCHAT_MODE=gemini sits in .env
 // doing exactly that.
 function resolve(setting, raw, env = process.env, dotenv = {}) {
+    // A per-tool toggle is not its own key: every one of them reads the SAME
+    // `tools.disabled` array and reports whether its own name is in it. Resolved here so
+    // the value shown in the list, the "is it on" question and the writer all agree.
+    if (setting.type === 'tooltoggle') {
+        const list = getPath(raw, 'tools.disabled');
+        const off = Array.isArray(list) ? list : [];
+        return { value: !off.includes(setting.toolName), source: 'file' };
+    }
     // File-backed settings (memory.contents) read the real file, not config JSON.
     if (setting.fileBacked) {
         const file = memoryMod ? memoryMod.memoryFile() : '';
@@ -695,7 +754,9 @@ function listModes(raw) {
 function display(setting, value) {
     if (value === undefined || value === null || value === '') return '(not set)';
     if (setting.type === 'secret') return '••••••••';
-    if (setting.type === 'bool' || setting.type === 'envbool') return value ? 'on' : 'off';
+    if (setting.type === 'bool' || setting.type === 'envbool' || setting.type === 'tooltoggle') {
+        return value ? 'on' : 'off';
+    }
     if (setting.type === 'list') return Array.isArray(value) && value.length ? value.join(', ') : '(none)';
     return String(value);
 }
@@ -706,8 +767,23 @@ function display(setting, value) {
 // Returns what happened rather than assuming success: a value that is SHADOWED by an
 // environment variable is written to the file and still has no effect, and a caller
 // that reports "saved" there is lying to the user. The return says so.
-function saveSetting(dotted, value) {
-    const setting = BY_PATH.get(dotted);
+    function saveSetting(dotted, value) {
+        // A per-tool toggle writes membership of `tools.disabled`, not a key of its own.
+        // `dotted` arrives as `tools.disabled::<name>` and is translated here, so the
+        // caller works in the same id space the list uses and never has to know the
+        // storage shape.
+        if (dotted.startsWith('tools.disabled::')) {
+            const name = dotted.slice('tools.disabled::'.length);
+            const loaded = loadRaw();
+            const next = loaded.raw || {};
+            const cur = getPath(next, 'tools.disabled');
+            const set = new Set(Array.isArray(cur) ? cur : []);
+            if (value) set.delete(name); else set.add(name);
+            setPath(next, 'tools.disabled', [...set]);
+            saveRaw(next, loaded.file);
+            return { ok: true, value: !set.has(name), shadowed: false, shadowedBy: null };
+        }
+        const setting = BY_PATH.get(dotted);
     if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
     // loadRaw returns an ENVELOPE ({ file, raw, missing }) — writing that straight
     // back produces a config containing the envelope instead of the settings, which

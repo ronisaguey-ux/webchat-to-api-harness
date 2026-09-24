@@ -425,7 +425,7 @@ function build(ctx) {
         try {
             // Ask the harness itself which tools exist, so this list cannot drift from
             // the real catalogue the way a hand-written copy would.
-            names = require('../tools').getToolDefinitions().map((t) => t.name);
+            names = require('../src/tools/tools').getToolDefinitions().map((t) => t.name);
         } catch { names = []; }
 
         const items = names.map((n) => ({
