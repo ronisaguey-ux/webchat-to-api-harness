@@ -384,7 +384,7 @@ function build(ctx) {
         else if (choice === 'go') return 'launch';
     }
 
-    async function screenPickGates() {
+    async function screenPickGates(startIndex = 0) {
         const cfg = LC.read();
         const { gates } = G.read();
         const chosen = new Set(cfg.gates || []);
@@ -403,7 +403,10 @@ function build(ctx) {
 
         const pick = await A.menu(items, {
             title: 'Which webchats should this harness use?',
-            footer: ['The first one selected is the primary — it is what the harness opens on.'],
+            footer: [
+                'Enter selects a webchat. The first one selected is the primary.',
+            ],
+            startIndex,
         });
         if (pick === A.BACK) return;
         if (pick === 'done') {
@@ -415,11 +418,12 @@ function build(ctx) {
         }
         if (chosen.has(pick)) chosen.delete(pick);
         else chosen.add(pick);
-        return screenPickGates();
+        const at = items.findIndex((i) => i.value === pick);
+        return screenPickGates(at >= 0 ? at : startIndex);
     }
 
     // ── Tools ────────────────────────────────────────────────────────────────
-    async function screenTools() {
+    async function screenTools(startIndex = 0) {
         const st = ctx.state();
         const rows = ctx.rowsOf(st);
         const row = rows.find((r) => r.setting.path === 'tools.disabled');
@@ -441,7 +445,8 @@ function build(ctx) {
 
         const pick = await A.menu(items, {
             title: 'Tools the model may use',
-            footer: ['A tool switched off is not offered to the model at all.'],
+            footer: ['Enter switches a tool on or off. Esc when you are done.'],
+            startIndex,
         });
         if (pick === A.BACK) return;
         if (pick === 'done') {
@@ -450,7 +455,8 @@ function build(ctx) {
         }
         if (disabled.has(pick)) disabled.delete(pick);
         else disabled.add(pick);
-        return screenTools();
+        const at = items.findIndex((i) => i.value === pick);
+        return screenTools(at >= 0 ? at : startIndex);
     }
 
     return {
