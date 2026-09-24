@@ -1694,16 +1694,27 @@ module.exports = {
 async function screenWelcome() {
     const SK = require('./stickman.js');
 
-    // Roughly fifty words: what this is, what it is for, how it works. Long enough to be
-    // a real explanation, short enough to be read instead of skipped.
+    // Friendly, and detailed enough to answer the three questions someone actually has
+    // in the first ten seconds: what is this, does it work with my setup, and what does
+    // it cost me. Wrapped to a column so the character keeps his place beside it.
     const intro = [
-        'Hello. This is the webchat-to-api harness.',
+        'Hey - welcome to the webchat-to-api harness.',
         '',
-        'It runs a real webchat - Claude, ChatGPT, Gemini, DeepSeek - in a browser you '
-            + 'sign in to once, then serves it as an ordinary model API. Any coding agent '
-            + 'can then use that account as if it were an endpoint.',
+        'It takes any AI webchat you already have - free or paid - Claude, ChatGPT, Gemini, '
+            + 'DeepSeek, Kimi, and others - and turns it into an ordinary model API.',
         '',
-        'No API key, no per-token bill, and the browser stays yours.',
+        'How: it drives a real browser with Puppeteer and sends that webchat a specialised '
+            + 'system prompt, so the tab answers the way an API endpoint would. Sniff the '
+            + 'requests and you would see a normal model API; behind it is your own browser, '
+            + 'signed in as you.',
+        '',
+        'What that means: point any agentic harness at it - Claude Code, opencode, Codex - '
+            + 'or anything else you fancy plugging in, and it runs on the account you already '
+            + 'pay for. No API key, no token meter, no quota to buy.',
+        '',
+        'This CLI is the control centre: add webchats, choose your agent, set what it may '
+            + 'and may not do, then launch. If you would rather not click at all, there is an '
+            + 'MCP mode that lets an agent already running drive all of this for you.',
     ];
 
     let tick = 0;
@@ -1716,9 +1727,12 @@ async function screenWelcome() {
             const wrapped = A.wrapText(para, COL);
             for (const w of wrapped) text.push(i === 0 && w === wrapped[0] ? A.bold(w) : w);
         });
+        // Centre him against the paragraph: pinned to the top he stands beside the first
+        // nine lines and the rest of the greeting runs on without him.
+        const offset = wide ? Math.max(0, Math.floor((text.length - art.length) / 2)) : -1;
         const rows = [];
-        for (let i = 0; i < Math.max(text.length, wide ? art.length : 0); i++) {
-            const a = wide ? (art[i] || '').padEnd(19) : '';
+        for (let i = 0; i < text.length; i++) {
+            const a = wide && i >= offset && i - offset < art.length ? art[i - offset].padEnd(19) : '';
             const s = text[i] || '';
             rows.push(s ? `${A.padVisible('  ' + s, COL + 5)}${a}`.replace(/\s+$/, '')
                         : (a.trim() ? `${' '.repeat(COL + 5)}${a}`.replace(/\s+$/, '') : ''));

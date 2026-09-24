@@ -130,7 +130,27 @@ async function waveFor(A, ms = 1400, intervalMs = 190) {
     anim.done();
 }
 
+// The character beside a block of text, centred against it. `beside` puts him at the TOP,
+// which looks wrong the moment the text is longer than he is: he ends up standing next to
+// the greeting and nothing else, and the rest of the paragraph runs on without him.
+function besideCentred(lines, pose = 'idle', tick = 0, opts = {}) {
+    const art = frameFor(pose, tick);
+    const text = (lines || []).map(String);
+    const col = opts.column || Math.max(0, ...text.map((l) => l.length));
+    const offset = Math.max(0, Math.floor((text.length - art.length) / 2));
+    const rows = [];
+    for (let i = 0; i < text.length; i++) {
+        const a = art[i - offset];
+        const s = text[i];
+        if (!a) { rows.push(s ? { text: s } : null); continue; }
+        rows.push({ text: s, art: a });
+    }
+    // Callers that want plain strings get them; the CLI pads by visible width itself, so
+    // the two columns stay aligned even when one side is coloured.
+    return rows.map((r) => (r === null ? null : { s: r.text, a: r.art || '' }));
+}
+
 module.exports = {
     WAVE, IDLE, POINT, THINK, CHEER,
-    frameFor, beside, above, makeAnimator, waveFor,
+    frameFor, beside, besideCentred, above, makeAnimator, waveFor,
 };
