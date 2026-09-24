@@ -1472,12 +1472,16 @@ const USAGE = `
     log in, start the harness, change any setting, read the logs, run the doctor.
 
     ${A.bold('First run')}
-      1. ${A.bold('webchat')}                        open the dashboard
-      2. Webchat & browser                     pick which site
-      3. ${A.bold('1. Launch browser & log in')}       a window opens on your desktop
-      4. sign in to it                         (you do this, not the CLI)
-      5. ${A.bold('2. Connect')}                     the CLI checks the tab and saves it
-      6. new terminal → ${A.bold('webchat connect')}   harness + agent, wired up
+      1. ${A.bold('webchat')}                    open the dashboard
+      2. ${A.bold('Webchats → Add a webchat')}   pick the site, then "Open the browser"
+      3. sign in to that window                 (you do this, not the CLI)
+      4. ${A.bold('Webchats → Connect …')}       it checks the tab and records the webchat
+      5. new terminal → ${A.bold('webchat connect')}   harness + agent, wired up
+
+    ${A.bold('Several webchats at once')}
+      Each one gets its own browser, profile and ports, so Gemini and ChatGPT can
+      both be connected and used as separate models (${A.cyan('webchat/gemini')},
+      ${A.cyan('webchat/chatgpt')}) from inside your agent.
 
     ${A.bold('Options')}
       webchat --help          this text
@@ -1494,9 +1498,7 @@ async function main(argv) {
 
     // `status` is no longer a separate command — the owner asked for ONE command
     // that shows everything. It survives as a hidden alias so anything already
-    // calling it keeps working, but it is not advertised.
-    // `status` is folded into the single command. It survives as a hidden alias so
-    // anything already invoking it keeps working; it is not advertised in --help.
+    // invoking it keeps working; it is not advertised in --help.
     if (cmd === 'status') { await interactive(); return 0; }
 
     if (cmd === 'connect' && argv[1] !== '--help') return cmdConnect(argv.slice(1));

@@ -142,8 +142,8 @@ function build(ctx) {
                 : `Sign into ${site.label} in that window.`,
             '',
             A.yellow('The CLI cannot tell whether you are logged in.'),
-            A.dim('A signed-out Gemini still looks like a signed-in one to us, so this is'),
-            A.dim('your call to make — which is why there is a Confirm step.'),
+            A.dim(`A signed-out ${site.label} looks exactly like a signed-in one from`),
+            A.dim('here, so this is your call to make — which is why there is a Confirm step.'),
             '',
             A.dim(`When you are signed in, choose "${gate.label}" → Connect in the Webchats list.`),
         ], 'Back to Webchats');
