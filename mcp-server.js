@@ -172,6 +172,10 @@ const TOOLS = [
             if (!site) return asError('unknown site "' + a.site + '" — known: ' + gatesMod.SITES.map((x) => x.id).join(', '));
             const { gates } = gatesMod.read();
             const gate = gatesMod.add({ site: site.id, label: a.label, url: a.url || site.url, cdpPort: 9225 + gates.length, gatewayPort: 8081 + gates.length });
+            // The gate just created is what the caller means next. Without this, every
+            // later tool that omits `gate` falls back to gates[0] — so adding a SECOND
+            // webchat and then launching would launch the first one instead.
+            gatesMod.setActive(gate.id);
             return asText({ created: gate, next: 'Call webchat_gate_launch so a browser opens for the user to log into.' });
         },
     ),

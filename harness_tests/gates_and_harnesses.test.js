@@ -205,3 +205,17 @@ test('the MCP server never writes a non-JSON line to stdout', () => {
     assert.ok(guard > -1, 'the stdout guard must exist');
     assert.ok(guard < firstRequire && guard < src.indexOf('safeRequire'), 'the redirect must be installed before any module that might log is loaded');
 });
+
+test('adding a webchat makes it the active one', async () => {
+    // Every tool that omits `gate` falls back to the active one. Told to add a SECOND
+    // webchat and then launch, a caller that passes no gate must get the one it just
+    // added — not gates[0], which measured as the FIRST webchat and the wrong browser.
+    const before = G.read().gates.map((g) => g.id);
+    const mcp = require('../mcp-server.js');
+    const tool = mcp.TOOLS.find((t) => t.name === 'webchat_gate_add');
+    const res = await tool.handler({ site: 'deepseek' });
+    const text = res.content ? res.content[0].text : String(res);
+    const created = JSON.parse(text).created;
+    assert.ok(!before.includes(created.id), 'should be a new gate');
+    assert.strictEqual(G.read().active, created.id, 'the gate just created must become active');
+});
