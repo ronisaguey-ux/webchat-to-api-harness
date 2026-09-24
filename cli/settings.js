@@ -772,6 +772,24 @@ function display(setting, value) {
         // `dotted` arrives as `tools.disabled::<name>` and is translated here, so the
         // caller works in the same id space the list uses and never has to know the
         // storage shape.
+        // One entry of a MAP setting, addressed as `<map.path>::<key>`. Clearing with an
+        // empty string removes the key, which is how a per-webchat prompt falls back to
+        // the shared one. Without this the only way to set a single entry was to
+        // read-modify-write the whole object, which is exactly the kind of whole-object
+        // write that loses a concurrent edit.
+        const mapEntry = /^([A-Za-z]+\.[A-Za-z]+)::(.+)$/.exec(dotted);
+        if (mapEntry && BY_PATH.has(mapEntry[1])) {
+            const mapPath = mapEntry[1];
+            const key = mapEntry[2];
+            const loaded0 = loadRaw();
+            const next0 = loaded0.raw || {};
+            const map = Object.assign({}, getPath(next0, mapPath) || {});
+            if (String(value == null ? '' : value).trim() === '') delete map[key];
+            else map[key] = String(value);
+            setPath(next0, mapPath, map);
+            saveRaw(next0, loaded0.file);
+            return { ok: true, value: map[key] || '', shadowed: false, shadowedBy: null };
+        }
         if (dotted.startsWith('tools.disabled::')) {
             const name = dotted.slice('tools.disabled::'.length);
             const loaded = loadRaw();
@@ -783,15 +801,44 @@ function display(setting, value) {
             saveRaw(next, loaded.file);
             return { ok: true, value: !set.has(name), shadowed: false, shadowedBy: null };
         }
-        const setting = BY_PATH.get(dotted);
-    if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
-    // loadRaw returns an ENVELOPE ({ file, raw, missing }) — writing that straight
-    // back produces a config containing the envelope instead of the settings, which
-    // silently reverts every value on the next boot. Write `loaded.raw`.
-    const loaded = loadRaw();
-    const next = loaded.raw || {};
-    setPath(next, dotted, value);
-    saveRaw(next, loaded.file);
+      const setting = BY_PATH.get(dotted);
+      if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
+
+      // ★ THE WRITE TARGET DEPENDS ON THE TYPE, and this used to ignore two of them.
+      // It always wrote to the config JSON, so `memory.contents` went into the config
+      // while the model reads the memory FILE (the write reported success and changed
+      // nothing), and an env-only secret like `__env__.API_TOKEN` went into the config
+      // while the runtime reads .env. Both are "saved but inert" — the worst shape a
+      // settings writer can have, because the caller is told it worked. This is the
+      // single writer for BOTH the CLI and the MCP, so the fix belongs here rather than
+      // in either caller.
+
+      // Env-only: the value lives in .env, never in the config file.
+      if (setting.envOnly) {
+          const file = envFilePath();
+          let text = '';
+          try { text = fs.readFileSync(file, 'utf-8'); } catch { text = ''; }
+          fs.writeFileSync(file, setEnvVar(text, setting.env, String(value)), { mode: 0o600 });
+          return { ok: true, value, shadowed: false, shadowedBy: null, where: file };
+      }
+
+      // File-backed: the value IS a file. Writing it into the config JSON would leave
+      // the real file untouched and the setting would appear to have no effect.
+      if (setting.fileBacked) {
+          if (!memoryMod || typeof memoryMod.writeMemory !== 'function') {
+              return { ok: false, reason: 'the memory module is unavailable, so ' + dotted + ' cannot be written' };
+          }
+          memoryMod.writeMemory(String(value == null ? '' : value));
+          return { ok: true, value, shadowed: false, shadowedBy: null, where: memoryMod.memoryFile() };
+      }
+
+      // loadRaw returns an ENVELOPE ({ file, raw, missing }) — writing that straight
+      // back produces a config containing the envelope instead of the settings, which
+      // silently reverts every value on the next boot. Write `loaded.raw`.
+      const loaded = loadRaw();
+      const next = loaded.raw || {};
+      setPath(next, dotted, value);
+      saveRaw(next, loaded.file);
     // Re-resolve so the caller learns whether the file write actually took effect.
     const after = resolve(setting, next);
     const shadowed = Boolean(after && after.shadowedBy);
@@ -803,12 +850,54 @@ function display(setting, value) {
     };
 }
 
-module.exports = {
-    SCHEMA, BY_PATH,
-    getPath, setPath,
-    parseEnvFile, setEnvVar, removeEnvVar,
-    envFilePath, loadDotenv,
-    configFilePath, loadRaw, saveRaw,
-    coerce, resolve, resolveAll, countShadowed, saveSetting,
-    listModes, display,
-};
+    // Reset one setting to its built-in default.
+    //
+    // "Reset" has to strip EVERY layer that could be holding a value, not just the config
+    // file: a setting can be set in the file, shadowed by an environment variable, or both.
+    // Removing only the file value leaves the env var in charge and the setting unchanged,
+    // which reads as "reset did nothing". So this removes the file entry AND the env var,
+    // and reports which of the two it actually removed.
+    function resetSetting(dotted) {
+        const setting = BY_PATH.get(dotted);
+        if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
+
+        const removed = [];
+        const { raw, file } = loadRaw();
+        const next = raw || {};
+        if (getPath(next, dotted) !== undefined) {
+            setPath(next, dotted, undefined);
+            saveRaw(next, file);
+            removed.push(path.basename(file));
+        }
+        if (setting.env) {
+            const envFile = envFilePath();
+            let text = '';
+            try { text = fs.readFileSync(envFile, 'utf-8'); } catch { text = ''; }
+            const without = removeEnvVar(text, setting.env);
+            if (without !== text) {
+                fs.writeFileSync(envFile, without, { mode: 0o600 });
+                removed.push(path.basename(envFile));
+            }
+            delete process.env[setting.env];
+        }
+        const after = resolve(setting, loadRaw().raw || {});
+        return {
+            ok: true,
+            path: dotted,
+            value: after ? after.value : setting.default,
+            removedFrom: removed,
+            note: removed.length
+                ? 'Removed from ' + removed.join(' and ') + '.'
+                : 'Already at the default — nothing to remove.',
+        };
+    }
+
+    module.exports = {
+        SCHEMA, BY_PATH,
+        getPath, setPath,
+        parseEnvFile, setEnvVar, removeEnvVar,
+        envFilePath, loadDotenv,
+        configFilePath, loadRaw, saveRaw,
+        coerce, resolve, resolveAll, countShadowed, saveSetting, resetSetting,
+        listModes, display,
+    };
