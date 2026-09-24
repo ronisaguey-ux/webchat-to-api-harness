@@ -45,7 +45,11 @@ function quirk(name, dflt) {
 // 08-14 WEDGE ROOT-CAUSE guard: nothing legitimate is ever near this; it
 // exists to turn a runaway tool result into a loud client-visible error
 // instead of a silent gateway wedge (see sendPrompt).
-const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS || '900000', 10);
+// Below the webchat composer's own limit, not above it. Measured on Gemini: the
+// composer kept 30,717 of a 150,682-char prompt and the send proceeded anyway, so the
+// model worked from a prompt missing its middle. Refusing here is cheaper than typing
+// 150K chars into a box that will drop most of them.
+const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS || '28000', 10);
 
 let browser = null;
 
@@ -1352,6 +1356,19 @@ async function insertVerified(cdp, text, sels, { isChatGpt = false } = {}) {
     if (isChatGpt) {
         throw new Error(`Composer verification failed after ${MAX_TRIES} attempts `
             + `(want ${text.length} chars, got ${lastLen}) — refusing to send a scrambled prompt`);
+    }
+    // ★ A SHORT COMPOSER IS NOT A SCRAMBLED ONE, IT IS A TRUNCATED ONE — and sending it
+    // anyway is how the model gets a prompt with the middle missing and no way to know.
+    // Measured: 150,682 chars went in, the composer held 30,717, and the send proceeded
+    // "unverified" — so the model worked from a prompt that silently lost 120K chars.
+    //
+    // A composer that holds CONSISTENTLY LESS than we sent (same short length on every
+    // retry) means a length limit, not a race; a retry cannot fix it and neither can the
+    // model. Refuse loudly instead, naming the number, so the caller shrinks the prompt.
+    if (lastLen > 0 && lastLen < text.length * 0.9) {
+        throw new Error(`prompt exceeds what this composer accepts: sent ${text.length} chars, `
+            + `the composer kept ${lastLen}. Refusing to send a prompt with the middle missing — `
+            + `shrink it (MAX_PROMPT_CHARS / the tool-result cap) or start a fresh context.`);
     }
     console.log(`⚠️ proceeding with unverified composer (${lastLen}/${text.length} chars)`);
     return lastLen;

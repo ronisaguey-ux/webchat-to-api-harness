@@ -247,7 +247,7 @@
   },
   "limits": {
     "timeoutMs": 1800000,
-    "maxToolRounds": 40,
+    "maxToolRounds": 300,
     "toolContextWindow": 30000,
     "contextHandoffThreshold": 2000000,
     "antiSpiralMinWords": 40,

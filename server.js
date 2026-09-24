@@ -1557,7 +1557,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             // double the message and re-wedge the tab. send_message needs no
             // receipt: its text was already delivered to the client above.
             const followUp =
-                (call.toolName === 'send_message' ? '' : formatToolResultView(call, maybeCompactResult(call, result), 150000, { forModel: true }) + '\n\n') +
+                (call.toolName === 'send_message' ? '' : formatToolResultView(call, maybeCompactResult(call, result), config.modelToolResultCap, { forModel: true }) + '\n\n') +
                 (config.allowPlainText
                     ? 'Task is NOT complete until every part is done AND verified. Send ONE 💬 line, then your ' +
                       'next fenced tool call. Verify with run_bash (syntax checks, imports, the project tests); ' +

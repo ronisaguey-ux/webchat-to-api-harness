@@ -129,6 +129,14 @@ const cfg = {
     toolContextWindow: MC.pickNum('TOOL_CONTEXT_WINDOW', 'limits', 'toolContextWindow') || 30000, // Claude Code's tool list + schemas is ~20K chars
     loginWaitMs: (MC.pickNum('LOGIN_WAIT_SECONDS', 'webchat', 'loginWaitSeconds') || 300) * 1000,
     maxToolRounds: MC.pickNum('MAX_TOOL_ROUNDS', 'limits', 'maxToolRounds') || 40,
+    // ★ How much of a tool result the MODEL is shown, in the follow-up prompt. Must stay
+    // under the webchat composer's own limit, because a prompt that exceeds it is
+    // SILENTLY TRUNCATED by the site — measured on Gemini: 150,682 chars sent, 30,717
+    // kept, and the model then worked from a prompt with the middle missing.
+    // The cap is what keeps a big read_file from exceeding that: the result is shown
+    // head+tail with an explicit "N characters dropped" marker, so the model knows it is
+    // seeing part of the file and can ask for a window instead of assuming it saw it all.
+    modelToolResultCap: MC.pickNum('MODEL_TOOL_RESULT_CAP', 'limits', 'modelToolResultCap') || 16000,
     // 09-13: how many rounds BEFORE maxToolRounds the harness stops the model and
     // demands its final answer, so running out of rounds yields a summary instead
     // of an error. Configurable in harness.config.json (limits.wrapUpRounds).
