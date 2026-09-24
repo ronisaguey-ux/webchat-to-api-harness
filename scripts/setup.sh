@@ -7,14 +7,14 @@
 #  one, hand-edit a JSON config that is gitignored, and guess a port. Every one
 #  of those is a place to get stuck.
 #
-#  Now:  ./setup.sh
+#  Now:  ./scripts/setup.sh
 #
 #  It asks at most three questions, is safe to re-run, and never overwrites an
 #  existing .env without saying so. Everything it writes lives in .env, which is
 #  gitignored — so a re-run is always recoverable.
 #
 #  Non-interactive (CI, scripts, or if you already know what you want):
-#      ./setup.sh --chat gemini --port 8080 --yes
+#      ./scripts/setup.sh --chat gemini --port 8080 --yes
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -25,7 +25,7 @@ CHAT=""; PORT=""; ASSUME_YES=0; ATTACH=""
 
 usage() {
   cat <<'U'
-Usage: ./setup.sh [options]
+Usage: ./scripts/setup.sh [options]
 
   --chat <name>    webchat to drive: gemini | chatgpt | deepseek | kimi |
                    notegpt | freebuff | generic
@@ -139,7 +139,7 @@ if [ -f .env ]; then
   say "· existing .env backed up (env.bak-*)"
 fi
 cat > .env <<ENV
-# Written by ./setup.sh on $(date '+%Y-%m-%d %H:%M'). Safe to edit by hand.
+# Written by ./scripts/setup.sh on $(date '+%Y-%m-%d %H:%M'). Safe to edit by hand.
 HOST=127.0.0.1
 PORT=$PORT
 
@@ -185,14 +185,14 @@ say "✓ wrote .env"
 echo
 say "Next, start it:"
 echo
-echo "      ./start.sh"
+echo "      ./scripts/start.sh"
 echo
 say "The browser will open MINIMISED. To sign in for the first time:"
 echo
-echo "      ./launch-agent.sh any        # prints the env for your agent"
+echo "      ./scripts/launch-agent.sh any        # prints the env for your agent"
 echo "      # or raise the window:       (see README → 'Signing in')"
 echo
 say "Then point any coding agent at it:"
 echo
-echo "      ./launch-agent.sh opencode   # or: claude, codex, aider, …"
+echo "      ./scripts/launch-agent.sh opencode   # or: claude, codex, aider, …"
 echo

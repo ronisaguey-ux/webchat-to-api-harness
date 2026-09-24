@@ -85,7 +85,7 @@ test('every writing tool the harness offers is in MUTATING_TOOLS', () => {
     // The general rule this bug came from: a new writing tool has to be added to BOTH the
     // offered set and the mutation set, and forgetting the second is invisible until an
     // honest answer gets accused.
-    const { getToolDefinitions } = require(path.join(__dirname, '..', 'tools.js'));
+    const { getToolDefinitions } = require(path.join(__dirname, '..', 'src', 'tools', 'tools.js'));
     const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
     const m = src.match(/const MUTATING_TOOLS = new Set\(\[([^\]]*)\]\)/);
     const registered = m[1].split(',').map((s) => s.trim().replace(/^'|'$/g, ''));

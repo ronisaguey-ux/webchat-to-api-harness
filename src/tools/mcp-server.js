@@ -40,7 +40,7 @@ for (const level of ['log', 'info', 'warn', 'error', 'debug', 'trace']) {
     };
 }
 
-const REPO = __dirname;
+const REPO = require('path').join(__dirname, '..', '..');
 const PROTOCOL_VERSION = '2024-11-05';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -83,11 +83,11 @@ function safeRequire(p) {
     try { return require(p); } catch { return null; }
 }
 
-const gatesMod = safeRequire('./cli/gates');
-const harnessesMod = safeRequire('./cli/harnesses');
-const settingsMod = safeRequire('./cli/settings');
-const launchMod = safeRequire('./cli/launchconfig');
-const daemonMod = safeRequire('./cli/daemon');
+const gatesMod = safeRequire('../../cli/gates');
+const harnessesMod = safeRequire('../../cli/harnesses');
+const settingsMod = safeRequire('../../cli/settings');
+const launchMod = safeRequire('../../cli/launchconfig');
+const daemonMod = safeRequire('../../cli/daemon');
 
 function activeGate(id) {
     if (!gatesMod) return null;

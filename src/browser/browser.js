@@ -2,8 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const puppeteer = require('puppeteer');
-const config = require('./config');
-const RATE_LIMIT = require('./rate_limit');
+const config = require('../core/config');
+const RATE_LIMIT = require('../runtime/rate_limit');
 
 // ── A webchat stream error, classified so the send gate can act on it ─────────
 //
@@ -1232,7 +1232,7 @@ async function ensureToggles() {
     try {
         // A model id that named toggles wins over the static config; the id IS the
         // user's choice. Keyed by the registry's ids so a rename cannot drift.
-        const W = require('./webchat-models');
+        const W = require('../models/webchat-models');
         const siteId = (_requestModel && _requestModel.site) || '';
         const site = W.SITES[siteId] || null;
         const wantDeepThink = (_requestToggles && 'deepthink' in _requestToggles)

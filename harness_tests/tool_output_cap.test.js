@@ -21,8 +21,8 @@ function freshConfig(env = {}) {
     }
     const saved = { ...process.env };
     for (const [k, v] of Object.entries(env)) process.env[k] = v;
-    const cfg = require(path.join(__dirname, '..', 'config.js'));
-    const comp = require(path.join(__dirname, '..', 'compactor.js'));
+    const cfg = require(path.join(__dirname, '..', 'src', 'core', 'config.js'));
+    const comp = require(path.join(__dirname, '..', 'src', 'runtime', 'compactor.js'));
     return { cfg, comp, restore: () => { process.env = { ...saved }; } };
 }
 

@@ -181,7 +181,7 @@ test('a ready config has no problems', () => {
 
 // ── the MCP server ───────────────────────────────────────────────────────────
 test('the MCP server exposes its tools without a live gateway', () => {
-    const mcp = require('../mcp-server.js');
+    const mcp = require('../src/tools/mcp-server.js');
     assert.ok(mcp.TOOLS.length >= 15, `expected a full surface, got ${mcp.TOOLS.length}`);
     for (const t of mcp.TOOLS) {
         assert.ok(t.name && t.description && t.inputSchema, `incomplete tool: ${t.name}`);
@@ -190,7 +190,7 @@ test('the MCP server exposes its tools without a live gateway', () => {
 });
 
 test('MCP tool names are unique and namespaced', () => {
-    const mcp = require('../mcp-server.js');
+    const mcp = require('../src/tools/mcp-server.js');
     const names = mcp.TOOLS.map((t) => t.name);
     assert.strictEqual(new Set(names).size, names.length, 'duplicate tool name');
     for (const n of names) assert.match(n, /^webchat_/, `unprefixed tool name: ${n}`);
@@ -199,9 +199,9 @@ test('MCP tool names are unique and namespaced', () => {
 test('the MCP server never writes a non-JSON line to stdout', () => {
     // Stdout IS the wire. A stray console.log corrupts the stream — measured: a config
     // warning printed straight into it and the client got a parse error.
-    const src = fs.readFileSync(path.join(__dirname, '..', 'mcp-server.js'), 'utf-8');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'tools', 'mcp-server.js'), 'utf-8');
     const guard = src.indexOf('STDOUT IS THE WIRE');
-    const firstRequire = src.indexOf("const REPO = __dirname;");
+    const firstRequire = src.indexOf("const REPO =");
     assert.ok(guard > -1, 'the stdout guard must exist');
     assert.ok(guard < firstRequire && guard < src.indexOf('safeRequire'), 'the redirect must be installed before any module that might log is loaded');
 });
@@ -211,7 +211,7 @@ test('adding a webchat makes it the active one', async () => {
     // webchat and then launch, a caller that passes no gate must get the one it just
     // added — not gates[0], which measured as the FIRST webchat and the wrong browser.
     const before = G.read().gates.map((g) => g.id);
-    const mcp = require('../mcp-server.js');
+    const mcp = require('../src/tools/mcp-server.js');
     const tool = mcp.TOOLS.find((t) => t.name === 'webchat_gate_add');
     const res = await tool.handler({ site: 'deepseek' });
     const text = res.content ? res.content[0].text : String(res);

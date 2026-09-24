@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # IP-breach guard (2026-09-10): this repo is the webchat-to-api harness ONLY.
 # Block any staged path that belongs to the oculus/trading codebase.
+# NOTE 09-24: bare tests/ and scripts/ were removed - they are the harness's OWN
+# folders now (harness_tests/ holds its tests, scripts/ its launchers), and blocking
+# the prefix rejected the harness's own files. Oculus paths that matter are still
+# matched by name (the module list, oculus/, live/, execution/, ...).
 set -euo pipefail
-blocked='^(oculus/|oculus_auth/|oculus_app/|live/|execution/|swarm/|genetic_algorithm/|historical_data/|executor/|alt_important_scripts/|security/|config/|app/|dashboard/|tests/|scripts/|regime\.py$|risk_manager\.py$|weight_store\.py$|asset_registry\.py$|cache\.py$|cookie_encrypt\.py$|rollback_validator\.py$|api_server\.py$|call_deepchat\.sh$)'
+blocked='^(oculus/|oculus_auth/|oculus_app/|live/|execution/|swarm/|genetic_algorithm/|historical_data/|executor/|alt_important_scripts/|security/|config/|app/|dashboard/|regime\.py$|risk_manager\.py$|weight_store\.py$|asset_registry\.py$|cache\.py$|cookie_encrypt\.py$|rollback_validator\.py$|api_server\.py$|call_deepchat\.sh$)'
 hits=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$blocked" || true)
 if [ -n "$hits" ]; then
   echo "✗ BLOCKED: oculus/trading paths staged in the harness repo:" >&2

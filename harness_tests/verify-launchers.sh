@@ -70,7 +70,7 @@ export PORT="$FAKE_PORT"
 export HARNESS_MODEL_NAME="test-model"
 export PATH="$STUB:$PATH"
 
-run() { timeout 15 ./launch-agent.sh "$@" 2>/dev/null; }
+run() { timeout 15 ./scripts/launch-agent.sh "$@" 2>/dev/null; }
 
 echo "verify-launchers — every recipe, against stubs"
 
@@ -104,7 +104,7 @@ crush|OPENAI_BASE_URL=http://127.0.0.1:PORT/v1
 TABLE
 
 # ── an unknown agent must fail loudly, not silently do nothing ──────────────
-OUT="$(timeout 15 ./launch-agent.sh notarealagent 2>&1)"; RC=$?
+OUT="$(timeout 15 ./scripts/launch-agent.sh notarealagent 2>&1)"; RC=$?
 if [ "$RC" -ne 0 ]; then ok "unknown agent: non-zero exit ($RC)"
 else bad "unknown agent: exited 0" "an unknown name must not look like success"; fi
 check "unknown agent: says what IS known" "$OUT" "opencode"

@@ -18,13 +18,13 @@
 
 const path = require('path');
 const fs = require('fs');
-const A = require('./ansi');
-const S = require('./settings');
-const D = require('./daemon');
-const G = require('./gates');
-const H = require('./harnesses');
-const LC = require('./launchconfig');
-const screensGates = require('./screens-gates');
+const A = require('./ansi.js');
+const S = require('./settings.js');
+const D = require('./daemon.js');
+const G = require('./gates.js');
+const H = require('./harnesses.js');
+const LC = require('./launchconfig.js');
+const screensGates = require('./screens-gates.js');
 
 let SHOW_ADVANCED = false;
 
@@ -888,7 +888,7 @@ async function screenStart() {
             A.dim('and pick any model name.'),
             '',
             'Or use the launcher, which exports the right variables for you:',
-            A.dim('  ./launch-agent.sh opencode|claude|codex|aider|hermes|crush|any'),
+            A.dim('  ./scripts/launch-agent.sh opencode|claude|codex|aider|hermes|crush|any'),
         ]);
         return;
     }
@@ -896,7 +896,7 @@ async function screenStart() {
 }
 
 async function screenLaunchIde(host, port, rows) {
-    const launcher = path.join(D.REPO, 'launch-agent.sh');
+    const launcher = path.join(D.REPO, 'scripts', 'launch-agent.sh');
     const model = rows.find((r) => r.setting.path === 'server.modelName').value;
 
     const agents = ['opencode', 'claude', 'codex', 'aider', 'hermes', 'crush'];
@@ -922,7 +922,7 @@ async function screenLaunchIde(host, port, rows) {
     }
 
     A.clear();
-    A.line(`  ${A.dim('$')} ./launch-agent.sh ${pick}`);
+    A.line(`  ${A.dim('$')} ./scripts/launch-agent.sh ${pick}`);
     A.newline();
     // Hand the terminal to the agent. This is the one place the CLI execs rather
     // than spawns: the user asked to run that program, and it owns the TTY.
@@ -1211,7 +1211,7 @@ async function screenDoctor() {
     checks.push({ name: 'chrome', ok: Boolean(D.chromePath()), detail: D.chromePath() || 'not found — set CHROME_PATH' });
     checks.push({ name: 'puppeteer', ok: (() => { try { require.resolve('puppeteer'); return true; } catch { return false; } })(), detail: 'required to inspect and drive the tab' });
 
-    const launcher = path.join(D.REPO, 'launch-agent.sh');
+    const launcher = path.join(D.REPO, 'scripts', 'launch-agent.sh');
     checks.push({ name: 'launch-agent.sh', ok: fs.existsSync(launcher), detail: shortHome(launcher) });
 
     const host = get('server.host').value || '127.0.0.1';

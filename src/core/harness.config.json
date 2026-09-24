@@ -215,15 +215,17 @@
       "url": "https://claude.ai/new",
       "tabUrlSubstring": "claude.ai",
       "selectors": {
-        "input": "div.ProseMirror[contenteditable=\"true\"], fieldset div[contenteditable=\"true\"]",
-        "send": "button[aria-label*=\"Send\" i], button[type=\"submit\"]",
-        "message": ".font-claude-message, [data-testid=\"assistant-message\"]"
+        "input": "div.tiptap.ProseMirror",
+        "send": "button[aria-label='Send message']",
+        "message": ".font-claude-message, [data-is-streaming], div.standard-markdown"
       },
       "quirks": {
-        "_probed_2026_09_24": "claude.ai served a Cloudflare 'Just a moment...' interstitial to the profile on :9230, so these selectors are NOT verified - they are the known claude.ai contract and must be confirmed with one hand-driven send after logging in.",
-        "cloudflare": "Likely needs a HEADED browser with a signed-in persistent profile (the same class as chatgpt.com, which 403s headless). Do not run this lane headless.",
-        "not_claude_code": "This is the claude.ai WEBCHAT. Claude Code is a separate harness in the harness list, not this site.",
-        "_login_state_2026_09_24": "HEADED browser launched on DISPLAY=:2 (XAUTHORITY=/run/user/1000/xauth_lEjhMq), CDP :9231, profile /home/roni/.config/webchat-profiles/claude/chrome-profile. Measured: window 1500x1006 IsViewable on :2; tabs = 'Sign in - Claude' (claude.ai/login) + a Google accounts sign-in. NOT yet logged in, so selectors stay UNVERIFIED until the owner signs in and a hand-driven send is made."
+        "verified": "2026-09-24",
+        "login": "signed in on CDP :9231 (headed, DISPLAY=:2); title reads 'New chat - Claude'",
+        "composer": "div.tiptap.ProseMirror \u2014 a ProseMirror contenteditable, so the CDP Ctrl+A clear works (same class as Kimi's editor)",
+        "send": "button[aria-label='Send message']; starts disabled and enables once the composer holds text, so a click must be retried after typing",
+        "UNVERIFIED": "the answer node was NOT observed \u2014 a fresh chat has no assistant turn in the DOM yet, so all three message selectors returned 0. Confirm on a real send before trusting this mode.",
+        "cloudflare": "the unauthenticated page returns 'Just a moment...' with a Ray ID; a signed-in persistent profile is required"
       }
     }
   },

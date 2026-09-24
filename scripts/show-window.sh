@@ -5,10 +5,10 @@
 #  This is a thin wrapper around window.js, which drives Chrome over CDP. Use
 #  this one if you prefer a shell entry point; both do exactly the same thing.
 #
-#      ./show-window.sh raise      # bring the window up (use this to sign in)
-#      ./show-window.sh drop       # minimise it — and it STAYS minimised
-#      ./show-window.sh maximize   # maximise it — and it STAYS maximised
-#      ./show-window.sh status     # what state is it in?
+#      ./scripts/show-window.sh raise      # bring the window up (use this to sign in)
+#      ./scripts/show-window.sh drop       # minimise it — and it STAYS minimised
+#      ./scripts/show-window.sh maximize   # maximise it — and it STAYS maximised
+#      ./scripts/show-window.sh status     # what state is it in?
 #
 #  NO GUARD. There used to be a `minimize-guard.sh` re-minimising every 0.15s and
 #  it has been REMOVED. It could never stop the flash, because it was racing Chrome

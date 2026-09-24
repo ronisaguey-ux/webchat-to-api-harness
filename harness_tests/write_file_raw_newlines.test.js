@@ -18,7 +18,7 @@ const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
 
-const { parseToolCalls } = require(path.join(__dirname, '..', 'tools.js'));
+const { parseToolCalls } = require(path.join(__dirname, '..', 'src', 'tools', 'tools.js'));
 
 const fileBody = [
     'import React, { useState } from "react";',

@@ -11,7 +11,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
-const { executeTool, getToolDefinitions } = require(path.join(__dirname, '..', 'tools.js'));
+const { executeTool, getToolDefinitions } = require(path.join(__dirname, '..', 'src', 'tools', 'tools.js'));
 
 // The sandbox only permits /home/roni/Roni_workspace/{t2b,helpotron,webchat_worker/harness}
 // and /tmp/opencode, so the system temp dir is DENIED — a test writing there fails with a

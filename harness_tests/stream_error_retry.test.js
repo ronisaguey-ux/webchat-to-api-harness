@@ -22,7 +22,7 @@ Module.prototype.require = function (id) {
     if (id === 'puppeteer') return { launch: async () => ({}) };
     return origRequire.apply(this, arguments);
 };
-const B = require('../browser.js');
+const B = require('../src/browser/browser.js');
 
 test('a transient upstream overload is tagged retryable', () => {
     const e = B.streamError('Server busy, please try again later. (finish_reason: generation_timeout)');

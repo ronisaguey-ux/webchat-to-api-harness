@@ -208,9 +208,9 @@ not optional.
 Three commands. No editing.
 
 ```bash
-./setup.sh                    # asks which webchat, picks a free port, writes .env
-./start.sh                    # the browser opens MINIMISED
-./launch-agent.sh opencode    # or claude | codex | aider | hermes | any
+./scripts/setup.sh                    # asks which webchat, picks a free port, writes .env
+./scripts/start.sh                    # the browser opens MINIMISED
+./scripts/launch-agent.sh opencode    # or claude | codex | aider | hermes | any
 ```
 
 That is the whole setup. `setup.sh` is safe to re-run and backs up your `.env`
@@ -221,14 +221,14 @@ real headed browser (headless gets signed out and is a fingerprint tell), just
 kept out of your way. Raise it once, sign in, drop it back:
 
 ```bash
-./show-window.sh raise      # or: ./show-window.sh raise && … && ./show-window.sh drop
+./scripts/show-window.sh raise      # or: ./scripts/show-window.sh raise && … && ./scripts/show-window.sh drop
 ```
 
 If you already have a browser open with a signed-in webchat tab, you can attach
 to it instead and skip the login entirely:
 
 ```bash
-./setup.sh --attach ws://127.0.0.1:9222/devtools/browser/<id>
+./scripts/setup.sh --attach ws://127.0.0.1:9222/devtools/browser/<id>
 # (find that id at http://127.0.0.1:9222/json/version)
 ```
 
@@ -251,12 +251,12 @@ be your logged-in tab.
 
 | Agent | Command | How it is wired |
 |---|---|---|
-| OpenCode | `./launch-agent.sh opencode` | writes `./opencode.json` (gitignored) and runs from here |
-| Claude Code | `./launch-agent.sh claude` | `ANTHROPIC_BASE_URL` → `/v1/messages` |
-| Codex | `./launch-agent.sh codex` | `OPENAI_BASE_URL` |
-| Aider | `./launch-agent.sh aider` | `--openai-api-base` passed explicitly |
-| Hermes | `./launch-agent.sh hermes` | exported env |
-| anything else | `./launch-agent.sh any` | prints the four variables; that is the whole surface |
+| OpenCode | `./scripts/launch-agent.sh opencode` | writes `./opencode.json` (gitignored) and runs from here |
+| Claude Code | `./scripts/launch-agent.sh claude` | `ANTHROPIC_BASE_URL` → `/v1/messages` |
+| Codex | `./scripts/launch-agent.sh codex` | `OPENAI_BASE_URL` |
+| Aider | `./scripts/launch-agent.sh aider` | `--openai-api-base` passed explicitly |
+| Hermes | `./scripts/launch-agent.sh hermes` | exported env |
+| anything else | `./scripts/launch-agent.sh any` | prints the four variables; that is the whole surface |
 
 The integration surface is four environment variables:
 
@@ -268,7 +268,7 @@ HARNESS_MODEL_NAME   the `model` value from GET /
 ```
 
 Any tool that lets you set an OpenAI-compatible base URL will work with those.
-If your agent is not in the table, `./launch-agent.sh any` prints them.
+If your agent is not in the table, `./scripts/launch-agent.sh any` prints them.
 
 ## Endpoints
 

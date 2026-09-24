@@ -15,13 +15,13 @@ process.env.HARNESS_CONFIG = path.join(TMP, 'harness.config.json');
 fs.writeFileSync(process.env.HARNESS_CONFIG, '{}');
 
 const REPO = path.join(__dirname, '..');
-const browserSrc = fs.readFileSync(path.join(REPO, 'browser.js'), 'utf-8');
+const browserSrc = fs.readFileSync(path.join(REPO, 'src', 'browser', 'browser.js'), 'utf-8');
 
 function cfg() {
     for (const k of Object.keys(require.cache)) {
         if (/(config|master_config)\.js$/.test(k)) delete require.cache[k];
     }
-    return require(path.join(REPO, 'config.js'));
+    return require(path.join(REPO, 'src', 'core', 'config.js'));
 }
 
 // The composer's own ceiling, MEASURED on the live lane. Everything else must fit below it.
