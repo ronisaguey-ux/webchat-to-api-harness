@@ -966,7 +966,12 @@ function claimsWorkDone(text) {
 
 // Tools that CHANGE something on disk. Reading and listing are work, but they cannot
 // make a claim about a change true.
-const MUTATING_TOOLS = new Set(['write_file', 'edit_memory']);
+//
+// edit_file belongs here for the same reason write_file does. Missing it would be a FALSE
+// POSITIVE in the other direction: a run that made its only change with edit_file would
+// score mutationsRun=0, and an entirely honest "updated the file" answer would be marked
+// unverified. Every new writing tool must be added here as well as to the offered set.
+const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'edit_memory']);
 
 // A bash command that changes a repository. Deliberately narrow: a false positive adds
 // a warning to an honest answer, so only unambiguous verbs count.
