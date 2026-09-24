@@ -988,6 +988,15 @@ async function runTool(name, args, ctx) {
 // a truncated stack trace is a wrong answer (the compactor's rule 1).
 function maybeCompactResult(call, result) {
     if (!config.toolCompactor) return result;
+    // read_file is EXEMPT, and this is a data-loss guard, not a preference.
+    //
+    // read_file already caps itself at 200K chars and flags it (truncated:true +
+    // totalLength). Compacting it further to 10K loses the middle of a file with no
+    // truncation flag at all, so the model cannot tell a short file from a clipped
+    // one — and a model that then writes the file back destroys everything it did
+    // not see. Compaction exists to stop a 4MB bash flood, not to silently rewrite
+    // source the user asked to be read.
+    if (call.toolName === 'read_file') return result;
     const { result: compacted, compacted: did } = compactor.compactResult(result, config.compactor);
     if (did) console.log(`🗜️ compacted ${call.toolName} result (maxText ${config.compactor.maxText})`);
     return compacted;

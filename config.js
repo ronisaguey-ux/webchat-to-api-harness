@@ -209,7 +209,14 @@ const cfg = {
     // ── 09-22 (owner): tool-result compaction as a config option ────────────
     // Ports the owner's tool-call-compactor rules (never touch errors, head+tail
     // truncation). See compactor.js. Off by default.
-    toolCompactor: MC.pickBool('TOOL_COMPACTOR', 'features', 'toolCompactor') === true,
+    // 09-23: default ON. Two independent costs made OFF the wrong default:
+    //   1. A single run_bash can return 4 MB (execMaxBuffer), and every byte is
+    //      re-sent on EVERY later round of that turn. The report "broad command
+    //      output can be large, contributing to repeated follow-up turns" is this.
+    //   2. Compaction is not an optimisation for a chat lane — it is what keeps the
+    //      tab out of the context-handoff path, which is where runs get expensive.
+    // Set TOOL_COMPACTOR=false (or features.toolCompactor:false) to turn it off.
+    toolCompactor: MC.pickBool('TOOL_COMPACTOR', 'features', 'toolCompactor') !== false,
     compactor: {
         maxText: MC.pickNum('COMPACTOR_MAX_TEXT', 'compactor', 'maxText') || 10000,
         maxItems: MC.pickNum('COMPACTOR_MAX_ITEMS', 'compactor', 'maxItems') || 10,
