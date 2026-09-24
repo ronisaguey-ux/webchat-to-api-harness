@@ -432,6 +432,41 @@ let sendRetriesLeft = 1;
 // disable automatic resets entirely (manual POST /newchat still works).
 const NEW_CHAT_EVERY_SENDS = parseInt(process.env.NEW_CHAT_EVERY_SENDS || '5', 10);
 let sendCount = 0;
+
+// ── Send latency ─────────────────────────────────────────────────────────────
+// How long the webchat takes to answer, over a rolling window. The dashboard needs
+// this because "how slow is the lane right now" is the first question when a run
+// looks stuck, and a single last-send figure cannot tell a one-off stall from a lane
+// that has genuinely got slower.
+//
+// Timed around sendPrompt only — NOT around the pacing gate above it. The gate's
+// wait is deliberate spacing, not latency; folding it in would report a number that
+// changes with the send interval rather than with the model.
+const LATENCY_WINDOW = 40;
+let sendLatencies = [];
+let lastLatencyMs = null;
+
+function recordLatency(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return;
+    lastLatencyMs = ms;
+    sendLatencies.push(ms);
+    if (sendLatencies.length > LATENCY_WINDOW) sendLatencies.shift();
+}
+
+function latencyStats() {
+    const n = sendLatencies.length;
+    if (!n) return { samples: 0, lastMs: null, avgMs: null, p50Ms: null, minMs: null, maxMs: null };
+    const sorted = [...sendLatencies].sort((a, b) => a - b);
+    const sum = sendLatencies.reduce((a, b) => a + b, 0);
+    return {
+        samples: n,
+        lastMs: lastLatencyMs,
+        avgMs: Math.round(sum / n),
+        p50Ms: sorted[Math.floor(n / 2)],
+        minMs: sorted[0],
+        maxMs: sorted[n - 1],
+    };
+}
 // True while handleRequest() is running. The reset is refused whenever this is
 // set, so a tool-loop send can never navigate the tab out from under itself.
 let requestInFlight = false;
@@ -542,7 +577,12 @@ async function countedSend(msg, defs) {
     lastSendAt = Date.now();
     try { fs.writeFileSync(SHARED_SEND_FILE, String(lastSendAt)); } catch { /* non-fatal */ }
     try {
+        // Time the model's own turnaround. A failed send is NOT recorded — it
+        // measures our timeout or a dead renderer, not the webchat's speed, so
+        // folding failures in would make the average describe the failures.
+        const _latencyStart = Date.now();
         const r = await sendPrompt(msg, defs);
+        recordLatency(Date.now() - _latencyStart);
         await jevCheckReply(msg, r);
         lastReqBodyChars = await getReqBodyChars();
         // 08-14 EXPERT-SWAP PIN: the send swapped an instant thread for a
@@ -594,10 +634,12 @@ async function countedSend(msg, defs) {
         if (sendRetriesLeft > 0 && _retryable) {
             sendRetriesLeft--;
             console.log(`⏱ send timed out${e.partialAnswerChars != null ? ` (partial answer was ${e.partialAnswerChars} chars)` : ''} — resending with a RETRY banner`);
+            const _retryStart = Date.now();
             const r = await sendPrompt(
                 '### RETRY (the previous message may not have reached you — here it is again)\n' + msg,
                 defs
             );
+            recordLatency(Date.now() - _retryStart);
             lastReqBodyChars = await getReqBodyChars();
             return r;
         }
@@ -903,8 +945,29 @@ async function ensureMcpDiscovered() {
 // answer that needed no tools is left alone, so conversation callers are unaffected.
 const UNVERIFIED_MARKER = '[⚠️ no tools were run in this turn — this answer contains no work the harness could verify]\n\n';
 
+// Does the answer CLAIM that work was done?
+//
+// This is the signal the guard actually needs, and the first version did not have it:
+// it marked ANY submit that followed zero tool calls, so a plain question answered
+// directly — "What is 2+2?" -> "Four" — came back wearing a warning that no work had
+// been verified. A guard that fires on a correct answer is a guard that lies in the
+// other direction, which is the same defect it exists to catch.
+//
+// The real failure is narrower and specific: a submit that ASSERTS completed work
+// while nothing ran. That is a claim the harness can contradict, so it does.
+const WORK_CLAIM_RE = new RegExp(
+    '\\b(completed|complete|finished|done|verified|verifies|implemented|executed|applied|' +
+    'fixed|resolved|addressed|tests? (pass|passed|are passing)|all (steps|waves|tasks|tests)|' +
+    'successfully|no (remaining|further) work)\\b', 'i');
+
+function claimsWorkDone(text) {
+    return WORK_CLAIM_RE.test(String(text || ''));
+}
+
 function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun }) {
-    if (offeredWorkTools && workToolsRun === 0) {
+    // Only when work tools were OFFERED, none ran, AND the answer claims the job was
+    // done. A bare answer asserts nothing, so there is nothing to contradict.
+    if (offeredWorkTools && workToolsRun === 0 && claimsWorkDone(text)) {
         return { marked: true, text: UNVERIFIED_MARKER + (text || '') };
     }
     return { marked: false, text };
@@ -1901,7 +1964,10 @@ app.get('/status', async (req, res) => {
 
 // ── GET /metrics — live numbers for the dashboard ───────────────────────────
 // The CLI polls this to render "time since last send", "average latency",
-// "waiting for the browser", "cooling down until…" and so on. Kept separate from
+// "waiting for the browser", "cooling down until…" and so on. (Every one of those
+// must actually be IN the payload below — this comment described an "average
+// latency" the response did not carry, which is worse than not mentioning it.)
+// Kept separate from
 // /health on purpose: /health is a liveness probe with a status code that other
 // tooling depends on (503 when not attached), while /metrics is an observation
 // surface that must always answer 200 and never lie about readiness.
@@ -1962,6 +2028,7 @@ app.get('/metrics', (req, res) => {
         sendCount,
         lastSendAgoMs: sinceLastSend,
         pacing,
+        latency: latencyStats(),
         rateLimit,
         // send bookkeeping
         sendRetriesLeft,
@@ -2751,6 +2818,7 @@ module.exports = {
         // decision rather than re-implementing its condition — a copy would keep
         // passing after the real one changed.
         markUnverifiedSubmit,
+        claimsWorkDone,
         UNVERIFIED_MARKER,
     },
 };

@@ -162,6 +162,18 @@ async function screenDashboard() {
             body.push(`${A.dim('sends')}      ${m.sendCount}${m.lastSendAgoMs != null
                 ? A.gray(`   last ${fmtDuration(m.lastSendAgoMs)} ago`) : A.gray('   none yet')}`);
 
+            // Latency, from a rolling window of real sends. The average is the one
+            // that answers "has this lane got slower?", which a single last-send
+            // figure cannot — one stall and one fast reply look the same.
+            const lat = m.latency || {};
+            if (lat.samples > 0) {
+                body.push(`${A.dim('latency')}    ${A.gray('avg')} ${fmtDuration(lat.avgMs)}`
+                    + A.gray(`   median ${fmtDuration(lat.p50Ms)}   last ${fmtDuration(lat.lastMs)}`));
+                body.push(`           ${A.gray(`over the last ${lat.samples} send(s)   range ${fmtDuration(lat.minMs)}–${fmtDuration(lat.maxMs)}`)}`);
+            } else {
+                body.push(`${A.dim('latency')}    ${A.gray('no sends yet this run')}`);
+            }
+
             const p = m.pacing || {};
             if (showPacing) {
                 if (!p.applies) {

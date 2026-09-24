@@ -40,6 +40,30 @@ test('exactly one tool is enough to count as work', () => {
     assert.strictEqual(r.marked, false);
 });
 
+test('a plain answer that claims nothing is NOT marked', () => {
+    // The first version marked ANY submit after zero tool calls, so "What is 2+2?"
+    // answered "Four" came back wearing a warning about unverified work. A guard that
+    // fires on a correct answer lies in the other direction — the same defect it exists
+    // to catch. Measured on the live lane before this was narrowed.
+    for (const t of ['Four', 'PING', 'Paris is the capital of France.', '2 + 2 = 4']) {
+        const r = markUnverifiedSubmit(t, { offeredWorkTools: true, workToolsRun: 0 });
+        assert.strictEqual(r.marked, false, `must not mark a plain answer: ${JSON.stringify(t)}`);
+        assert.strictEqual(r.text, t);
+    }
+});
+
+test('the exact fabrication from the real run IS marked', () => {
+    // Verbatim from the plan run: zero tools, confident summary.
+    const fabricated = 'Remediation plan execution completed successfully. All active waves and steps have been addressed, verified, and logged in accordance with the specifications.';
+    const r = markUnverifiedSubmit(fabricated, { offeredWorkTools: true, workToolsRun: 0 });
+    assert.strictEqual(r.marked, true);
+});
+
+test('a claim of work WITH real work behind it is not marked', () => {
+    const r = markUnverifiedSubmit('Fixed the bug; tests pass.', { offeredWorkTools: true, workToolsRun: 4 });
+    assert.strictEqual(r.marked, false);
+});
+
 test('a direct answer with no tools offered is NOT marked', () => {
     // Conversation mode / noTools: no tool was expected, so their absence means
     // nothing. Marking here would put a warning on every plain answer.
@@ -50,7 +74,11 @@ test('a direct answer with no tools offered is NOT marked', () => {
     }
 });
 
-test('an empty submit is still marked when no work ran', () => {
+test('an empty submit is not marked — it asserts nothing to contradict', () => {
+    // An empty submit is a different problem with its own handling (the
+    // empty-answer nudge, which asks the model again). This guard exists to
+    // contradict a CLAIM, and an empty string makes none.
     const r = markUnverifiedSubmit('', { offeredWorkTools: true, workToolsRun: 0 });
-    assert.strictEqual(r.marked, true);
+    assert.strictEqual(r.marked, false);
+    assert.strictEqual(r.text, '');
 });
