@@ -543,7 +543,7 @@ function configFilePath(explicit) {
     if (process.env.HARNESS_CONFIG) return path.resolve(process.env.HARNESS_CONFIG);
     const dotenv = loadDotenv();
     if (dotenv.vars.HARNESS_CONFIG) return path.resolve(dotenv.vars.HARNESS_CONFIG);
-    return path.join(__dirname, '..', 'harness.config.json');
+    return path.join(__dirname, '..', 'src', 'core', 'harness.config.json');
 }
 
 function loadRaw(explicit) {
