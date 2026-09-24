@@ -781,6 +781,13 @@ function cleanProse(s) {
     return s
         .replace(/Gemini said\s*/gi, '')
         .replace(/^JSON\s*/i, '')
+        // Gemini's code-block renderer stamps a bare `JSON` label before the fence,
+        // and it survives into the extracted text as trailing prose:
+        //   "💬 Checking git status... JSON {"tool":...}"
+        // The prose is cut at the brace, so the label lands at the END of it and the
+        // 💬 line the user reads ends with a stray "JSON".
+        .replace(/\s*\bJSON\s*$/i, '')
+        .replace(/\s+JSON\s+(?=\{)/gi, ' ')
         .replace(/```(?:json)?/gi, '')
         .replace(new RegExp('^\\s*' + chrome.source), '')
         .replace(new RegExp(chrome.source + '\\s*$'), '')
@@ -850,9 +857,38 @@ function parseToolCalls(response) {
             const esc = candidate.replace(/"([A-Za-z_]\w*)"\s*:\s*"""([\s\S]*?)"""/g, (m, key, val) => `"${key}":${JSON.stringify(val)}`);
             if (esc !== candidate) obj = tryParse(esc);
         }
-        if (obj && typeof obj === 'object' && obj.tool && obj.params) {
+        // ACCEPT BOTH ARGUMENT SHAPES. There are two equally unambiguous ways to
+        // write the same call, and the model uses whichever it feels like:
+        //     {"tool":"git_status","params":{"repo":"helpotron"}}   nested
+        //     {"tool":"git_status","repo":"helpotron"}              flat
+        // The parser required `params`, so a flat call was rejected as malformed —
+        // the correction was sent, the model retried in the SAME shape, the rounds
+        // burned, and it eventually gave up and fabricated a summary.
+        //
+        // Measured on the Gemini lane: every tool call it emitted was flat.
+        // `git_status` and `read_file` were both thrown away while the log said only
+        // "malformed tool JSON" — and a parser that rejects valid input looks exactly
+        // like a model that cannot produce valid output, which is why this hid behind
+        // a model-reliability story for so long.
+        //
+        // Being liberal costs nothing: the envelope's shape cannot change the meaning.
+        const _toolName = obj && typeof obj === 'object' ? (obj.tool || obj.name) : null;
+        if (_toolName) {
+            let _args = obj.params;
+            if (typeof _args === 'string') {
+                // {"tool":"submit_answer","params":"the answer"} — a scalar param
+                // has exactly one sensible reading.
+                _args = { text: _args };
+            } else if (!_args || typeof _args !== 'object' || Array.isArray(_args)) {
+                // Flat form: every key except the tool's own name/params is an arg.
+                _args = {};
+                for (const [k, v] of Object.entries(obj)) {
+                    if (k === 'tool' || k === 'name' || k === 'params') continue;
+                    _args[k] = v;
+                }
+            }
             if (firstCallStart === -1) firstCallStart = start;
-            result.toolCalls.push({ toolName: String(obj.tool), args: obj.params });
+            result.toolCalls.push({ toolName: String(_toolName), args: _args });
         }
         if (end === -1) break; // consumed the whole tail
         start = text.indexOf('{', start + 1);
