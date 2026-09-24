@@ -463,11 +463,26 @@ function build(ctx) {
     }
 
     // ── Tools ────────────────────────────────────────────────────────────────
+    // Each tool is its OWN setting (`tools.disabled::<name>`, default false = available).
+    // This used to read one array setting called `tools.disabled`, which the schema does
+    // not have, so the very first row lookup returned undefined and the screen died with
+    // "Cannot read properties of undefined (reading 'value')" before it drew anything.
+    const toolPath = (name) => `tools.disabled::${name}`;
+
     async function screenTools(startIndex = 0) {
         const st = ctx.state();
         const rows = ctx.rowsOf(st);
-        const row = rows.find((r) => r.setting.path === 'tools.disabled');
-        const disabled = new Set(Array.isArray(row.value) ? row.value : []);
+        const rowFor = (name) => rows.find((r) => r.setting.path === toolPath(name));
+        // `value` is TRUE WHEN THE TOOL IS AVAILABLE -- resolve() reports
+        // `!off.includes(name)` -- so this is "is on", not "is disabled". Getting that
+        // backwards draws every tick on the wrong row.
+        // A tool with no setting is treated as available rather than crashing: the
+        // catalogue is read from the harness at runtime and can gain a tool before the
+        // schema does.
+        const isOn = (name) => {
+            const r = rowFor(name);
+            return Boolean(r && r.value);
+        };
 
         let names = [];
         try {
@@ -477,11 +492,11 @@ function build(ctx) {
         } catch { names = []; }
 
         const items = names.map((n) => ({
-            label: `${disabled.has(n) ? '[ ]' : '[x]'} ${n}`,
-            hint: disabled.has(n) ? 'switched off' : 'available',
+            label: `${isOn(n) ? '[x]' : '[ ]'} ${n}`,
+            hint: isOn(n) ? 'available' : 'switched off',
             value: n,
         }));
-        items.push({ label: 'Done', hint: `${disabled.size} switched off`, value: 'done' });
+        items.push({ label: 'Done', hint: `${names.filter((n) => !isOn(n)).length} switched off`, value: 'done' });
 
         const pick = await A.menu(items, {
             title: 'Tools the model may use',
@@ -489,15 +504,13 @@ function build(ctx) {
             startIndex,
         });
         if (pick === A.BACK) return;
-        if (pick === 'done') {
-            await ctx.saveSetting('tools.disabled', [...disabled]);
-            return;
-        }
-        if (disabled.has(pick)) disabled.delete(pick);
-        else disabled.add(pick);
-        // Persist NOW — `disabled` is rebuilt from the setting on the next call, so an
-        // in-memory-only toggle was lost as soon as the list redrew.
-        await ctx.saveSetting('tools.disabled', [...disabled]);
+        if (pick === 'done') return;
+
+        // Persist NOW, on the setting that owns this tool. `isOff` is rebuilt from the
+        // settings on the next call, so an in-memory-only toggle was lost as soon as the
+        // list redrew.
+        const row = rowFor(pick);
+        if (row) await ctx.saveSetting(toolPath(pick), !isOn(pick));
         const at = items.findIndex((i) => i.value === pick);
         return screenTools(at >= 0 ? at : startIndex);
     }
