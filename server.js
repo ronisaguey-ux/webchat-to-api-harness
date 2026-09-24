@@ -1614,6 +1614,12 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
         if (round < config.maxToolRounds - 1) {
             const yap = looksLikeYap(response);
             console.log(`⚠️ webchat replied without tool JSON (round ${round + 1})${yap ? ' [progress-report yap]' : ''} — sending FORMAT ERROR`);
+            // Print what the model actually said. Without this the log records that a reply
+            // was rejected and nothing about WHY, which makes "the model is flaky" and "the
+            // shape it used is one we do not accept" indistinguishable — the same blind spot
+            // that hid the flat-args bug and the raw-newline write_file bug for a whole
+            // session each. 400 chars is enough to name the shape.
+            console.log(`   raw=[${String(response || '').replace(/\s+/g, ' ').slice(0, 400)}]`);
             onProgress?.({ type: 'rejected', text: yap ? 'plain-text progress report — rejected, demanding the next tool call' : 'plain-text reply — format error sent, demanding fenced tool JSON' });
             response = await countedSend(yap ? YAP_ERROR_MSG : FORMAT_ERROR_MSG, toolDefs);
             continue;

@@ -154,6 +154,83 @@ const TOOL_DEFINITIONS = [
         },
     },
     {
+        // SURGICAL EDIT — and the reason it exists is a measured failure, not tidiness.
+        //
+        // This harness had write_file and nothing else, so the smallest change cost a full
+        // rewrite: a 3-line edit to a 297-line file meant emitting all 297 lines as one
+        // JSON string. Models fail at that — they drop closing braces, silently truncate,
+        // or leave the newlines raw — so simple edits failed far more often than they
+        // should have. Measured: the lane read DataLakeView.jsx, was asked to change three
+        // things, produced no write at all, ran the build, and reported success.
+        //
+        // A small bounded operation makes an impossible request routine: the model emits
+        // the old text it saw and the new text it wants, and the tool proves the old text
+        // existed exactly once before touching anything.
+        //
+        // Deliberately strict, because a fuzzy match on source code is a corruption risk:
+        //   • old_string must be found, and found EXACTLY ONCE — a match appearing twice
+        //     is ambiguous and is refused rather than guessed at.
+        //   • A multi-line old_string must reproduce its own indentation verbatim.
+        //   • Not-found and not-unique return actionable errors naming the fix, so the
+        //     model can correct itself in one round instead of retrying blindly.
+        //   • replace_all is opt-in and only for deliberately repetitive text.
+        name: 'edit_file',
+        category: 'file',
+        description: 'Replace an exact string in a file. Use this for edits instead of rewriting the whole file. old_string must match EXACTLY ONCE, including its indentation.',
+        parameters: {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: 'File path to edit' },
+                old_string: { type: 'string', description: 'The exact text to replace, indentation included. Must appear exactly once.' },
+                new_string: { type: 'string', description: 'The replacement text. Use an empty string to delete the matched text.' },
+                replace_all: { type: 'boolean', description: 'Replace every occurrence instead of requiring exactly one. Use only for deliberately repeated text.' },
+            },
+            required: ['path', 'old_string', 'new_string'],
+        },
+        handler: async (args) => {
+            const sb = sandbox.denyResult(sandbox.checkPath(args.path));
+            if (sb) return sb;
+            let content;
+            try {
+                content = fs.readFileSync(args.path, 'utf-8');
+            } catch (e) {
+                return { success: false, error: `Could not read ${args.path}: ${e.message}`, content_is_error: true };
+            }
+            const oldStr = args.old_string;
+            if (typeof oldStr !== 'string' || oldStr === '') {
+                return { success: false, error: 'old_string is required and must be a non-empty string. To create a new file, use write_file.', content_is_error: true };
+            }
+            const count = content.split(oldStr).length - 1;
+            if (count === 0) {
+                // Name the likely cause rather than just reporting failure — an
+                // unindented or partially-remembered snippet is the common case.
+                const firstLine = oldStr.split('\n')[0].trim();
+                let hint = 'Check the wording and the indentation — old_string must match the file byte for byte.';
+                if (firstLine && content.includes(firstLine)) {
+                    hint = `A line matching "${firstLine.slice(0, 60)}" exists, so the text is probably there but the indentation or the surrounding lines differ. Read the exact region with read_file and copy it verbatim.`;
+                }
+                return { success: false, error: `old_string was not found in ${args.path}. ${hint}`, content_is_error: true, found: 0 };
+            }
+            if (count > 1 && !args.replace_all) {
+                return {
+                    success: false,
+                    error: `old_string appears ${count} times in ${args.path} — it is ambiguous, so nothing was changed. Include more surrounding lines to make it unique, or pass replace_all:true to change every occurrence.`,
+                    content_is_error: true,
+                    found: count,
+                };
+            }
+            const newContent = args.replace_all ? content.split(oldStr).join(args.new_string) : content.replace(oldStr, () => args.new_string);
+            fs.writeFileSync(args.path, newContent, 'utf-8');
+            return {
+                success: true,
+                message: `Edited ${args.path} (${count} replacement${count === 1 ? '' : 's'})`,
+                replacements: count,
+                oldContent: content,
+                newLength: newContent.length,
+            };
+        },
+    },
+    {
         // SECURITY: disabled unless BASH_ALLOWED=true. The webchat model's
         // output is executed verbatim here — a prompt-injected or hostile
         // response could run anything on this machine.
