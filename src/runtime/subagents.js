@@ -33,12 +33,30 @@ function dir() {
 }
 
 function jobFile(id) {
-    return path.join(dir(), `${id}.json`);
+    // ★ An id must never escape state/subagents. `path.join(dir(), `${id}.json`)` resolves
+    // `..`, so an id of `../../secret` read a file anywhere on disk — verified by driving it:
+    // readJob('../../secret') returned a JSON file planted two levels up. The id comes from a
+    // caller (the MCP exposes webchat_subagent_result with an id), so it is untrusted input,
+    // not an internal detail.
+    //
+    // Only the basename is kept and any residual separator is rejected, so a path-shaped id
+    // fails closed instead of silently resolving somewhere else. A legitimate id (pid + random
+    // suffix) never contains a separator, so nothing real is lost.
+    const safe = String(id == null ? '' : id);
+    if (!safe || safe.includes('/') || safe.includes('\\') || safe.includes('..')) {
+        throw new Error(`subagents: invalid job id ${JSON.stringify(safe)}`);
+    }
+    return path.join(dir(), `${safe}.json`);
 }
 
 function readJob(id) {
+    // ★ Validate the id OUTSIDE the try. `jobFile` throws on a path-shaped id, but this
+    // function's own catch swallowed that and returned null — so an invalid id was
+    // indistinguishable from a job that does not exist. A caller that cannot tell a bad
+    // argument from an empty result cannot report the difference to a user.
+    const file = jobFile(id);
     try {
-        return JSON.parse(fs.readFileSync(jobFile(id), 'utf8'));
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch {
         return null;
     }
