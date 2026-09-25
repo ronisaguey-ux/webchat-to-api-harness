@@ -761,16 +761,26 @@ for (const pair of (process.env.WEBCHAT_ROUTES || '').split(',')) {
 }
 
 // Transparent proxy: status + headers + body (SSE passthrough when streaming).
-async function proxyTo(req, res, upstreamBase, path, body) {
+//
+// The credential is an explicit argument, never a default. This used to attach
+// UPSTREAM_ANTHROPIC.token — the PAID DeepSeek key — to EVERY proxied request,
+// including the WEBCHAT_ROUTES targets (OmniRoute on :20128, the per-webchat
+// gateways), so the paid key was sent to OmniRoute on every "omniroute" pick
+// even though the comment beside that call says "Never the paid key on this
+// route". Only the paid-upstream call sites pass { token }; a route gets none.
+async function proxyTo(req, res, upstreamBase, path, body, { token = '' } = {}) {
     try {
+        const headers = {
+            'content-type': 'application/json',
+            'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+        };
+        if (token) {
+            headers['x-api-key'] = token;
+            headers.authorization = `Bearer ${token}`;
+        }
         const resp = await fetch(`${upstreamBase}${path}`, {
             method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-                'x-api-key': UPSTREAM_ANTHROPIC.token,
-                authorization: `Bearer ${UPSTREAM_ANTHROPIC.token}`,
-            },
+            headers,
             body: JSON.stringify(body),
         });
         res.status(resp.status);
@@ -2525,7 +2535,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     try {
         const { messages, tools, model, stream } = req.body || {};
         if (!isWebchatModel(req.body)) {
-            return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', req.body);
+            return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', req.body, { token: UPSTREAM_OPENAI.token });
         }
         await applyModelSelection(req.body);
         if (stream) console.log('⚠️  stream requested — responding non-streamed');
@@ -2743,7 +2753,7 @@ app.post('/v1/messages', async (req, res) => {
             );
         }
         if (!isWebchatModel(routedBody)) {
-            return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
+            return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody, { token: UPSTREAM_ANTHROPIC.token });
         }
         await applyModelSelection(routedBody);
 
