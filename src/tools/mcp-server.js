@@ -89,11 +89,43 @@ const settingsMod = safeRequire('../../cli/settings');
 const launchMod = safeRequire('../../cli/launchconfig');
 const daemonMod = safeRequire('../../cli/daemon');
 
+// Which webchat an agent means when it does not name one.
+//
+// The registry's `active` is a UI preference the user set once, and it goes stale: measured
+// live, `active` was "gemini" while gemini was SIGNED OUT and `launch.json` pointed at
+// deepseek. An agent that omits the gate then drives a lane that cannot answer, and the
+// failure reads as the harness being broken rather than the default being wrong.
+//
+// So the recorded preference is honoured only while it is actually usable. Order:
+//   named gate → the recorded active gate IF live → the launch config's gate IF live →
+//   any live gate → the recorded active anyway (so a cold box still resolves to something).
+//
+// The live check is async, so this returns a gate and the caller verifies; `pickGate` below
+// is the async form used where a probe is affordable.
 function activeGate(id) {
     if (!gatesMod) return null;
     const { gates, active } = gatesMod.read();
     if (id) return gates.find((g) => g.id === id) || null;
     return gates.find((g) => g.id === active) || gates[0] || null;
+}
+
+// The same choice, but preferring a gate that is genuinely usable right now.
+async function pickGate(id) {
+    if (!gatesMod) return null;
+    const { gates, active } = gatesMod.read();
+    if (id) return gates.find((g) => g.id === id) || null;
+    const recorded = gates.find((g) => g.id === active) || null;
+    const launch = (launchMod && launchMod.read().gates) || [];
+    const preferred = [
+        recorded,
+        ...launch.map((id2) => gates.find((g) => g.id === id2)).filter(Boolean),
+        ...gates,
+    ].filter(Boolean);
+    for (const g of preferred) {
+        const c = await liveConnection(g);
+        if (c.connected) return g;
+    }
+    return recorded || gates[0] || null;
 }
 
 // Is this webchat USABLE right now, by evidence rather than by memory?
@@ -150,7 +182,16 @@ const TOOLS = [
         async (a) => {
             if (!gatesMod) return asError('gates module unavailable');
             const { gates, active } = gatesMod.read();
-            const out = { activeGate: active, launch: launchMod ? launchMod.read() : null, gates: [] };
+            // The gate the gateway numbers are attached to. NOT `active || gates[0]`: the
+            // recorded active gate goes stale (measured: active=gemini while gemini was
+            // signed out), so the one row carrying live numbers described a dead lane.
+            const defaultGate = await pickGate(a.gate);
+            const out = {
+                activeGate: active,
+                defaultGate: defaultGate ? defaultGate.id : null,
+                launch: launchMod ? launchMod.read() : null,
+                gates: [],
+            };
             for (const g of gates) {
                 const probe = await gatesMod.probe(g);
                 // Verified live, not the stored flag: an agent acts on what it reads here,
@@ -162,9 +203,10 @@ const TOOLS = [
                 };
                 if (!conn.connected && conn.why) row.notConnectedWhy = conn.why;
                 if (!conn.verified) row.connectedNote = 'could not verify — showing the recorded flag';
-                if (a.gate ? g.id === a.gate : g.id === (active || (gates[0] || {}).id)) {
+                if (defaultGate && g.id === defaultGate.id) {
                     const h = await httpJson('GET', gatewayBase(g) + '/metrics', null, 4000);
                     row.gateway = h.ok && h.body ? h.body : { reachable: false, error: h.error || 'HTTP ' + h.status };
+                    row.default = true;
                 }
                 out.gates.push(row);
             }
@@ -213,7 +255,7 @@ const TOOLS = [
         null,
         async (a) => {
             if (!gatesMod || !daemonMod) return asError('modules unavailable');
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             if (!gate) return asError('no such webchat — call webchat_gate_add first');
             const res = daemonMod.launchBrowser({ cdpPort: gate.cdpPort, profile: gate.profile, url: gate.url || 'about:blank' });
             if (!res || res.error) return asError({ launched: false, error: (res && res.error) || 'launch failed' });
@@ -231,7 +273,7 @@ const TOOLS = [
         null,
         async (a) => {
             if (!gatesMod) return asError('gates module unavailable');
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             if (!gate) return asError('no such webchat');
             const probe = await gatesMod.probe(gate);
             gatesMod.update(gate.id, { connected: true, liveTabUrl: probe.liveTabUrl || null, connectedAt: new Date().toISOString() });
@@ -327,7 +369,7 @@ const TOOLS = [
         },
         ['prompt'],
         async (a) => {
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             if (!gate) return asError('no webchat available — call webchat_gate_add then webchat_gate_launch');
             const res = await httpJson('POST', gatewayBase(gate) + '/v1/chat/completions', {
                 model: a.model || 'webchat/' + gate.id,
@@ -346,7 +388,7 @@ const TOOLS = [
         { gate: S('Webchat id.') },
         null,
         async (a) => {
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             if (!gate) return asError('no webchat available');
             const res = await httpJson('POST', gatewayBase(gate) + '/newchat', {}, 180000);
             if (!res.ok) return asError('gateway unreachable: ' + res.error);
@@ -359,7 +401,7 @@ const TOOLS = [
         { content: S('What the new thread should start with.'), gate: S('Webchat id.') },
         ['content'],
         async (a) => {
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             if (!gate) return asError('no webchat available');
             const res = await httpJson('POST', gatewayBase(gate) + '/handoff', { content: String(a.content) }, 300000);
             if (!res.ok) return asError('gateway unreachable: ' + res.error);
@@ -417,7 +459,7 @@ const TOOLS = [
             if (!harnessesMod || !daemonMod) return asError('modules unavailable');
             const h = harnessesMod.harnessById(a.harness);
             if (!h) return asError('unknown harness "' + a.harness + '" — known: ' + harnessesMod.HARNESSES.map((x) => x.id).join(', '));
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             if (!gate) return asError('no webchat available');
             const mode = a.mode || 'auto';
             if (!harnessesMod.MODES[mode]) return asError('unknown mode "' + mode + '"');
@@ -611,7 +653,7 @@ const TOOLS = [
         async (a) => {
             const { spawnSync } = require('child_process');
             const script = require('path').join(REPO, 'scripts', 'show-window.sh');
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             const env = Object.assign({}, process.env);
             if (gate && gate.cdpPort) env.CDP_PORT = String(gate.cdpPort);
             const r = spawnSync('bash', [script, a.action], { env, encoding: 'utf-8', timeout: 20000 });
@@ -638,7 +680,7 @@ const TOOLS = [
         },
         ['prompt'],
         async (a) => {
-            const gate = activeGate(a.gate);
+            const gate = await pickGate(a.gate);
             if (!gate) return asError('no webchat available — call webchat_gate_add then webchat_gate_launch');
             const sub = safeRequire('../runtime/subagents');
             if (!sub) return asError('subagent runtime unavailable');
