@@ -143,10 +143,38 @@ async function probeGateway(host, port) {
 }
 
 // ── the gateway (server.js) ────────────────────────────────────────────────
+
+// Is this pid actually OUR gateway, or just a live process wearing the number?
+//
+// `isAlive(pid)` answers "may I signal this pid?", which stays true after our gateway dies
+// and the OS reuses the number for something unrelated. Trusting it alone makes the CLI
+// report a running gateway that is not there — the same lie, in the same file, as
+// `connected` outliving its browser.
+//
+// The cmdline is the cheap proof: the gateway is always node running server.js. A pid with
+// no readable /proc entry (permissions, or a race with the process exiting) is treated as
+// NOT ours, so the caller clears the stale file and starts a real one. Failing that way is
+// safe — the cost is one wasted start — whereas failing the other way is a false "up".
+function pidLooksLikeGateway(pid) {
+    if (!pid) return false;
+    try {
+        // argv, not a substring. `cmd.includes('server.js')` also matches our own MCP
+        // process (`.../src/tools/mcp-server.js`) — "mcp-server.js" CONTAINS "server.js" —
+        // so an MCP pid would have been accepted as a running gateway. Match the argument.
+        const argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+        return argv.some((a) => a === 'server.js' || a.endsWith('/server.js'));
+    } catch {
+        return false;
+    }
+}
+
 function gatewayRunning(port) {
     const key = gatewayKey(port);
     const pid = readPid(key);
     if (!isAlive(pid)) { if (pid) clearPid(key); return null; }
+    // Alive but not ours: a reused pid. Clear it rather than report a gateway that is not
+    // running — the caller then starts one, which is what "not running" should do.
+    if (!pidLooksLikeGateway(pid)) { clearPid(key); return null; }
     return pid;
 }
 
