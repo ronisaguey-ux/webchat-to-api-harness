@@ -96,6 +96,28 @@ function activeGate(id) {
     return gates.find((g) => g.id === active) || gates[0] || null;
 }
 
+// Is this webchat USABLE right now, by evidence rather than by memory?
+//
+// `g.connected` is a flag written when the user confirms a tab, and nothing clears it — so
+// reporting it raw tells an agent "connected" for a browser that was closed hours ago. The
+// CLI's dashboard was fixed to probe for exactly this reason; an agent driving the harness
+// deserves the same answer, and worse, it acts on what it reads.
+//
+// gatesMod.live() is the same rule the CLI uses: the browser answers, a tab exists, it has
+// a composer, and the page carries no sign-in copy. Falls back to the stored flag only if
+// the module cannot perform the check at all, and says which of the two it is.
+async function liveConnection(g) {
+    if (!g || !gatesMod || typeof gatesMod.liveCached !== 'function') {
+        return { connected: Boolean(g && g.connected), verified: false };
+    }
+    try {
+        const state = await gatesMod.liveCached(g, 30000);
+        return { connected: Boolean(state.live), verified: true, why: state.live ? null : state.why };
+    } catch (e) {
+        return { connected: Boolean(g.connected), verified: false, why: (e && e.message) || 'check failed' };
+    }
+}
+
 function gatewayBase(gate) {
     const port = (gate && gate.gatewayPort) || parseInt(process.env.PORT || '8081', 10);
     return 'http://127.0.0.1:' + port;
@@ -131,10 +153,15 @@ const TOOLS = [
             const out = { activeGate: active, launch: launchMod ? launchMod.read() : null, gates: [] };
             for (const g of gates) {
                 const probe = await gatesMod.probe(g);
+                // Verified live, not the stored flag: an agent acts on what it reads here,
+                // and the stored flag outlives the browser it describes.
+                const conn = await liveConnection(g);
                 const row = {
                     id: g.id, label: g.label, site: g.site, url: g.url,
-                    connected: g.connected, browserRunning: probe.running, tabs: probe.tabs,
+                    connected: conn.connected, browserRunning: probe.running, tabs: probe.tabs,
                 };
+                if (!conn.connected && conn.why) row.notConnectedWhy = conn.why;
+                if (!conn.verified) row.connectedNote = 'could not verify — showing the recorded flag';
                 if (a.gate ? g.id === a.gate : g.id === (active || (gates[0] || {}).id)) {
                     const h = await httpJson('GET', gatewayBase(g) + '/metrics', null, 4000);
                     row.gateway = h.ok && h.body ? h.body : { reachable: false, error: h.error || 'HTTP ' + h.status };
@@ -468,12 +495,18 @@ const TOOLS = [
                 for (const g of gates) {
                     const probe = await gatesMod.probe(g);
                     const gw = await httpJson('GET', gatewayBase(g) + '/health', null, 3000);
+                    const conn = await liveConnection(g);
                     const row = {
-                        id: g.id, connected: g.connected, browserRunning: probe.running,
+                        id: g.id, connected: conn.connected, browserRunning: probe.running,
                         gatewayReachable: gw.ok, gatewayHealthy: Boolean(gw.body && gw.body.browserAlive),
                     };
-                    if (!probe.running && g.connected) {
-                        row.problem = 'marked connected but the browser is not running';
+                    if (!conn.connected && conn.why) row.notConnectedWhy = conn.why;
+                    if (!conn.verified) row.connectedNote = 'could not verify — showing the recorded flag';
+                    // Keep reporting a stored flag that contradicts reality: it is a state the
+                    // user should know about, not something to hide now that we probe instead.
+                    if (g.connected && !conn.connected) {
+                        row.problem = 'marked connected but not usable right now'
+                            + (conn.why ? ` (${conn.why})` : '');
                         out.problems.push(g.id + ': ' + row.problem);
                     }
                     out.gates.push(row);
