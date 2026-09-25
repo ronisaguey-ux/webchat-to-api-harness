@@ -291,7 +291,20 @@ function build(ctx) {
         // Keep the old single-connection file in step: other tooling reads it, and a
         // half-truth there (connected to a gate that no longer exists) is worse than
         // no file at all.
-        D.writeConnection({ gate: gate.id, mode: gate.site, cdpPort: gate.cdpPort, gatewayPort: gate.gatewayPort });
+        //
+        // CANONICAL SHAPE. This used to write `{gate: <id>, ...}` (singular), while
+        // `webchat start` writes `{gates: [{id, ...}]}` — so a reader expecting the array
+        // saw "nothing connected" after a connect that had really happened. One shape, one
+        // meaning: `gates` is always the array.
+        const prevConn = D.readConnection() || {};
+        D.writeConnection({
+            gates: [{ id: gate.id, gatewayPort: gate.gatewayPort, cdpPort: gate.cdpPort }],
+            mode: gate.site,
+            agent: prevConn.agent || null,
+            cdpWsUrl: prevConn.cdpWsUrl || null,
+            targetUrl: prevConn.targetUrl || null,
+            connectedAt: new Date().toISOString(),
+        });
 
         await panel('Connected', [
             `${A.green('✓')} ${A.bold(gate.label)} is now a webchat the CLI can use.`,
