@@ -333,8 +333,8 @@ const TOOLS = [
             gates: { type: 'array', description: 'Which webchats to use. Defaults to every reachable one.', items: { type: 'string' } },
             concurrency: N('How many tasks in flight at once. Defaults to the number of lanes.'),
             timeoutMs: N('Per task, default 300000. Budget generously: a webchat injects a ' +
-                         'DELIBERATE pause before EVERY send (SEND_GAP_MAX_MS — 15s by default, ' +
-                         'so budget ~30s per prompt on one lane, raisable in the CLI settings). ' +
+                         'DELIBERATE pause before EVERY send (SEND_GAP_MAX_MS — 6s by default, ' +
+                         'so budget ~15s per prompt on one lane, raisable in the CLI settings). ' +
                          'A caller whose own request budget ' +
                          'is shorter than the swarm takes sees "Request timed out" over work that ' +
                          'is still in flight — verified: the same call returns ok=2 in 236s when ' +

@@ -310,7 +310,7 @@ const SCHEMA = [
                 help: 'Shortest random wait before a deepseek send. Every send pays this, and one agent turn makes several. 0 disables the random gap.',
             },
             {
-                path: 'webchat.sendGapMaxMs', label: 'Send gap maximum (ms)', type: 'number', env: 'SEND_GAP_MAX_MS', envOnly: true, default: 15000,
+                path: 'webchat.sendGapMaxMs', label: 'Send gap maximum (ms)', type: 'number', env: 'SEND_GAP_MAX_MS', envOnly: true, default: 6000,
                 help: 'Longest random wait before a deepseek send. The wait is picked fresh in [min, max] each time so the cadence never repeats.',
             },
         ],
