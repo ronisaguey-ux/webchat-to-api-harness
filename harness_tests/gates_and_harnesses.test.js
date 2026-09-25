@@ -241,20 +241,24 @@ test('opencode is never given --yolo, which it does not have', () => {
 
 test('the permission modes are observably different for opencode', () => {
     // opencode has ONE permission flag, so the manual/auto distinction has to be in
-    // the config file — otherwise two of three modes launch an identical agent.
+    // the config file - otherwise two of three modes launch an identical agent.
     //
     // The definition is about WHEN it asks, per the owner:
     //   manual = asks for EVERY tool call, so the wildcard is 'ask'
-    //   auto   = asks only for RISKY calls, so reads pass ('*': allow) while
-    //            edit/write/bash/webfetch still ask
-    //   yolo   = never asks, so everything is allow
+    //   auto   = proceeds by itself, asking only for RISKY commands. It must NOT ask
+    //            on edit/write - that made it manual with extra steps and stopped the
+    //            user on every file change, which is what the owner corrected.
+    //   yolo   = never asks
     const manual = H.OPENCODE_PERMISSION.manual;
     const auto = H.OPENCODE_PERMISSION.auto;
     const yolo = H.OPENCODE_PERMISSION.yolo;
     assert.notDeepStrictEqual(manual, auto, 'manual and auto must not be the same');
+    assert.notDeepStrictEqual(auto, yolo, 'auto and yolo must not be the same');
     assert.strictEqual(manual['*'], 'ask', 'manual asks for every tool call');
-    assert.strictEqual(auto['*'], 'allow', 'auto lets ordinary (read) calls through');
-    assert.strictEqual(auto.edit, 'ask', 'auto still asks before a risky write');
+    assert.strictEqual(auto['*'], 'allow', 'auto lets ordinary calls through');
+    assert.notStrictEqual(auto.edit, 'ask', 'editing a file is not the risky act');
+    assert.strictEqual(auto.bash['*'], 'allow', 'an ordinary command is allowed');
+    assert.strictEqual(auto.bash['rm -rf*'], 'ask', 'but a destructive one asks');
     assert.strictEqual(yolo['*'], 'allow', 'yolo never asks');
 });
 
