@@ -1,4 +1,7 @@
 'use strict';
+
+// One-shot guard so a repeatedly-failing menu tick warns instead of flooding stderr.
+let ansiWarnedTick = false;
 //
 // ansi.js — a zero-dependency terminal UI toolkit.
 //
@@ -576,8 +579,19 @@ const PENDING_KEYS = [];
               head = typeof above === 'function' ? (above() || []) : (above || []);
           } catch { head = []; }
           if (onTick) {
-              try { head = head.concat(onTick() || []); } catch { /* a broken tick must not kill the menu */ }
-          }
+              // A tick that throws must not kill the menu — but it must not be SILENT either.
+              // This swallowed an error for the dashboard's whole status panel: cdpAlive has no
+              // `pages`, the render read it, and the only symptom was a panel that never appeared.
+              // A control that renders nothing looks identical to a control with nothing to say.
+              // Warn once per session so a broken panel is visible without flooding the screen.
+              try { head = head.concat(onTick() || []); }
+              catch (e) {
+                  if (!ansiWarnedTick) {
+                      ansiWarnedTick = true;
+                      try { process.stderr.write('webchat: a screen update failed and was skipped: ' + (e && e.message) + '\n'); } catch { /* stderr gone */ }
+                  }
+              }
+            }
           if (head.length) { for (const l of head) line(l); newline(); }
           for (const l of boxLines(title ? '' : '', body, { width })) line(l);
           if (footer) { newline(); for (const f of [].concat(footer)) line(gray(`  ${f}`)); }

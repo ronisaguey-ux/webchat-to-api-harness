@@ -10,7 +10,10 @@
     "start": "node server.js",
     "check": "node --check server.js && node --check src/browser/browser.js && node --check src/tools/tools.js && node --check src/core/config.js && node --check src/runtime/rate_limit.js",
     "test": "node --test --test-concurrency=1 harness_tests/*.test.js",
-    "webchat": "node bin/webchat.js"
+    "webchat": "node bin/webchat.js",
+    "test:unit": "node --test --test-concurrency=1 harness_tests/*.test.js",
+    "test:tui": "node harness_tests/cli_smoke.js",
+    "test:all": "npm run test && npm run test:tui"
   },
   "dependencies": {
     "express": "^4.18.2",

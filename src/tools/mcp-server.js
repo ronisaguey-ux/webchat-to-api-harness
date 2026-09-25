@@ -787,6 +787,27 @@ async function handle(msg) {
     }
 }
 
+// ★ THIS MERGE MUST PRECEDE THE `--list` BLOCK BELOW, and it did not before.
+// `--list` is the documented way to see the surface, and it exits immediately — so with the
+// merge further down the file it printed "26 tools" while the running server answered
+// tools/list with 43. The CLI's Agent access screen requires this module (43) and `--list`
+// is run directly (26), so the two disagreed about the same fact, and the one a user reads to
+// decide what the server can do was the wrong one.
+// The operational half of the surface (lifecycle, logs, health, memory, sandbox, swarm,
+// the local decision model). Kept in its own file so this one stays readable; merged here
+// so a client sees ONE tool list.
+const EXTRA = (() => {
+    try { return require('./mcp-tools-extra').TOOLS || []; } catch (e) {
+        // A failure here must not take the whole server down, or the client cannot even be
+        // told what is missing — but it must be visible, not silent.
+        process.stderr.write('mcp-server: extra tools failed to load: ' + (e && e.message) + '\n');
+        return [];
+    }
+})();
+for (const t of EXTRA) {
+    if (!TOOLS.some((x) => x.name === t.name)) TOOLS.push(t);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
@@ -824,19 +845,5 @@ if (require.main === module) {
     process.stdin.on('end', () => process.exit(0));
 }
 
-// The operational half of the surface (lifecycle, logs, health, memory, sandbox, swarm,
-// the local decision model). Kept in its own file so this one stays readable; merged here
-// so a client sees ONE tool list.
-const EXTRA = (() => {
-    try { return require('./mcp-tools-extra').TOOLS || []; } catch (e) {
-        // A failure here must not take the whole server down, or the client cannot even be
-        // told what is missing — but it must be visible, not silent.
-        process.stderr.write('mcp-server: extra tools failed to load: ' + (e && e.message) + '\n');
-        return [];
-    }
-})();
-for (const t of EXTRA) {
-    if (!TOOLS.some((x) => x.name === t.name)) TOOLS.push(t);
-}
 
 module.exports = { TOOLS, handle };
