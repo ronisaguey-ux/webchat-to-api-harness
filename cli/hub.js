@@ -47,22 +47,50 @@ function targetFor(modelId, gates, models) {
     return { url: `http://127.0.0.1:${gate.gatewayPort}`, site };
 }
 
+// ★ A relay needs a CONNECT timeout and a response timeout, and it had neither.
+// getJson() directly below sets one, so the omission was an oversight rather than a
+// decision. Without it a gateway that accepts the socket and then never answers holds the
+// hub's request open forever: the caller sees a hang with no error, cannot tell it from a
+// slow model, and has no way to recover. The harness's own send gate sleeps 20-80s before
+// each send, so the response budget has to clear that — hence 180s, not 30s.
+const RELAY_CONNECT_MS = Number(process.env.HUB_RELAY_CONNECT_MS || 10000);
+const RELAY_RESPONSE_MS = Number(process.env.HUB_RELAY_RESPONSE_MS || 180000);
+
 function relay(target, reqPath, body, cb) {
     const url = new URL(reqPath, target.url);
     const payload = body == null ? null : Buffer.from(
         typeof body === 'string' ? body : JSON.stringify(body)
     );
+    let settled = false;
+    const done = (err, res) => {
+        if (settled) return;
+        settled = true;
+        cb(err, res);
+    };
     const req = http.request({
         hostname: url.hostname,
         port: url.port,
         path: url.pathname + url.search,
         method: 'POST',
+        // Time to establish the connection.
+        timeout: RELAY_CONNECT_MS,
         headers: {
             'content-type': 'application/json',
             ...(payload ? { 'content-length': payload.length } : {}),
         },
-    }, (res) => cb(null, res));
-    req.on('error', (e) => cb(e));
+    }, (res) => {
+        // Headers arrived, so the connect timeout no longer applies; the response body may
+        // legitimately take minutes. Guard only against a stalled stream.
+        res.setTimeout(RELAY_RESPONSE_MS, () => {
+            res.destroy(new Error(`no data for ${RELAY_RESPONSE_MS}ms`));
+        });
+        done(null, res);
+    });
+    req.on('timeout', () => {
+        // The socket-level timeout fires when the connection itself stalls.
+        req.destroy(new Error(`gateway did not answer within ${RELAY_CONNECT_MS}ms`));
+    });
+    req.on('error', (e) => done(e));
     if (payload) req.write(payload);
     req.end();
 }
