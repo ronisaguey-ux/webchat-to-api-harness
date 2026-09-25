@@ -566,9 +566,25 @@ async function cdpTargets(port) {
     }
 }
 
+// Same trap as the gateway pid: isAlive() only answers "may I signal this pid?". A reused pid
+// therefore read as a running browser, so the CLI reported a window that was not there and
+// launchBrowser() would refuse to start a real one. Prove it by argv — a browser we started
+// carries --remote-debugging-port, and the configured profile dir when one was given.
+function pidLooksLikeBrowser(pid) {
+    if (!pid) return false;
+    try {
+        const argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+        if (!/chrome|chromium/i.test(argv)) return false;
+        return argv.includes('--remote-debugging-port');
+    } catch {
+        return false;   // unreadable means NOT ours; one wasted start beats a false "running"
+    }
+}
+
 function browserRunning() {
     const pid = readPid('browser');
     if (!isAlive(pid)) { if (pid) clearPid('browser'); return null; }
+    if (!pidLooksLikeBrowser(pid)) { clearPid('browser'); return null; }
     return pid;
 }
 
@@ -801,6 +817,7 @@ module.exports = {
     freePort, isPortFree, freePortPair, distinctPair,
     startHub, stopHub, hubRunning, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
+    pidLooksLikeBrowser, pidLooksLikeGateway,
     tailLines,
     copyToClipboard, restoreForExec,
     launchInTerminal, whichTerminal,
