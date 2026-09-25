@@ -689,6 +689,15 @@ function isWebchatModel(body) {
     // — Codex rejects provider/model syntax it does not know). All three route to
     // the tab.
     if (m === config.modelName || m === 'anymodel' || m === 'webchat') return true;
+    // 09-24: a harness names the model the way ITS provider layer dictates, and the
+    // request body carries that name — not ours. opencode resolves its config entry
+    // `provider: webchat, models: { deepseek }` to the id `webchat/deepseek` for display
+    // but SENDS `deepseek`, so every request missed this match and was proxied to the
+    // real upstream, answering "Authentication Fails (auth header format should be
+    // Bearer sk-...)". This gateway serves exactly ONE webchat, so its own name's last
+    // segment is an unambiguous alias for it.
+    const bare = String(config.modelName || '').split('/').filter(Boolean).pop();
+    if (bare && m === bare) return true;
     // 09-24: every toggle COMBINATION is published as its own model id, so picking a
     // model is how an agent changes the webchat's own configuration. See
     // webchat-models.js — webchat/deepseek/deepthink+search and friends.
