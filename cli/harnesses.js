@@ -218,16 +218,47 @@ function reachability(h, gates, hubPort) {
 // opencode expresses permissions in its config file, not on the command line — its
 // only CLI flag is --auto. So the permission MODE has to be written here, or two of
 // the three modes would launch the same agent.
+// The commands `auto` stops for. Everything else runs. The point of the mode is that a
+// normal working session - reading, editing, running tests - never interrupts the user,
+// and only something genuinely destructive or irreversible asks first.
+//
+// This is the same doctrine as the sandbox's own danger list (src/core/platform.js):
+// losing work, escalating privilege, rewriting history, or shipping a secret off the box.
+const RISKY_BASH = [
+    // destroying a filesystem
+    'rm -rf*', 'rm -fr*', 'rm -r *', 'rm -f *', 'dd *', 'mkfs*', 'shred*', '> /dev/sd*',
+    // privilege and machine state
+    'sudo *', 'su *', 'systemctl *', 'service *', 'shutdown*', 'reboot*', 'pkill *', 'kill -9 *',
+    // history rewriting: irreversible once pushed
+    'git push --force*', 'git push -f*', 'git reset --hard*', 'git clean*',
+    // taking permissions away (or handing them out) recursively
+    'chmod -R*', 'chown -R*',
+    // piping the internet straight into a shell
+    'curl *| sh*', 'curl *| bash*', 'wget *| sh*', 'wget *| bash*',
+    // databases and containers
+    'drop database*', 'drop table*', 'docker rm*', 'docker rmi*', 'docker volume rm*',
+    'docker system prune*',
+    // a secret leaving this machine
+    '*ghp_*', '*TELEGRAM_TOKEN*', '*BOT_TOKEN*', '*API_KEY*',
+    // and the same shapes on Windows
+    'format *', 'del /f /s /q*', 'rd /s /q*', 'rmdir /s /q*', 'Remove-Item -Recurse -Force*',
+];
+
 const OPENCODE_PERMISSION = {
-    // Bob's semantics: manual asks for EVERY tool call, auto asks only for the
-    // risky ones, yolo never asks. opencode's `permission` block takes
-    // allow | ask | deny per tool, so the mode is expressed here rather than on the
-    // command line (its only CLI flag is --auto, which is all-or-nothing).
+    // Bob's semantics: manual asks for EVERY tool call, auto proceeds by itself and asks
+    // only for the risky ones, yolo never asks.
     //
-    // `edit: 'ask'` on manual and `edit: 'allow'` on auto are load-bearing: without
-    // that difference two of the three modes launch an identical agent.
+    // `auto` used to ask on edit, write, bash AND webfetch - which is most of what an
+    // agent does, so it behaved like "manual with extra steps" and stopped the user on
+    // every file change. The majority is allowed now and only RISKY_BASH interrupts.
+    // `manual` still asks for everything, so the three modes stay distinct.
     manual: { '*': 'ask', edit: 'ask', bash: 'ask' },
-    auto: { '*': 'allow', edit: 'ask', write: 'ask', bash: 'ask', webfetch: 'ask' },
+    auto: {
+        '*': 'allow',
+        // Last matching rule wins, so the catch-all goes first and the dangerous
+        // commands after it.
+        bash: Object.fromEntries([['*', 'allow'], ...RISKY_BASH.map((pat) => [pat, 'ask'])]),
+    },
     yolo: { '*': 'allow' },
 };
 
@@ -311,6 +342,7 @@ function firstInstalled(preferred = ['opencode', 'claude']) {
 
 module.exports = {
     firstInstalled,
+    RISKY_BASH,
     MODES,
     HARNESSES,
     harnessById,

@@ -85,3 +85,28 @@ test('connect fills in what the machine already knows, instead of asking the use
     const none = LC.autofill({ gates: [], harnesses: [] }, [], () => null);
     assert.deepStrictEqual(none.filled, {});
 });
+
+test('auto proceeds by itself and stops only for the risky commands', () => {
+    // `auto` asked on edit, write, bash AND webfetch, which is most of what an agent
+    // does - so it behaved like manual with extra steps and stopped the user on every
+    // file change. The majority is allowed; only genuinely destructive, irreversible or
+    // secret-leaking commands interrupt.
+    const P = H.OPENCODE_PERMISSION;
+    assert.strictEqual(P.auto['*'], 'allow', 'ordinary tools run without asking');
+    assert.notStrictEqual(P.auto.edit, 'ask', 'editing a file is not a risky act');
+    assert.notStrictEqual(P.auto.write, 'ask', 'writing a file is not a risky act');
+    assert.strictEqual(P.auto.bash['*'], 'allow', 'an ordinary command runs without asking');
+
+    // Last matching rule wins, so every risky pattern must come after the catch-all.
+    const keys = Object.keys(P.auto.bash);
+    assert.strictEqual(keys[0], '*', 'the catch-all must be first or it would shadow the rules');
+    for (const pat of ['rm -rf*', 'sudo *', 'git push --force*', 'git reset --hard*', '*ghp_*']) {
+        assert.strictEqual(P.auto.bash[pat], 'ask', `${pat} must ask`);
+    }
+
+    // The three modes must stay three modes, not two spellings of the same thing.
+    assert.strictEqual(P.manual['*'], 'ask', 'manual asks for everything');
+    assert.deepStrictEqual(P.yolo, { '*': 'allow' }, 'yolo never asks');
+    assert.notDeepStrictEqual(P.auto, P.yolo);
+    assert.notDeepStrictEqual(P.auto, P.manual);
+});
