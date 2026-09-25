@@ -683,6 +683,27 @@ const UPSTREAM_OPENAI = {
     token: process.env.UPSTREAM_ANTHROPIC_AUTH_TOKEN || '',
 };
 
+// The paid upstream is FLASH-ONLY (owner rule, after a pro-model burn). Any other
+// model name reaching the paid proxy is refused before a request is made, so a
+// caller's typo or a "best model" default can never spend on a pricier tier.
+const UPSTREAM_ALLOWED_MODELS = new Set(
+    String(process.env.UPSTREAM_ALLOWED_MODELS || 'deepseek-v4-flash')
+        .split(',').map((m) => m.trim()).filter(Boolean)
+);
+function refuseUnlistedUpstreamModel(body, res) {
+    const m = body && typeof body.model === 'string' ? body.model : '';
+    if (UPSTREAM_ALLOWED_MODELS.has(m)) return false;
+    console.log(`⛔ paid-upstream model "${m}" refused (allowed: ${[...UPSTREAM_ALLOWED_MODELS].join(', ')})`);
+    res.status(403).json({
+        type: 'error',
+        error: {
+            type: 'permission_error',
+            message: `model "${m}" is not allowed on the paid upstream (allowed: ${[...UPSTREAM_ALLOWED_MODELS].join(', ')})`,
+        },
+    });
+    return true;
+}
+
 function isWebchatModel(body) {
     const m = body && typeof body.model === 'string' ? body.model : config.modelName;
     // 09-22 A3: 'anymodel' and 'webchat' are the Codex-friendly aliases (no slash
@@ -2535,6 +2556,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     try {
         const { messages, tools, model, stream } = req.body || {};
         if (!isWebchatModel(req.body)) {
+            if (refuseUnlistedUpstreamModel(req.body, res)) return;
             return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', req.body, { token: UPSTREAM_OPENAI.token });
         }
         await applyModelSelection(req.body);
@@ -2753,6 +2775,7 @@ app.post('/v1/messages', async (req, res) => {
             );
         }
         if (!isWebchatModel(routedBody)) {
+            if (refuseUnlistedUpstreamModel(routedBody, res)) return;
             return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody, { token: UPSTREAM_ANTHROPIC.token });
         }
         await applyModelSelection(routedBody);

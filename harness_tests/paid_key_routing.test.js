@@ -77,3 +77,14 @@ test('the paid upstream itself still gets its key (flash)', async () => {
     assert.ok(hit, 'a non-webchat model proxies to the paid upstream');
     assert.strictEqual(hit.headers['x-api-key'], DUMMY_PAID_KEY);
 });
+
+// The paid upstream is flash-only: a pro (or any unlisted) model is refused
+// before a single byte reaches it — on both API shapes.
+for (const [route, shape] of [['/v1/messages', 'anthropic'], ['/v1/chat/completions', 'openai']]) {
+    test(`a non-flash model is refused before the paid upstream (${shape})`, async () => {
+        seen.length = 0;
+        const r = await post(route, { model: 'deepseek-v4-pro', max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] });
+        assert.strictEqual(r.status, 403);
+        assert.strictEqual(seen.length, 0, 'the paid upstream must not be contacted');
+    });
+}
