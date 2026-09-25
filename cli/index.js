@@ -2185,8 +2185,11 @@ async function interactive() {
         },
     ];
 
-    let at = OPENING.length;          // past the walk once it has been completed
-    if (!platformChosen()) at = 0;
+    // The walk runs EVERY launch. It used to be skipped once the platform had been
+    // answered, so `webchat` dropped straight onto the dashboard and the greeting - the
+    // thing the product opens with - was never seen again. The platform row shows the
+    // current choice, so a returning user is one Enter from the menu.
+    let at = 0;
     while (at < OPENING.length) {
         let step;
         try { step = await OPENING[at](); }

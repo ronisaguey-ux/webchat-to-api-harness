@@ -135,3 +135,46 @@ test('start is the command and connect still works as an alias', () => {
     assert.match(src, /async function cmdStart\(/, 'the implementation is named start');
     assert.ok(!/cmdConnect\b/.test(src), 'the old name is gone, not left dangling');
 });
+
+test('the Webchats list offers only live webchats, plus Add', async () => {
+    // It used to list a "Connect <site>" row per CONFIGURED gate, so a signed-out DeepSeek
+    // sat there as a to-do item for a webchat the user had not added - and the list read
+    // as a list of things that do not work. Only a live webchat is listed; otherwise the
+    // one action is adding one.
+    const A = require(path.join(REPO, 'cli', 'ansi.js'));
+    const G = require(path.join(REPO, 'cli', 'gates.js'));
+    const SG = require(path.join(REPO, 'cli', 'screens-gates.js'));
+
+    const real = { menu: A.menu, line: A.line, clear: A.clear, newline: A.newline, boxLines: A.boxLines, header: A.header, gray: A.gray };
+    let seen = null;
+    A.line = () => {}; A.clear = () => {}; A.newline = () => {};
+    A.boxLines = () => ['box']; A.header = () => {};
+    A.menu = async (items) => { seen = items; return A.BACK; };
+    const realRefresh = G.refresh;
+    G.refresh = async () => ({ gates: [{ id: 'deepseek', site: 'deepseek', label: 'DeepSeek webchat', connected: false }], active: null });
+    try {
+        // build() threads its helpers in explicitly (it has no require fallback for G),
+        // so a test has to hand it the real ones.
+        const ctx = {
+            A,
+            G,
+            D: require(path.join(REPO, 'cli', 'daemon.js')),
+            H: require(path.join(REPO, 'cli', 'harnesses.js')),
+            LC: require(path.join(REPO, 'cli', 'launchconfig.js')),
+            header: () => {},
+            shortHome: (s) => String(s),
+            panel: async () => {},
+        };
+        await SG.build(ctx).screenGates();
+    } finally {
+        Object.assign(A, real); G.refresh = realRefresh;
+    }
+
+    assert.ok(seen, 'the screen must render a menu');
+    const labels = seen.map((i) => i.label);
+    assert.ok(!labels.some((l) => /^Connect /.test(l)),
+        `no "Connect <site>" rows - got ${JSON.stringify(labels)}`);
+    assert.ok(labels.includes('Add a webchat'), 'adding one is the action');
+    assert.ok(!labels.some((l) => /Gemini|DeepSeek/.test(l)),
+        'a webchat that is not live must not be listed at all');
+});

@@ -63,20 +63,16 @@ function build(ctx) {
             const launch = LC.read();
             const picked = new Set(launch.gates || []);
             const ready = gates.filter((g) => g.connected);
-            const needsConnect = gates.filter((g) => !g.connected);
+            // ONLY the webchats that are live are listed. A configured-but-signed-out
+            // entry used to sit here as "Connect Gemini", which read as a to-do item for a
+            // webchat the user had not added, and turned the list into a list of things
+            // that do not work. A webchat appears here when it is signed in and answering.
 
             const items = ready.map((g) => ({
                 label: `${picked.has(g.id) ? '[x]' : '[ ]'} ${g.label}`,
                 hint: `connected · gateway :${g.gatewayPort || '—'}`,
                 value: `pick:${g.id}`,
             }));
-            for (const g of needsConnect) {
-                items.push({
-                    label: `Connect ${g.label}`,
-                    hint: 'opens the browser so you can log in',
-                    value: `conn:${g.id}`,
-                });
-            }
             items.push({
                 label: 'Add a webchat',
                 hint: 'pick a site (or Generic for any site), then log in',
@@ -87,13 +83,12 @@ function build(ctx) {
             }
             items.push({ label: 'Back', value: 'back' });
 
-            const total = ready.length + needsConnect.length;
             const choice = await A.menu(items, {
                 title: 'Webchats',
                 startIndex: menuStart,
                 footer: ready.length
                     ? ['Enter picks the webchats your agent may use — pick more than one if you like.']
-                    : ['Connect a webchat first: press Enter on it, log in, then confirm.'],
+                    : ['No webchat yet — Add a webchat opens a browser for you to log into.'],
             });
             if (choice === A.BACK || choice === 'back') return;
             if (choice === 'add') { await screenAddGate(); continue; }
@@ -149,14 +144,20 @@ function build(ctx) {
         // one webchat's model came back answered by a DIFFERENT webchat's browser.
         // Ports the OS says are free, so the user never has to know which numbers the
         // rest of the machine is using.
-        const { cdpPort, gatewayPort } = await G.freePortPair();
-
-        const gate = G.add({
-            site: site.id,
-            url: site.url,
-            cdpPort,
-            gatewayPort,
-        });
+        // Adding a site that is already saved REUSES its gate: same profile, same ports,
+        // same entry. A second gate for the same site would list the webchat twice and
+        // make the user sign in again for nothing.
+        const existing = G.read().gates.find((g) => g.site === site.id);
+        let gate = existing;
+        if (!gate) {
+            const { cdpPort, gatewayPort } = await G.freePortPair();
+            gate = G.add({
+                site: site.id,
+                url: site.url,
+                cdpPort,
+                gatewayPort,
+            });
+        }
 
         A.clear();
         header(['Webchats', `opening ${gate.label}`]);
@@ -165,7 +166,7 @@ function build(ctx) {
         A.line(`  ${A.gray('profile')} ${shortHome(gate.profile)}`);
         A.newline();
 
-        const res = D.launchBrowser({ cdpPort, profile: gate.profile, url: site.url || 'about:blank' });
+        const res = D.launchBrowser({ cdpPort: gate.cdpPort, profile: gate.profile, url: site.url || 'about:blank' });
         if (!res || res.error) {
             await panel('Could not open the browser', [
                 A.red(String((res && res.error) || 'launch failed')),
@@ -181,15 +182,12 @@ function build(ctx) {
                 ? `Log in and navigate to the site you want to drive.`
                 : `Sign into ${site.label} in that window.`,
             '',
-            A.yellow('The CLI cannot tell whether you are logged in.'),
-            A.dim(`A signed-out ${site.label} looks exactly like a signed-in one from`),
-            A.dim('here, so this is your call to make — which is why there is a Confirm step.'),
-            '',
-            A.dim(`When you are signed in, choose "${gate.label}" → Connect in the Webchats list.`),
-        ], 'Back to Webchats');
+            A.dim('Come back here when you are done and the CLI will read the tab.'),
+        ], 'Check the tab');
 
-        // Remember it as the working gate so the next screen has something to connect.
-        G.setActive(gate.id);
+        // Straight on to the check, so adding a webchat FINISHES the job. Leaving the user
+        // to hunt for a Connect row is how the list filled up with things that did not work.
+        await screenConnectGate(gate.id);
     }
 
     async function screenPickActive() {
