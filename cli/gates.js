@@ -138,27 +138,12 @@ function nextId(gates, siteId) {
 // that belonged to another stack and a model request came back answered by the wrong
 // browser. Asking the OS for a free port makes that impossible without the user
 // having to know or care which numbers are taken.
-const net = require('net');
-
-// Ask the OS for a port nobody holds. Binding to 0 and reading back the assigned
-// port is the only reliable test: a "is this number taken" check races anything that
-// binds between the check and the use.
-function freePort() {
-    return new Promise((resolve, reject) => {
-        const srv = net.createServer();
-        srv.unref();
-        srv.on('error', reject);
-        srv.listen(0, '127.0.0.1', () => {
-            const { port } = srv.address();
-            srv.close(() => resolve(port));
-        });
-    });
-}
-
-// A CDP port and a gateway port that nothing is listening on right now.
-async function freePortPair() {
-    return { cdpPort: await freePort(), gatewayPort: await freePort() };
-}
+// The port helpers live in daemon.js — this module requires that one, so the other
+// direction would be a cycle. Re-exported here so every existing G.freePortPair() caller
+// keeps working and there is still exactly one implementation.
+const freePort = (...a) => d.freePort(...a);
+const isPortFree = (...a) => d.isPortFree(...a);
+const freePortPair = (...a) => d.freePortPair(...a);
 
 function add({ site, label, url, cdpPort, gatewayPort, profile }) {
     const state = read();
@@ -328,6 +313,7 @@ async function liveGates(maxAgeMs = 30000) {
 module.exports = {
     freePort,
     freePortPair,
+    isPortFree,
     SITES,
     siteById,
     siteForUrl,

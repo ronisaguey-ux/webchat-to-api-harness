@@ -109,10 +109,21 @@ const TOOLS = [
             if (!gate) return asError('no webchat configured — use webchat_gate_add first');
             if (!daemonMod) return asError('daemon module unavailable');
             const wait = Math.min(Math.max(Number(a.waitMs) || 15000, 1000), 120000);
+            let res;
             try {
-                await daemonMod.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort, gate: gate.id });
+                res = await daemonMod.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort, gate: gate.id });
             } catch (e) {
                 return asError('could not start gateway for ' + gate.id + ': ' + (e && e.message));
+            }
+            if (res && res.started === false && res.reason !== 'already running') {
+                return asError('could not start gateway for ' + gate.id + ': ' + (res.reason || 'unknown'));
+            }
+            // startGateway renumbers when the stored port is held by something else. Follow
+            // it and PERSIST it, or the /health probe below would poll a port nothing serves
+            // and this tool would report started:true / answered:false for a live gateway.
+            if (res && res.port && res.port !== gate.gatewayPort) {
+                try { if (gatesMod) gatesMod.update(gate.id, { gatewayPort: res.port }); } catch { /* keep going on the new port */ }
+                gate.gatewayPort = res.port;
             }
             const deadline = Date.now() + wait;
             for (;;) {
@@ -152,8 +163,18 @@ const TOOLS = [
             if (!daemonMod) return asError('daemon module unavailable');
             try { await daemonMod.stopGateway(gate.gatewayPort); } catch { /* may not be running */ }
             await new Promise((r) => setTimeout(r, 2000));
-            try { await daemonMod.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort, gate: gate.id }); }
+            let res;
+            try { res = await daemonMod.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort, gate: gate.id }); }
             catch (e) { return asError('restart failed for ' + gate.id + ': ' + (e && e.message)); }
+            if (res && res.started === false && res.reason !== 'already running') {
+                return asError('restart failed for ' + gate.id + ': ' + (res.reason || 'unknown'));
+            }
+            // Follow a renumber, and persist it, so the health probe below polls the port
+            // the gateway actually bound instead of the one we asked for.
+            if (res && res.port && res.port !== gate.gatewayPort) {
+                try { if (gatesMod) gatesMod.update(gate.id, { gatewayPort: res.port }); } catch { /* keep going */ }
+                gate.gatewayPort = res.port;
+            }
             const deadline = Date.now() + 20000;
             for (;;) {
                 const h = await httpJson('GET', gatewayBase(gate) + '/health', null, 3000);

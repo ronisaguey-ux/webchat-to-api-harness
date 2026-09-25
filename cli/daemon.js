@@ -23,7 +23,65 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
+const net = require('net');
 const { spawn, execFileSync } = require('child_process');
+
+// ── ports ──────────────────────────────────────────────────────────────────
+//
+// These live here, not in gates.js, because gates.js already requires this module — the
+// other direction would be a cycle, and a lazy require to dodge one is the kind of thing
+// that works until someone imports in a different order. gates.js re-exports them so the
+// rest of the CLI keeps calling G.freePortPair().
+
+// Ask the OS for a port nobody holds. Binding to 0 and reading back the assigned port is
+// the only reliable test: a "is this number taken" check races anything that binds between
+// the check and the use.
+function freePort() {
+    return new Promise((resolve, reject) => {
+        const srv = net.createServer();
+        srv.unref();
+        srv.on('error', reject);
+        srv.listen(0, '127.0.0.1', () => {
+            const { port } = srv.address();
+            srv.close(() => resolve(port));
+        });
+    });
+}
+
+// Is THIS specific port bindable on loopback right now? `freePort()` answers "give me one
+// nobody holds"; this answers "is this one taken?", which is what a caller needs before
+// binding to a number it already has. The bind IS the test.
+function isPortFree(port) {
+    return new Promise((resolve) => {
+        const p = Number(port);
+        if (!Number.isInteger(p) || p < 1 || p > 65535) return resolve(false);
+        const srv = net.createServer();
+        srv.unref();
+        srv.once('error', () => resolve(false));
+        srv.listen(p, '127.0.0.1', () => srv.close(() => resolve(true)));
+    });
+}
+
+// Pick two DIFFERENT values from `next()`, retrying when they collide.
+//
+// The generator is a parameter so the retry is testable without waiting for a 1-in-200 OS
+// coincidence: a stub that returns a collision first proves the loop runs, which a
+// probabilistic test on real ports cannot do reliably.
+async function distinctPair(next = freePort) {
+    const a = await next();
+    let b = await next();
+    for (let i = 0; i < 10 && b === a; i++) b = await next();
+    return { a, b };
+}
+
+// A CDP port and a gateway port that nothing is listening on right now. The two halves
+// must DIFFER: as two sequential freePort() calls the OS could hand the second the port the
+// first had just released — measured at 1 in 200 pairs, and a gateway sharing a number with
+// its own browser's debug port is a start that cannot work.
+async function freePortPair() {
+    const { a, b } = await distinctPair(freePort);
+    return { cdpPort: a, gatewayPort: b };
+}
 
 const REPO = path.join(__dirname, '..');
 
@@ -185,17 +243,37 @@ function gatewayRunning(port) {
  * both are passed as environment rather than written to the config file: the config
  * is shared by every gate, so writing them would make the gates fight over one file
  * and the last writer would silently win for everybody.
+ *
+ * ASYNC, and it verifies the port before spawning. It used to spawn blind and return
+ * `{started:true}` no matter what: measured, with another process holding the port it
+ * still reported success while server.js could not bind — so the caller waited on a
+ * probe for a gateway that was never going to answer. A start that cannot bind is a
+ * failure, and saying so is cheaper than a timeout.
  */
-function startGateway(opts = {}) {
-    const port = Number(opts.port) || defaultGatewayPort();
-    const key = gatewayKey(port);
+async function startGateway(opts = {}) {
+    let port = Number(opts.port) || defaultGatewayPort();
     const existing = gatewayRunning(port);
-    if (existing) return { started: false, pid: existing, reason: 'already running' };
+    if (existing) return { started: false, pid: existing, reason: 'already running', port };
+
+    // Nothing of ours holds it — but something else might. `gatewayRunning` can only
+    // speak for our own pidfiles.
+    const wanted = port;
+    if (!(await isPortFree(port))) {
+        // Ask for a fresh one rather than failing: the caller passed a stored port, and a
+        // stale number is a reason to renumber, not to give up. The ACTUAL port comes back
+        // so the caller can persist it — otherwise the harness would be pointed at the old
+        // number and this fix would just move the failure.
+        const replacement = await freePort();
+        if (!replacement) {
+            return { started: false, reason: `port ${port} is in use by another process and no free port could be found`, port };
+        }
+        port = replacement;
+    }
 
     ensureStateDir();
-    const out = fs.openSync(logFile(key), 'a');
+    const out = fs.openSync(logFile(gatewayKey(port)), 'a');
     fs.writeSync(out, `\n─── gateway start ${new Date().toISOString()} (port ${port}) ───\n`);
-    const err = fs.openSync(logFile(`${key}.err`), 'a');
+    const err = fs.openSync(logFile(`${gatewayKey(port)}.err`), 'a');
 
     const child = spawn(process.execPath, ['server.js'], {
         cwd: REPO,
@@ -233,7 +311,11 @@ function startGateway(opts = {}) {
         },
     });
     child.unref();
-    writePid(key, child.pid);
+    // The key is derived from the FINAL port, after any renumber. Using the port we were
+    // asked for would file the pid under a name nothing looks up: `gatewayRunning` on the
+    // real port would find nothing (so a second start would spawn a duplicate) and
+    // `stopGateway` would miss it entirely, leaving an orphan holding the port.
+    writePid(gatewayKey(port), child.pid);
     fs.closeSync(out);
     fs.closeSync(err);
     return { started: true, pid: child.pid, port };
@@ -249,11 +331,20 @@ function hubRunning() {
     try { process.kill(pid, 0); return pid; } catch { return 0; }
 }
 
-function startHub(opts = {}) {
+// ASYNC for the same reason startGateway is: it verifies the port is free before spawning,
+// and renumbers if something else holds it. Spawning blind and returning started:true over
+// a port that cannot bind is the lie this whole file keeps having to unlearn.
+async function startHub(opts = {}) {
     const existing = hubRunning();
     if (existing) return { started: false, reason: 'already running', pid: existing };
-    const port = Number(opts.port);
+    let port = Number(opts.port);
     if (!port) return { started: false, reason: 'no port' };
+    const wanted = port;
+    if (!(await isPortFree(port))) {
+        const replacement = await freePort();
+        if (!replacement) return { started: false, reason: `port ${port} is in use and no free port could be found`, port };
+        port = replacement;
+    }
     ensureStateDir();
     const out = fs.openSync(path.join(stateDir(), `hub-${port}.log`), 'a');
     const child = spawn(process.execPath, [path.join(__dirname, 'hub-server.js')], {
@@ -691,6 +782,7 @@ module.exports = {
     readPid, isAlive, writePid, clearPid,
     httpGet, httpPost, probeGateway,
     gatewayRunning, startGateway, stopGateway, displayEnv,
+    freePort, isPortFree, freePortPair, distinctPair,
     startHub, stopHub, hubRunning, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     tailLines,

@@ -1023,27 +1023,37 @@ async function screenStart() {
 
     // The gateway first: it is what an IDE talks to, and it attaches to the
     // browser lazily on the first request.
+    // The port the gateway ACTUALLY ends up on. startGateway renumbers when the configured
+    // one is held by something else, and every probe below has to follow it.
+    let usePort = port;
     let gw = await D.probeGateway(host, port);
     if (gw.up) {
         A.line(`  ${A.green('✓')} gateway already up on ${host}:${port}`);
     } else {
         A.line(`  ${A.dim('gateway')}  starting…`);
-        const res = D.startGateway();
+        // awaited: startGateway verifies the port is free first and renumbers if it is
+        // taken, so the answer (and the port) only exists once that check has run.
+        const res = await D.startGateway();
         if (!res.started && res.reason !== 'already running') {
             A.newline();
             await A.message('Could not start the gateway', [A.red(res.reason || 'unknown error')]);
             return;
         }
+        // It may have moved off the requested port to avoid a squatter.
+        if (res.port && res.port !== port) {
+            A.line(`  ${A.yellow('·')} port ${port} was in use — started on ${res.port} instead`);
+            usePort = res.port;
+        }
         for (let i = 0; i < 24; i++) {
             await new Promise((r) => setTimeout(r, 500));
-            gw = await D.probeGateway(host, port);
+            gw = await D.probeGateway(host, usePort);
             if (gw.up) break;
             A.write('.');
         }
         A.newline();
         if (!gw.up) {
             await A.message('Gateway did not come up', [
-                `Nothing answered on ${host}:${port} after 12s.`,
+                `Nothing answered on ${host}:${usePort} after 12s.`,
                 '',
                 'Check the log (Logs on the main menu). Common causes:',
                 '  · the port is already used by something else',
@@ -1058,7 +1068,7 @@ async function screenStart() {
 
     A.newline();
     const body = [
-        `${A.dim('gateway')}   ${A.green(`up on http://${host}:${port}`)}`,
+        `${A.dim('gateway')}   ${A.green(`up on http://${host}:${usePort}`)}`,
         `${A.dim('browser')}   ${cdp.up ? A.green(`running on CDP :${cdpPort}`) : A.yellow('not running — the gateway will launch one on first use')}`,
         `${A.dim('webchat')}   ${rows.find((r) => r.setting.path === 'webchat.mode').value}`,
         `${A.dim('model id')}  ${rows.find((r) => r.setting.path === 'server.modelName').value}`,
@@ -1645,11 +1655,20 @@ async function cmdStart(argv) {
         } else {
             if (!gw.up) {
                 A.line(`  ${A.dim('…')} ${gate.label.padEnd(10)} gateway starting on :${gate.gatewayPort}`);
-                const res = D.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort, profile: gate.profile, mode: gate.site });
+                // awaited: it verifies the port is free and renumbers if something else
+                // holds it, so the port to probe is only known after this resolves.
+                const res = await D.startGateway({ port: gate.gatewayPort, cdpPort: gate.cdpPort, profile: gate.profile, mode: gate.site });
                 if (!res.started && res.reason !== 'already running') {
                     A.line(`  ${A.red('✗')} ${gate.label.padEnd(10)} gateway ${res.reason || 'could not start'}`);
-                    A.line(`      see the log:  ${A.dim(shortHome(D.logFile(D.gatewayKey(gate.gatewayPort))))}`);
+                    A.line(`      see the log:  ${A.dim(shortHome(D.logFile(D.gatewayKey(res.port || gate.gatewayPort))))}`);
                     return 1;
+                }
+                // PERSIST the renumber. Leaving the gate on a port we are not listening on
+                // would point the harness, the hub and every later `webchat start` at a
+                // number nothing serves — the fix would just move the failure.
+                if (res.port && res.port !== gate.gatewayPort) {
+                    A.line(`  ${A.yellow('·')} ${gate.label.padEnd(10)} port ${gate.gatewayPort} was in use — renumbered to ${res.port}`);
+                    try { G.update(gate.id, { gatewayPort: res.port }); gate.gatewayPort = res.port; } catch { /* keep the old number rather than fail the launch */ }
                 }
                 for (let i = 0; i < 30 && !gw.up; i++) {
                     await new Promise((r) => setTimeout(r, 500));
@@ -1674,9 +1693,11 @@ async function cmdStart(argv) {
     let hubPort = 0;
     if (!dryRun && chosen.length > 1) {
         const pair = await G.freePortPair();
-        const res = D.startHub({ port: pair.gatewayPort });
+        // awaited: startHub verifies the port is free and renumbers if it is not. The
+        // harness env below must be pointed at the port that ACTUALLY bound.
+        const res = await D.startHub({ port: pair.gatewayPort });
         if (res.started) {
-            hubPort = pair.gatewayPort;
+            hubPort = res.port || pair.gatewayPort;
             A.line(`  ${A.green('✓')} hub        one url for all ${chosen.length} webchats on http://${host}:${hubPort}/v1`);
         } else {
             A.line(`  ${A.yellow('·')} hub        not started (${res.reason || 'unknown'}) — falling back to the first webchat`);
