@@ -218,6 +218,13 @@ function envFor(gates, { modelName, hubPort } = {}) {
         OPENAI_API_KEY: process.env.HARNESS_API_KEY || 'webchat-local',
         ANTHROPIC_BASE_URL: base,
         ANTHROPIC_AUTH_TOKEN: process.env.HARNESS_API_KEY || 'webchat-local',
+        // WITHOUT THIS the claude harness sends its OWN default model name (e.g.
+        // claude-sonnet-4-20250514), which the /v1/messages route does not recognise: it
+        // falls through WEBCHAT_ROUTES and proxies to the PAID upstream, returning
+        // "Authentication Fails (auth header format should be Bearer sk-...)".
+        // Measured: 'deepseek-webchat' -> 200 (our tab), 'claude-sonnet-4-...' -> 401 paid.
+        // Setting it here is the difference between using the webchat and billing an API.
+        ANTHROPIC_MODEL: modelName || modelIdFor(primary),
         HARNESS_MODEL_NAME: modelName || modelIdFor(primary),
         HARNESS_GATES: gates.map((g) => g.id).join(','),
     };
