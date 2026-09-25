@@ -110,8 +110,14 @@ about each missing piece. Run it first whenever something does not work.
 - **Anti-spiral** *(experimental, off by default)* — detects a reasoning loop,
   redirects the model back to the task, and puts a warning at the top of the
   answer if it loops again. Narration-aware.
-- **Path-fenced file tools** — `sandbox.js` keeps `read_file`, `write_file`,
+- **Path-fenced file tools** — `src/tools/sandbox.js` keeps `read_file`, `write_file`,
   `list_dir` and `run_bash` inside an explicit allowlist of roots.
+- **The browser layer** — `src/browser/browser.js` owns Chrome: launching or
+  **attaching** to a browser already holding the profile (a persistent profile is
+  single-instance, so a second launch fails), CDP discovery, tab selection, the
+  logged-in check, and recovery when a renderer dies. `src/browser/window.js`
+  shows or hides that window. Per-site selectors live in `src/models/webchat-models.js`,
+  which is the single table the modes above are resolved from.
 - **Context handoff** — at the context threshold the model writes a handoff
   document, a new chat opens in the same tab, and the document seeds it.
 
