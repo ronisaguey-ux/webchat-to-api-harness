@@ -75,6 +75,27 @@ test('platform: the env var beats a stale explicit value only when set', () => {
     platform.setPlatform('linux');
 });
 
+test('subagents: a path-shaped job id cannot escape the state directory', () => {
+    // ★ The id reaches readJob from a CALLER (the MCP exposes webchat_subagent_result with an
+    // id), so it is untrusted input. `path.join(dir(), `${id}.json`)` resolved `..`, and
+    // readJob('../../secret') returned a JSON file planted two levels above state/subagents —
+    // verified by driving it before the fix. A traversal that silently returns another file
+    // is worse than an error, because the caller cannot tell it read the wrong thing.
+    for (const bad of ['../../secret', '..', 'a/b', '..\\..\\x']) {
+        assert.throws(
+            () => subagents.readJob(bad),
+            /invalid job id/,
+            `id ${JSON.stringify(bad)} must be refused, not resolved`,
+        );
+    }
+    // A legitimate id (pid + random suffix) still reads back, so the guard is not just "deny all".
+    const job = subagents.spawn({ prompt: 'id validation probe', gate: 'nonexistent-gate', label: 'unit' });
+    assert.ok(job.id && !job.id.includes('/'), 'a real id has no separator');
+    const back = subagents.readJob(job.id);
+    assert.equal(back && back.id, job.id, 'a real id still reads back');
+    subagents.cancel(job.id);
+});
+
 test('subagents: a job with no gate is recorded as running, then reads back', async () => {
     // spawn() must return immediately — the caller gets an id, not an answer. That is what
     // makes several webchats usable at once.
