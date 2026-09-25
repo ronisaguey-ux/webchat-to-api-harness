@@ -128,13 +128,33 @@ function defaultRoots(workspaceRoot) {
 // The deny-list is platform-specific: `rm -rf` means nothing to cmd, and `del /f /s /q`
 // means nothing to bash. Keeping one list and applying it everywhere lets a destructive
 // Windows command through while looking guarded.
+// ★ These block IRREVERSIBLE SYSTEM DESTRUCTION, not merely risky commands.
+// Measured 2026-09-25: the list caught `rm -rf` but allowed `mkfs /dev/sda`,
+// `shutdown now` and a fork bomb, because it only named the patterns someone had thought
+// of. A deny-list is always incomplete by construction, so this one is limited to commands
+// that (a) cannot be undone, and (b) have no legitimate use in a coding agent's workflow.
+// That narrow rule is what keeps it maintainable: it is not trying to be a security
+// boundary (the path fence in sandbox.js is), only a guard against an accidental
+// catastrophe that no amount of care afterwards can repair.
 const DANGER_LINUX = [
     'pkill -f', 'node -e', 'node -p', 'rm -rf',
+    // Disk and filesystem destruction — a single invocation loses the machine's data.
+    'mkfs', 'dd if=', 'dd of=', '> /dev/sd', 'wipefs', 'shred ',
+    // Power and boot state — kills the session that is running the work.
+    'shutdown', 'reboot', 'halt', 'poweroff', 'systemctl poweroff', 'systemctl reboot',
+    // Fork bomb and recursive mass-permission changes.
+    ':(){', 'chmod -R 777 /', 'chown -R',
+    // Piping a remote script straight into a shell: unread code, full privileges.
+    'curl | sh', 'curl|sh', 'wget | sh', 'wget|sh', '| bash', '|bash',
     'settings_backup.json', 'ghp_', 'TELEGRAM_TOKEN', 'BOT_TOKEN',
 ];
 const DANGER_WINDOWS = [
     'format ', 'del /f /s /q', 'rd /s /q', 'rmdir /s /q',
     'Remove-Item -Recurse -Force', 'settings_backup.json', 'ghp_',
+    // Disk and boot destruction, the Windows equivalents of the list above.
+    'diskpart', 'bcdedit', 'vssadmin delete',
+    'shutdown /s', 'shutdown /r', 'shutdown -s', 'shutdown -r',
+    'cipher /w',
     'TELEGRAM_TOKEN', 'BOT_TOKEN',
 ];
 
