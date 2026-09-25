@@ -178,3 +178,51 @@ test('the Webchats list offers only live webchats, plus Add', async () => {
     assert.ok(!labels.some((l) => /Gemini|DeepSeek/.test(l)),
         'a webchat that is not live must not be listed at all');
 });
+
+test('the agent is launched into its OWN opencode, not the user\'s', async () => {
+    // opencode merges the config in the working directory with the user's GLOBAL one. A
+    // clean folder was therefore not enough: the global config still supplied a paid
+    // provider, the user's own default model, their agents, their system prompts and their
+    // memory - which is exactly what launched. The harness points opencode at its own
+    // config and data dirs so the user's setup is never loaded and its keys never reachable.
+    const H = require(path.join(REPO, 'cli', 'harnesses.js'));
+    const cwd = '/tmp/agent-env-test';
+
+    const env = H.isolateHarnessEnv(cwd);
+    assert.equal(env.XDG_CONFIG_HOME, path.join(cwd, '.config'));
+    assert.equal(env.XDG_DATA_HOME, path.join(cwd, '.local', 'share'));
+    // The config the agent reads has to EXIST at the isolated path, or opencode falls back
+    // to its built-in defaults rather than ours.
+    for (const k of ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) {
+        assert.ok(env[k] && env[k].startsWith(cwd), `${k} must be isolated under the agent dir`);
+    }
+
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.mkdirSync(cwd, { recursive: true });
+    const gates = [{ id: 'deepseek', site: 'deepseek', label: 'DeepSeek webchat', gatewayPort: 8181, cdpPort: 9281 }];
+    const model = H.modelIdFor(gates[0]);
+    const envFor = H.envFor(gates);
+    assert.equal(envFor.HARNESS_MODEL_NAME, model, 'the env carries the id the config uses');
+    const written = H.prepareConfigFiles({ id: 'opencode', modelFlag: '-m' }, gates, cwd, envFor, 'auto');
+    assert.ok(written, 'a config is written');
+    assert.ok(fs.existsSync(path.join(cwd, '.config', 'opencode', 'opencode.json')),
+        'and at the path the isolated XDG_CONFIG_HOME resolves to');
+    const cfg = JSON.parse(fs.readFileSync(written, 'utf8'));
+    assert.equal(cfg.model, model);
+    assert.equal(Object.keys(cfg.provider.webchat.models).length, 1, 'only our provider');
+    fs.rmSync(cwd, { recursive: true, force: true });
+});
+
+test('launching from the menu comes back to the menu instead of ending the CLI', () => {
+    // `return cmdStart([])` in the menu branch exited the CLI, so launching an agent closed
+    // the terminal the user was standing in. Launching is a detour, not an exit.
+    const src = fs.readFileSync(path.join(REPO, 'cli', 'index.js'), 'utf8');
+    // `return cmdStart(...)` is only right where it IS the command the user typed. Inside the
+    // menu it ends the CLI, which is why launching an agent closed the terminal.
+    const menuBranch = /if \(next === 'launch'\)([^\n]*)/.exec(src);
+    assert.ok(menuBranch, 'the menu has a launch branch');
+    assert.ok(!/return\s+cmdStart/.test(menuBranch[1]),
+        'the menu launch branch may not return - that ends the CLI');
+    assert.match(menuBranch[1], /await cmdStart\(\[\]\); continue;/,
+        'it must continue the loop and come back to the menu');
+});

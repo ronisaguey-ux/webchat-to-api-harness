@@ -293,7 +293,19 @@ function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
         // Provider is `webchat`, so the MODEL key must be bare. Writing `webchat/deepseek`
         // here produced webchat/webchat/deepseek and the launch silently fell back to the
         // paid API. The harness env keeps the full id; only this key is stripped.
-        models[g.id] = { name: `${g.label} (${g.site})` };
+        const site = g.site || g.id;
+        models[g.id] = { name: `${g.label || site} (${site})` };
+    }
+    // `model` comes from the environment so the caller keeps one source of truth for the
+    // id - but if it is missing the key lands as `undefined`, opencode drops it, and the
+    // agent silently falls back to whatever model it would have used anyway. That is the
+    // exact failure this config exists to prevent, so refuse rather than write it.
+    const model = env.HARNESS_MODEL_NAME
+        || (gates[0] ? `${gates[0].site || gates[0].id}-webchat` : null);
+    if (!model) {
+        const err = new Error('no model id for the agent config — the gate list is empty.');
+        err.code = 'NO_MODEL';
+        throw err;
     }
     const cfg = {
         $schema: 'https://opencode.ai/config.json',
@@ -308,7 +320,7 @@ function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
                 models,
             },
         },
-        model: env.HARNESS_MODEL_NAME,
+        model,
         // An agent harness is a different product from this gateway: its plugins and
         // permissions must not leak into the webchat lane.
         plugin: [],
@@ -316,6 +328,11 @@ function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
     };
     try {
         fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+        // ...and at the path the isolated XDG_CONFIG_HOME resolves, so the agent has a
+        // global config of its OWN rather than none and never falls back to the user's.
+        const xdg = path.join(cwd, '.config', 'opencode');
+        fs.mkdirSync(xdg, { recursive: true });
+        fs.writeFileSync(path.join(xdg, 'opencode.json'), JSON.stringify(cfg, null, 2));
         return file;
     } catch {
         return null;
@@ -342,8 +359,26 @@ function firstInstalled(preferred = ['opencode', 'claude']) {
     return (HARNESSES.find((h) => installed(h)) || {}).id || null;
 }
 
+// The environment a PLAIN opencode needs.
+//
+// opencode merges the config it finds in the working directory with the user's GLOBAL one,
+// so launching from a clean folder was not enough: the global config still supplied a paid
+// provider, the user's own model default, their agents, their system prompts and their
+// memory. The agent the harness launches must be a plain harness with nothing but the
+// webchat provider in it, so opencode is pointed at its own config and data dirs - the
+// user's own opencode is left completely alone, and its keys are not even on the path.
+function isolateHarnessEnv(cwd) {
+    return {
+        XDG_CONFIG_HOME: path.join(cwd, '.config'),
+        XDG_DATA_HOME: path.join(cwd, '.local', 'share'),
+        XDG_CACHE_HOME: path.join(cwd, '.cache'),
+        XDG_STATE_HOME: path.join(cwd, '.local', 'state'),
+    };
+}
+
 module.exports = {
     firstInstalled,
+    isolateHarnessEnv,
     RISKY_BASH,
     MODES,
     HARNESSES,

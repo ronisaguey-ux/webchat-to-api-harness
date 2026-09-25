@@ -1713,7 +1713,7 @@ async function cmdStart(argv) {
         bin: first.h.bin,
         argv: first.argv,
         cwd,
-        env: { ...env, HARNESS_MODE: cfg.mode },
+        env: { ...env, ...H.isolateHarnessEnv(cwd), HARNESS_MODE: cfg.mode },
     });
     if (!started.ok) {
         A.line(`  ${A.red('could not launch:')} ${started.error}`);
@@ -2220,7 +2220,10 @@ async function interactive() {
               else if (choice === 'mode') await gatesScreens().screenMode();
               else if (choice === 'plan') {
                   const next = await gatesScreens().screenPlan();
-                  if (next === 'launch') return cmdStart([]);
+                  // `return` here ENDED the CLI: the launch worked, then the terminal
+                  // the user was standing in went back to a prompt. Launching is a
+                  // detour, not an exit.
+                  if (next === 'launch') { await cmdStart([]); continue; }
               } else if (choice === 'tools') await gatesScreens().screenTools();
               else if (choice === 'agentaccess') await screenAgentAccess();
               else if (choice === 'gates') await screenGates();
