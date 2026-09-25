@@ -138,8 +138,14 @@ test('opencode gets a config file written, and it names every gate', () => {
     const wrote = H.prepareConfigFiles(H.harnessById('opencode'), [{ id: 'gemini', label: 'G', site: 'gemini' }, { id: 'chatgpt', label: 'C', site: 'chatgpt' }], dir, env);
     assert.ok(wrote && fs.existsSync(wrote));
     const cfg = JSON.parse(fs.readFileSync(wrote, 'utf-8'));
-    assert.ok(cfg.provider.webchat.models['webchat/gemini']);
-    assert.ok(cfg.provider.webchat.models['webchat/chatgpt']);
+    // BARE keys under the provider. The provider is already called `webchat`, so writing
+    // `webchat/gemini` here produced the id webchat/webchat/gemini - which neither the
+    // config `model` nor `-m webchat/gemini` could match, so opencode fell back to the
+    // user's global default (a paid API) while our gateway sat unused. Live-verified.
+    assert.deepStrictEqual(Object.keys(cfg.provider.webchat.models).sort(), ['chatgpt', 'gemini'],
+        'every gate is named, bare, under the webchat provider');
+    assert.strictEqual(cfg.model, env.HARNESS_MODEL_NAME,
+        'and the default model resolves as provider webchat + one of those keys');
     assert.deepStrictEqual(cfg.plugin, [], 'the gateway\'s plugins must not leak into the agent');
 });
 
