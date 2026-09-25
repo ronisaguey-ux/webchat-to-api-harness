@@ -73,7 +73,13 @@ const HARNESSES = [
         // on the paid API while the webchat sat unused. Live: the agent's status bar read
         // "DeepSeek V4.1 Flash (paid API)" with `model: webchat/deepseek` sitting in the
         // config right beside it. An explicit -m cannot be out-voted by a merge.
-        modelFlag: (env) => ['-m', env.HARNESS_MODEL_NAME],
+        // The flag must be the PROVIDER-QUALIFIED id. opencode only accepts `webchat/<key>`
+        // in -m; a bare `deepseek-webchat` matches no registered model, so opencode falls
+        // back to the user's GLOBAL default (measured: providerID=openai
+        // modelID=gpt-5.6-terra-pro, then "AI_APICallError: Not Found" on every send).
+        // Qualified, the same launch resolves to webchat/deepseek-webchat and the request
+        // reaches the gateway. `opencode models` is the oracle: it lists the ids that exist.
+        modelFlag: (env) => ['-m', opencodeModelId(env.HARNESS_MODEL_NAME)],
         modes: {
             manual: [],
             auto: ['--auto'],
@@ -169,6 +175,24 @@ function modelIdFor(gate) {
     // <site>-webchat: the id is the model NAME the harness sends, so it has to be the one
     // the gateway answers to. See webchat-models.js.
     return `${gate.site || gate.id}-webchat`;
+}
+
+// The model id opencode needs, which is NOT the id the gateway answers to.
+//
+// These are two different namespaces and conflating them is what broke every launch:
+//   • the GATEWAY answers to  deepseek-webchat        (that is HARNESS_MODEL_NAME, and it
+//     is what goes in the request body)
+//   • opencode SELECTS        webchat/deepseek-webchat (provider + model key)
+// opencode's -m takes only the second. Given the first it resolves nothing and silently
+// falls back to the user's global default — measured: providerID=openai
+// modelID=gpt-5.6-terra-pro, then "AI_APICallError: Not Found" on every send, which is
+// what "it launched as GPT-5.6 Terra instead of deepseek webchat" was.
+//
+// Only opencode needs the qualified form; every other harness reads the env var directly.
+function opencodeModelId(modelName, providerId = 'webchat') {
+    if (!modelName) return modelName;
+    // Already qualified (contains a slash) — do not double-prefix it.
+    return modelName.includes('/') ? modelName : `${providerId}/${modelName}`;
 }
 
 // The environment a harness needs for a set of gates.
@@ -290,23 +314,29 @@ function prepareConfigFiles(h, gates, cwd, env, mode = 'manual') {
 
     const models = {};
     for (const g of gates) {
-        // Provider is `webchat`, so the MODEL key must be bare. Writing `webchat/deepseek`
-        // here produced webchat/webchat/deepseek and the launch silently fell back to the
-        // paid API. The harness env keeps the full id; only this key is stripped.
+        // Provider is `webchat`, so the MODEL KEY is what opencode resolves
+        // `webchat/<key>` against — and the only id the gateway answers to is the full
+        // `<site>-webchat`. Keying this by the bare gate id (`deepseek`) produced
+        // `webchat/deepseek-deepseek-webchat`-adjacent mismatches and an unresolvable
+        // selector, which is how a launch silently became GPT-5.6 Terra.
         const site = g.site || g.id;
-        models[g.id] = { name: `${g.label || site} (${site})` };
+        models[modelIdFor(g)] = { name: `${g.label || site} (${site})` };
     }
     // `model` comes from the environment so the caller keeps one source of truth for the
     // id - but if it is missing the key lands as `undefined`, opencode drops it, and the
     // agent silently falls back to whatever model it would have used anyway. That is the
     // exact failure this config exists to prevent, so refuse rather than write it.
-    const model = env.HARNESS_MODEL_NAME
+    const bare = env.HARNESS_MODEL_NAME
         || (gates[0] ? `${gates[0].site || gates[0].id}-webchat` : null);
-    if (!model) {
+    if (!bare) {
         const err = new Error('no model id for the agent config — the gate list is empty.');
         err.code = 'NO_MODEL';
         throw err;
     }
+    // The same provider-qualified id the -m flag carries. These two MUST agree: the config
+    // is what opencode uses when no -m is given, and a mismatch means the flag and the
+    // fallback disagree about which model to run.
+    const model = opencodeModelId(bare);
     const cfg = {
         $schema: 'https://opencode.ai/config.json',
         // Marks the file as ours. opencode ignores unknown keys, so this is a comment
@@ -385,6 +415,7 @@ module.exports = {
     harnessById,
     installed,
     modelIdFor,
+    opencodeModelId,
     envFor,
     reachability,
     prepareConfigFiles,

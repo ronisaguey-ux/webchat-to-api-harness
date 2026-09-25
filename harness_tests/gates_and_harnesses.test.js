@@ -139,13 +139,14 @@ test('opencode gets a config file written, and it names every gate', () => {
     const wrote = H.prepareConfigFiles(H.harnessById('opencode'), [{ id: 'gemini', label: 'G', site: 'gemini' }, { id: 'chatgpt', label: 'C', site: 'chatgpt' }], dir, env);
     assert.ok(wrote && fs.existsSync(wrote));
     const cfg = JSON.parse(fs.readFileSync(wrote, 'utf-8'));
-    // BARE keys under the provider. The provider is already called `webchat`, so writing
-    // `webchat/gemini` here produced the id webchat/webchat/gemini - which neither the
-    // config `model` nor `-m webchat/gemini` could match, so opencode fell back to the
-    // user's global default (a paid API) while our gateway sat unused. Live-verified.
-    assert.deepStrictEqual(Object.keys(cfg.provider.webchat.models).sort(), ['chatgpt', 'gemini'],
-        'every gate is named, bare, under the webchat provider');
-    assert.strictEqual(cfg.model, env.HARNESS_MODEL_NAME,
+    // The model KEY is the name the gateway answers to (`<site>-webchat`), because that is
+    // what opencode resolves `webchat/<key>` against and what it then sends on the wire.
+    // Keying by the bare gate id (`gemini`) produced a selector opencode could not match,
+    // so it fell back to the user's global default (measured: providerID=openai
+    // modelID=gpt-5.6-terra-pro) while our gateway sat unused.
+    assert.deepStrictEqual(Object.keys(cfg.provider.webchat.models).sort(), ['chatgpt-webchat', 'gemini-webchat'],
+        'every gate is named by the id the gateway answers to');
+    assert.strictEqual(cfg.model, `webchat/${env.HARNESS_MODEL_NAME}`,
         'and the default model resolves as provider webchat + one of those keys');
     assert.deepStrictEqual(cfg.plugin, [], 'the gateway\'s plugins must not leak into the agent');
 });
@@ -309,4 +310,50 @@ test('the generated config is marked as ours, and a stranger\'s is never overwri
     );
     assert.strictEqual(JSON.parse(fs.readFileSync(precious, 'utf-8')).model, 'deepseek/deepseek-flash',
         'the existing file must be untouched');
+});
+
+// ── the opencode model id must be PROVIDER-QUALIFIED ─────────────────────────
+//
+// This is the regression that made every launch silently run the user's own global
+// default. opencode resolves `-m <provider>/<key>`; given a bare `deepseek-webchat` it
+// matches no registered model and falls back to whatever the user's config says —
+// measured live: providerID=openai modelID=gpt-5.6-terra-pro, then
+// "AI_APICallError: Not Found" on every send, while our gateway sat unused.
+//
+// The gateway and opencode use two DIFFERENT namespaces and this pins both:
+//   gateway answers to   deepseek-webchat          (HARNESS_MODEL_NAME, the request body)
+//   opencode selects     webchat/deepseek-webchat  (-m, and the config `model`)
+test('opencodeModelId prefixes the provider, and never double-prefixes', () => {
+    assert.strictEqual(H.opencodeModelId('deepseek-webchat'), 'webchat/deepseek-webchat');
+    assert.strictEqual(H.opencodeModelId('gemini-webchat'), 'webchat/gemini-webchat');
+    assert.strictEqual(H.opencodeModelId('webchat/deepseek-webchat'), 'webchat/deepseek-webchat',
+        'an already-qualified id must be left alone');
+    assert.strictEqual(H.opencodeModelId(undefined), undefined,
+        'a missing name stays missing so the NO_MODEL guard can fire');
+});
+
+test('the -m flag carries the provider-qualified id, not the bare gateway name', () => {
+    const h = H.harnessById('opencode');
+    const env = { HARNESS_MODEL_NAME: 'deepseek-webchat' };
+    const argv = H.argvFor(h, 'auto', [], env);
+    const i = argv.indexOf('-m');
+    assert.ok(i >= 0, 'the model is pinned on the command line');
+    assert.strictEqual(argv[i + 1], 'webchat/deepseek-webchat',
+        'a bare deepseek-webchat resolves to nothing and opencode silently uses the global default');
+});
+
+test('the config model names a key that exists under its own provider', () => {
+    const dir = fs.mkdtempSync(path.join(TMP, 'resolve-'));
+    const gates = [{ id: 'deepseek', label: 'DeepSeek', site: 'deepseek' }];
+    const env = H.envFor(gates, {});
+    const written = H.prepareConfigFiles(H.harnessById('opencode'), gates, dir, env, 'auto');
+    const cfg = JSON.parse(fs.readFileSync(written, 'utf-8'));
+
+    // The whole failure was these two disagreeing: a model field that names no model.
+    const keys = Object.keys(cfg.provider.webchat.models);
+    const bare = String(cfg.model).replace(/^webchat\//, '');
+    assert.ok(keys.includes(bare),
+        `model "${cfg.model}" must resolve against provider "webchat" keys ${JSON.stringify(keys)}`);
+    assert.strictEqual(cfg.model, `webchat/${env.HARNESS_MODEL_NAME}`,
+        'and it must be the same id the -m flag uses, so flag and fallback cannot disagree');
 });
