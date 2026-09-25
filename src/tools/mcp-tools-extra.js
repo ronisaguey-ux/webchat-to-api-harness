@@ -311,7 +311,12 @@ const TOOLS = [
             prompts: { type: 'array', description: 'The list of tasks. Each is an independent prompt.', items: { type: 'string' } },
             gates: { type: 'array', description: 'Which webchats to use. Defaults to every reachable one.', items: { type: 'string' } },
             concurrency: N('How many tasks in flight at once. Defaults to the number of lanes.'),
-            timeoutMs: N('Per task. Default 300000.'),
+            timeoutMs: N('Per task, default 300000. Budget generously: a webchat injects a ' +
+                         'DELIBERATE 20-80s pause before EVERY send, so a 2-prompt swarm on one ' +
+                         'lane takes ~4 minutes of wall-clock. A caller whose own request budget ' +
+                         'is shorter than the swarm takes sees "Request timed out" over work that ' +
+                         'is still in flight — verified: the same call returns ok=2 in 236s when ' +
+                         'run outside the client. For a long swarm, prefer several small calls.'),
         },
         ['prompts'],
         async (a) => {
