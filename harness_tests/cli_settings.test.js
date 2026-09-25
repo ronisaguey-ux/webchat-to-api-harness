@@ -227,3 +227,95 @@ test('listModes reports every configured webchat with its selectors and quirks',
     assert.strictEqual(modes[0].quirks.phantomStopButton, true);
     assert.strictEqual(modes[1].url, '');
 });
+
+// ── envOnly: the value must go where the gateway reads it, and be reported honestly ──
+//
+// Measured 2026-09-25. Two defects, both of the "control that reports success and does
+// nothing" class, found because the send-pacing setting was added to this schema:
+//
+//   1. `saveSetting` writes the CONFIG FILE. An envOnly setting's value is read by the
+//      harness from process.env (dotenv loads .env), so a value written to the config file
+//      is read by nothing. The MCP calls saveSetting directly and so wrote it there —
+//      `saved: true, effective: true` over a change with no effect. The CLI's own settings
+//      screen routed envOnly settings to .env itself, so the two write paths disagreed and
+//      only the MCP was wrong.
+//
+//   2. `resolve()` returned `source: 'unset'` for an envOnly setting with no env line,
+//      IGNORING setting.default — while the gateway was applying that very default. The
+//      display called a running value missing.
+
+test('an envOnly setting is written to .env, not to the config file', () => {
+    const savedEnv = process.env.ENV_FILE;
+    const savedCfg = process.env.HARNESS_CONFIG;
+    try {
+        const envFile = write('write-target.env', '# keep me\nEXISTING=1\n');
+        const cfgFile = write('write-target.json', '{}\n');
+        process.env.ENV_FILE = envFile;
+        process.env.HARNESS_CONFIG = cfgFile;
+
+        const res = S.saveSetting('webchat.sendGapMaxMs', 12345);
+        assert.strictEqual(res.ok, true);
+
+        const envText = fs.readFileSync(envFile, 'utf-8');
+        assert.match(envText, /^SEND_GAP_MAX_MS=12345$/m,
+            'the value must land in .env, which is what the gateway loads');
+        assert.match(envText, /# keep me/, 'and the write must preserve existing comments');
+
+        const cfgText = fs.readFileSync(cfgFile, 'utf-8');
+        assert.ok(!/sendGap/i.test(cfgText),
+            'nothing may be written to the config file: the gateway never reads it for an env-backed value');
+    } finally {
+        if (savedEnv === undefined) delete process.env.ENV_FILE; else process.env.ENV_FILE = savedEnv;
+        if (savedCfg === undefined) delete process.env.HARNESS_CONFIG; else process.env.HARNESS_CONFIG = savedCfg;
+    }
+});
+
+test('an envOnly setting with a default reports the default, not "unset"', () => {
+    // The gateway falls back to its own default, so "unset" describes a value that is
+    // running — the display would be lying about the effective state.
+    const noEnv = {};
+    for (const p of ['webchat.sendGapMinMs', 'webchat.sendGapMaxMs']) {
+        const row = S.resolveAll({}, {}, noEnv).find((r) => r.setting.path === p);
+        assert.strictEqual(row.source, 'default',
+            `${p} must report that the built-in default applies, not that it is unset`);
+        assert.strictEqual(typeof row.value, 'number',
+            `${p} must be reported as a number, matching what the gateway parses`);
+    }
+});
+
+test('an envOnly setting WITHOUT a default is genuinely unset', () => {
+    // A secret with no fallback has no value until it is written — this is the behaviour
+    // the default case above must not have broken.
+    const row = S.resolveAll({}, {}, {}).find((r) => r.setting.env === 'API_TOKEN');
+    assert.ok(row, 'the API token setting must still exist');
+    assert.strictEqual(row.source, 'unset');
+    assert.strictEqual(row.value, undefined);
+});
+
+test('a value in .env is reported as coming from .env', () => {
+    // The MCP resolved with no dotenv at all, so a saved envOnly value read back as
+    // "unset" the moment it was written. Omitting the argument now loads the real file;
+    // passing one must still be honoured, which is what this asserts.
+    const rows = S.resolveAll({}, {}, { SEND_GAP_MIN_MS: '4321' });
+    const row = rows.find((r) => r.setting.path === 'webchat.sendGapMinMs');
+    assert.strictEqual(row.value, 4321);
+    assert.strictEqual(row.source, 'env');
+});
+
+test('omitting the dotenv argument loads the real .env — the MCP bug', () => {
+    // The MCP called `resolveAll(raw)` with no dotenv, whose old default was `{}`, so every
+    // env-backed setting read back as though .env did not exist. It reported a value it had
+    // just saved as "unset". Omitting the argument must now read the real file; this points
+    // ENV_FILE at a fixture so it proves that without depending on the live install.
+    const savedEnv = process.env.ENV_FILE;
+    try {
+        const envFile = write('omit-arg.env', 'SEND_GAP_MIN_MS=7777\n');
+        process.env.ENV_FILE = envFile;
+        const row = S.resolveAll({}).find((r) => r.setting.path === 'webchat.sendGapMinMs');
+        assert.strictEqual(row.value, 7777,
+            'omitting dotenv must read the real .env, or a saved value reads back as unset');
+        assert.strictEqual(row.source, 'env');
+    } finally {
+        if (savedEnv === undefined) delete process.env.ENV_FILE; else process.env.ENV_FILE = savedEnv;
+    }
+});

@@ -296,6 +296,23 @@ const SCHEMA = [
                 path: 'webchat.loginWaitSeconds', label: 'Login wait (seconds)', type: 'number', env: 'LOGIN_WAIT_SECONDS',
                 help: 'How long to wait for you to finish signing in on first launch.',
             },
+            // The send pacing. Deliberately random so the cadence never repeats (a fixed gap
+            // is itself a bot signature), but it is applied to EVERY send and a single agent
+            // turn makes several — so it dominates response time. Measured: 87% of a reply
+            // was this wait, not thinking (model 6.6s, gate 43s mean).
+            //
+            // It was env-only, i.e. invisible and uneditable from this CLI, which is why the
+            // latency looked like the model being slow. Every send pays it, so the default is
+            // a human typing cadence rather than a human being distracted: raise the pair if
+            // you want more padding between messages.
+            {
+                path: 'webchat.sendGapMinMs', label: 'Send gap minimum (ms)', type: 'number', env: 'SEND_GAP_MIN_MS', envOnly: true, default: 3000,
+                help: 'Shortest random wait before a deepseek send. Every send pays this, and one agent turn makes several. 0 disables the random gap.',
+            },
+            {
+                path: 'webchat.sendGapMaxMs', label: 'Send gap maximum (ms)', type: 'number', env: 'SEND_GAP_MAX_MS', envOnly: true, default: 15000,
+                help: 'Longest random wait before a deepseek send. The wait is picked fresh in [min, max] each time so the cadence never repeats.',
+            },
         ],
     },
     {
@@ -701,8 +718,19 @@ function resolve(setting, raw, env = process.env, dotenv = {}) {
         return { value: String(envVal).toLowerCase() !== 'false', source: 'env', envWhere: where };
     }
     if (setting.envOnly) {
-        if (!hasEnv) return { value: undefined, source: 'unset' };
-        return { value: envVal, source: 'env', envWhere: where };
+        // envOnly means the VALUE lives in .env rather than in the config file — it does not
+        // mean the setting has no default. When the var is absent the gateway still applies
+        // its own built-in default, so "unset" describes a setting that is very much in
+        // force: the same number is running, and the display called it missing.
+        //
+        // A setting that carries a default therefore reports that default (source
+        // "default", i.e. "not written to .env; the built-in value applies"). One without a
+        // default — a secret — is genuinely unset until written.
+        if (!hasEnv) {
+            if (setting.default === undefined) return { value: undefined, source: 'unset' };
+            return { value: coerce(setting, setting.default), source: 'default' };
+        }
+        return { value: coerce(setting, envVal), source: 'env', envWhere: where };
     }
 
     const fileVal = getPath(raw, setting.path);
@@ -733,13 +761,22 @@ function resolve(setting, raw, env = process.env, dotenv = {}) {
 }
 
 // Every setting, resolved, in schema order.
-function resolveAll(raw, env = process.env, dotenv = {}) {
-    const rows = [];
-    for (const group of SCHEMA) {
-        for (const s of group.settings) {
-            rows.push({ setting: s, group: group.id, groupTitle: group.title, ...resolve(s, raw, env, dotenv) });
-        }
-    }
+  // dotenv defaults to the REAL .env rather than {}. `.env` is where env-backed settings
+  // live, so a resolve that cannot see it reports `source: "unset"` for a setting that is
+  // in fact configured and in use — the MCP did exactly that (it called resolveAll(raw) with
+  // no dotenv, so an envOnly setting read back as unset the moment it was saved). A display
+  // that says "unset" about a live value is the same lie as a stale connected flag.
+  //
+  // Pass an explicit object to resolve against a fixture; only omitting the argument loads
+  // the file, so a test stays isolated and a caller cannot forget.
+  function resolveAll(raw, env = process.env, dotenv) {
+      const dotenvVars = dotenv === undefined ? loadDotenv().vars : dotenv;
+      const rows = [];
+      for (const group of SCHEMA) {
+          for (const s of group.settings) {
+              rows.push({ setting: s, group: group.id, groupTitle: group.title, ...resolve(s, raw, env, dotenvVars) });
+          }
+      }
     return rows;
 }
 

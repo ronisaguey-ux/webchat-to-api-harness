@@ -56,8 +56,9 @@ function targetFor(modelId, gates, models) {
 // getJson() directly below sets one, so the omission was an oversight rather than a
 // decision. Without it a gateway that accepts the socket and then never answers holds the
 // hub's request open forever: the caller sees a hang with no error, cannot tell it from a
-// slow model, and has no way to recover. The harness's own send gate sleeps 20-80s before
-// each send, so the response budget has to clear that — hence 180s, not 30s.
+// slow model, and has no way to recover. The harness's own send gate pauses before every
+// send (SEND_GAP_MAX_MS, 15s by default but raisable), so the response budget has to clear
+// that comfortably — hence 180s, not 30s. It is a ceiling, not an expectation.
 const RELAY_CONNECT_MS = Number(process.env.HUB_RELAY_CONNECT_MS || 10000);
 const RELAY_RESPONSE_MS = Number(process.env.HUB_RELAY_RESPONSE_MS || 180000);
 
