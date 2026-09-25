@@ -3152,6 +3152,9 @@ module.exports = {
     NEW_CHAT_EVERY_SENDS,
     needsSingleThread,
     __test: {
+        // The express app itself, so a test can drive the real HTTP surface
+        // (status codes, stop reasons) on an ephemeral port — no browser.
+        app,
         streamFailureEvents,
         setRequestInFlight: (v) => { requestInFlight = !!v; },
         getRequestInFlight: () => requestInFlight,
