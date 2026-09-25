@@ -191,7 +191,9 @@ function build(ctx) {
     }
 
     async function screenPickActive() {
-        const { gates, active } = G.read();
+        // Refreshed, not read: this menu DISPLAYS connected state, and the stored flag
+        // outlives the browser it describes — the same lie the dashboard had.
+        const { gates, active } = await G.refresh(undefined, 30000);
         const pick = await A.menu(
             gates.map((g) => ({ label: g.label, hint: g.connected ? 'connected' : 'not connected', value: g.id }))
                 .concat([{ label: 'Back', value: 'back' }]),
@@ -384,7 +386,9 @@ function build(ctx) {
     // the user can see what will happen, and run it themselves if they prefer.
     async function screenPlan() {
         const cfg = LC.read();
-        const { gates } = G.read();
+        // Refreshed: this screen DISPLAYS connected state per gate, so it must show what is
+        // true now, not what was recorded when the tab was confirmed.
+        const { gates } = await G.refresh(undefined, 30000);
         const v = LC.validate(cfg, gates);
 
         A.clear();
@@ -440,7 +444,8 @@ function build(ctx) {
 
     async function screenPickGates(startIndex = 0) {
         const cfg = LC.read();
-        const { gates } = G.read();
+        // Refreshed: the hint per row says "connected", so it has to be the live answer.
+        const { gates } = await G.refresh(undefined, 30000);
         const chosen = new Set(cfg.gates || []);
 
         if (!gates.length) {
