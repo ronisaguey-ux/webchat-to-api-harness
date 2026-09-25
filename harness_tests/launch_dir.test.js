@@ -45,7 +45,12 @@ test('a saved config pointing at HOME is migrated on read', () => {
 });
 
 test('the generated agent config is written into the isolated folder, not HOME', () => {
-    const dir = LC.ensureAgentDir();
+    // A TEMP dir, never the live agent dir. This test used to call LC.ensureAgentDir() —
+    // which resolves to the REAL ~/.webchat/agent — and write a config carrying a FAKE
+    // gatewayPort (8181, not the gateway's 8081) straight into it. Running the suite
+    // therefore broke the installed launch: the agent connected to a port nothing serves.
+    // A test must not write into live state; it only needs to prove WHERE the file lands.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentdir-'));
     const gates = [{ id: 'deepseek', site: 'deepseek', label: 'DeepSeek webchat', gatewayPort: 8181, cdpPort: 9281 }];
     const env = H.envFor(gates);
 
@@ -56,7 +61,7 @@ test('the generated agent config is written into the isolated folder, not HOME',
     assert.strictEqual(written, path.join(dir, 'opencode.json'),
         'the config belongs in the agent folder');
     const cfg = JSON.parse(fs.readFileSync(written, 'utf8'));
-    assert.strictEqual(cfg.model, env.HARNESS_MODEL_NAME, 'the agent must be pointed at the webchat model');
+    assert.strictEqual(cfg.model, `webchat/${env.HARNESS_MODEL_NAME}`, 'the agent must be pointed at the webchat model');
     assert.match(cfg.provider.webchat.options.baseURL, /:\d+\/v1$/,
         'the provider must point at the harness gateway');
     assert.strictEqual(fs.existsSync(homeCfg), hadHome,
@@ -208,7 +213,7 @@ test('the agent is launched into its OWN opencode, not the user\'s', async () =>
     assert.ok(fs.existsSync(path.join(cwd, '.config', 'opencode', 'opencode.json')),
         'and at the path the isolated XDG_CONFIG_HOME resolves to');
     const cfg = JSON.parse(fs.readFileSync(written, 'utf8'));
-    assert.equal(cfg.model, model);
+    assert.equal(cfg.model, `webchat/${model}`, 'the config points at provider webchat + our model key');
     assert.equal(Object.keys(cfg.provider.webchat.models).length, 1, 'only our provider');
     fs.rmSync(cwd, { recursive: true, force: true });
 });
