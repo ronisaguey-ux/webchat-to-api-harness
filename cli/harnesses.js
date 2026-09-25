@@ -166,7 +166,9 @@ function installed(h) {
 // The model id an agent sees for one gate. Kept in one place so the id we advertise
 // and the id the gateway serves cannot drift.
 function modelIdFor(gate) {
-    return `webchat/${gate.id}`;
+    // <site>-webchat: the id is the model NAME the harness sends, so it has to be the one
+    // the gateway answers to. See webchat-models.js.
+    return `${gate.site || gate.id}-webchat`;
 }
 
 // The environment a harness needs for a set of gates.

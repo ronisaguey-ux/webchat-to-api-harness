@@ -240,6 +240,91 @@ async function probe(gate) {
     return out;
 }
 
+// ── is this webchat ACTUALLY usable right now? ──────────────────────────────
+//
+// `connected` is a flag the user set once, when they confirmed a tab. It goes stale: a
+// session expires, a profile gets signed out, the tab is closed. Live, DeepSeek was
+// signed out while the CLI still listed it as a connected webchat and offered it in the
+// launch, so the agent came up pointed at a tab that could never answer.
+//
+// So the flag is EVIDENCE, not a memory: a gate is live only when its browser is
+// answering, a tab for the site exists, that tab has a composer, and the page does not
+// carry sign-in copy. That is the same rule browser.js uses before it sends.
+async function live(gate) {
+    const out = { live: false, why: 'no browser', url: null };
+    if (!gate || !gate.cdpPort) return out;
+    let browser = null;
+    try {
+        const targets = await d.cdpTargets(gate.cdpPort);
+        if (!targets.ok || !targets.pages.length) return out;
+        let host = null;
+        try { host = gate.url ? new URL(gate.url).host : null; } catch { /* opaque url */ }
+        const page = targets.pages.find((p) => host && String(p.url).includes(host))
+            || targets.pages.find((p) => !String(p.url).startsWith('about:'))
+            || targets.pages[0];
+        out.url = page.url;
+
+        const puppeteer = require('puppeteer-core');
+        browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${gate.cdpPort}`, defaultViewport: null });
+        const pages = await browser.pages();
+        const tab = pages.find((pg) => pg.url() === page.url) || pages[0];
+        if (!tab) { out.why = 'no tab'; return out; }
+
+        const seen = await tab.evaluate(() => {
+            const text = document.body ? (document.body.innerText || '') : '';
+            const top = text.slice(0, 1200);
+            return {
+                signedOut: /\b(sign in|log in|sign up to|log in to get answers|sign in to save activity)\b/i.test(top),
+                hasInput: !!document.querySelector('div[contenteditable="true"], textarea, rich-textarea'),
+                url: location.href,
+            };
+        });
+        out.url = seen.url;
+        if (!seen.hasInput) { out.why = 'no composer (not signed in?)'; return out; }
+        if (seen.signedOut) { out.why = 'signed out'; return out; }
+        return { live: true, why: 'signed in', url: seen.url };
+    } catch (e) {
+        out.why = e.message;
+        return out;
+    } finally {
+        try { if (browser) await browser.disconnect(); } catch { /* already gone */ }
+    }
+}
+
+// The dashboard redraws every couple of seconds and connecting to a browser is not free,
+// so a check is cached. `maxAgeMs` of 0 forces a fresh one.
+const _liveCache = new Map();   // gate id -> { at, state }
+
+async function liveCached(gate, maxAgeMs = 30000) {
+    const key = gate.id || `${gate.cdpPort}`;
+    const hit = _liveCache.get(key);
+    if (hit && Date.now() - hit.at < maxAgeMs) return hit.state;
+    const state = await live(gate);
+    _liveCache.set(key, { at: Date.now(), state });
+    return state;
+}
+
+// Re-check every gate and PERSIST the result, so the stored flag stops being a memory and
+// starts being what was last observed. Returns the refreshed registry.
+async function refresh(reg, maxAgeMs = 30000) {
+    const r = reg || read();
+    const out = [];
+    for (const g of r.gates || []) {
+        const state = await liveCached(g, maxAgeMs);
+        out.push({ ...g, connected: Boolean(state.live), notConnectedWhy: state.live ? null : state.why });
+    }
+    const next = { ...r, gates: out };
+    try { write(next); } catch { /* a read-only state dir must not break the dashboard */ }
+    return next;
+}
+
+// Only the gates that are usable RIGHT NOW. This is what a launch selection must be
+// built from: offering a webchat whose tab cannot answer is offering a broken agent.
+async function liveGates(maxAgeMs = 30000) {
+    const r = await refresh(undefined, maxAgeMs);
+    return (r.gates || []).filter((g) => g.connected);
+}
+
 module.exports = {
     freePort,
     freePortPair,
@@ -254,5 +339,9 @@ module.exports = {
     get,
     setActive,
     probe,
+    live,
+    liveCached,
+    refresh,
+    liveGates,
     registryFile,
 };

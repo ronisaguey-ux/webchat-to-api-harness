@@ -184,6 +184,11 @@ function startGateway(opts = {}) {
             // the generic mode, so the Gemini gateway used the wrong composer and
             // answer selectors and connected to the page but never read it.
             ...(opts.mode ? { WEBCHAT_MODE: String(opts.mode) } : {}),
+            // The model id THIS gateway answers to: <site>-webchat, the same name the CLI
+            // hands the harness. Without it the gateway keeps the old default and a
+            // harness sending the new name is proxied to the real upstream - a 401 that
+            // reads like an auth bug.
+            ...((opts.modelName || opts.mode) ? { MODEL_NAME: String(opts.modelName || `${opts.mode}-webchat`) } : {}),
             // The gateway drives a HEADED browser, so it needs the display too. Without
             // this a gateway started from a shell with no DISPLAY fails every send
             // with "Missing X server to start the headful browser".
@@ -574,6 +579,56 @@ function clearConnection() {
     try { fs.unlinkSync(connectFile()); } catch { /* already gone */ }
 }
 
+// ── launch a program in its OWN terminal window ─────────────────────────────
+//
+// The agent is an interactive TUI. Handing it this terminal replaces the CLI, so the
+// user loses the thing they were just using; `webchat start` gives it its own window
+// instead and stays where it is. Falls back to a detached process with a log when no
+// terminal emulator is installed - never to taking over the caller's TTY.
+const TERMINALS = [
+    { bin: 'konsole', args: (cmd) => ['-e', 'bash', '-lc', cmd] },
+    { bin: 'x-terminal-emulator', args: (cmd) => ['-e', 'bash', '-lc', cmd] },
+    { bin: 'gnome-terminal', args: (cmd) => ['--', 'bash', '-lc', cmd] },
+    { bin: 'xfce4-terminal', args: (cmd) => ['-e', `bash -lc ${JSON.stringify(cmd)}`] },
+    { bin: 'xterm', args: (cmd) => ['-e', 'bash', '-lc', cmd] },
+];
+
+function whichTerminal() {
+    const { spawnSync } = require('child_process');
+    for (const t of TERMINALS) {
+        const r = spawnSync('which', [t.bin], { encoding: 'utf-8' });
+        if (r.status === 0 && String(r.stdout).trim()) return t;
+    }
+    return null;
+}
+
+function shq(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+
+function launchInTerminal({ bin, argv = [], cwd, env = {} }) {
+    const { spawn } = require('child_process');
+    const cmd = `cd ${shq(cwd)} && exec ${[bin, ...argv].map(shq).join(' ')}`;
+    const full = { ...process.env, ...env };
+    const term = whichTerminal();
+    try {
+        if (term) {
+            const child = spawn(term.bin, term.args(cmd), {
+                detached: true, stdio: 'ignore', env: { ...full, ...displayEnv() },
+            });
+            child.unref();
+            return { ok: true, how: 'window', terminal: term.bin, pid: child.pid };
+        }
+        // No terminal emulator: run it detached and leave a log, so this TTY is untouched.
+        ensureStateDir();
+        const out = fs.openSync(logFile('agent'), 'a');
+        fs.writeSync(out, `\n─── agent start ${new Date().toISOString()} ───\n`);
+        const child = spawn('bash', ['-lc', cmd], { detached: true, stdio: ['ignore', out, out], env: full });
+        child.unref();
+        return { ok: true, how: 'detached', log: logFile('agent'), pid: child.pid };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
 module.exports = {
     REPO, stateDir, ensureStateDir, profileDir,
     pidFile, logFile,
@@ -584,6 +639,7 @@ module.exports = {
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     tailLines,
     copyToClipboard, restoreForExec,
+    launchInTerminal, whichTerminal,
     realDisplay, connectFile, readConnection, writeConnection, clearConnection,
 };
 

@@ -10,10 +10,10 @@
 // concept of "flip a chip". So every toggle COMBINATION is published as its own model
 // id, and choosing that id makes the gateway set the chips over CDP before it sends:
 //
-//     webchat/deepseek                     default
-//     webchat/deepseek/search              Search on
-//     webchat/deepseek/deepthink           DeepThink on
-//     webchat/deepseek/deepthink+search    both
+//     deepseek-webchat                       default
+//     deepseek-webchat-search                Search on
+//     deepseek-webchat-deepthink             DeepThink on
+//     deepseek-webchat-deepthink-search      both
 //
 // The user changes configuration by picking a different model. Nothing else.
 //
@@ -113,7 +113,7 @@ function combinations(site) {
     return out;
 }
 
-/** The model ids a site publishes, e.g. webchat/deepseek/deepthink+search */
+/** The model ids a site publishes, e.g. deepseek-webchat/deepthink+search */
 function modelIdsFor(site) {
     const s = SITES[site];
     if (!s) return [];
@@ -121,10 +121,17 @@ function modelIdsFor(site) {
     const ids = [];
     for (const base of bases) {
         for (const combo of combinations(site)) {
-            const parts = [site];
+            // Named <site>-webchat, so the id says what it is in a model picker: a
+            // webchat, and whose. The provider prefix is NOT in the id any more -
+            // opencode sends the bare name it is given, so the bare name has to be the
+            // one this gateway answers to.
+            // All one hyphenated name: deepseek-webchat, deepseek-webchat-deepthink,
+            // deepseek-webchat-search-deepthink. A model picker shows an id as a single
+            // token, so the toggles belong IN the name rather than after a slash.
+            const parts = [`${site}-webchat`];
             if (base) parts.push(base);
-            if (combo.length) parts.push(combo.map((t) => t.id).join('+'));
-            ids.push(`webchat/${parts.join('/')}`);
+            for (const tg of combo) parts.push(tg.id);
+            ids.push(parts.join('-'));
         }
     }
     return ids;
@@ -143,16 +150,49 @@ function allModelIds() {
  */
 function parse(modelId) {
     const m = String(modelId || '').trim();
-    if (!m.startsWith('webchat/')) return null;
-    const parts = m.slice('webchat/'.length).split('/').filter(Boolean);
-    if (!parts.length) return null;
-    const site = parts.shift();
+    let site = null;
+    let parts = [];
+    // The current form is one hyphenated name: deepseek-webchat, deepseek-webchat-search,
+    // deepseek-webchat-deepthink-search. The site is found by matching the LONGEST known
+    // key against the head, so a site whose own name contains a hyphen still resolves.
+    const head = Object.keys(SITES)
+        .filter((k) => m === `${k}-webchat` || m.startsWith(`${k}-webchat-`))
+        .sort((a, b) => b.length - a.length)[0];
+    // In the hyphenated form the whole tail is toggles (and possibly a base model), so it
+    // is kept as ONE string. Splitting it on '-' here made
+    // deepseek-webchat-deepthink-search read as base=deepthink + toggle=search, silently
+    // dropping a toggle the caller asked for.
+    let tail = null;
+    if (head) {
+        site = head;
+        tail = m.slice(`${head}-webchat`.length).replace(/^-/, '');
+    } else if (m.startsWith('webchat/')) {
+        // The earlier form: webchat/deepseek[/<base>][/<toggles>]. Still accepted so an
+        // agent configured before the rename keeps working rather than silently
+        // proxying to the real upstream and 401ing.
+        parts = m.slice('webchat/'.length).split('/').filter(Boolean);
+        site = parts.shift();
+    } else {
+        return null;
+    }
+    if (!site) return null;
     const s = SITES[site];
     if (!s) return { site: null, unknownSite: site, base: null, toggles: [], unknown: [], requiresNewChat: false };
 
     let base = null;
     let togglePart = null;
-    if (parts.length === 1) {
+    if (tail !== null) {
+        // Hyphenated form: an optional base model first, then the toggles, all joined by
+        // '-'. Longest base first so a base id containing a hyphen still matches.
+        const bases = ((s.models || []).map((x) => x.id)).sort((a, b) => b.length - a.length);
+        const hit = bases.find((b) => tail === b || tail.startsWith(`${b}-`));
+        if (hit) {
+            base = hit;
+            togglePart = tail.slice(hit.length).replace(/^-/, '') || null;
+        } else {
+            togglePart = tail || null;
+        }
+    } else if (parts.length === 1) {
         // could be a base model (kimi/instant) or a toggle combo (deepseek/search)
         const knownBase = (s.models || []).find((x) => x.id === parts[0]);
         if (knownBase) base = knownBase.id;
@@ -162,7 +202,25 @@ function parse(modelId) {
         togglePart = parts[1];
     }
 
-    const want = togglePart ? togglePart.split('+').filter(Boolean) : [];
+    // `togglePart` is either the legacy `a+b` form or the hyphenated tail. Resolve the
+    // hyphenated tail against the toggles this site actually declares, longest id first,
+    // so an id containing a hyphen is not mistaken for two toggles.
+    let want = [];
+    if (togglePart) {
+        if (togglePart.includes('+')) {
+            want = togglePart.split('+').filter(Boolean);
+        } else {
+            const known = ((SITES[site] && SITES[site].toggles) || []).map((x) => x.id)
+                .sort((a, b) => b.length - a.length);
+            let rest = togglePart;
+            while (rest) {
+                const hit = known.find((k) => rest === k || rest.startsWith(`${k}-`));
+                if (!hit) { want.push(rest); break; }
+                want.push(hit);
+                rest = rest.slice(hit.length).replace(/^-/, '');
+            }
+        }
+    }
     const known = (s.toggles || []).map((t) => t.id);
     const unknown = want.filter((w) => !known.includes(w));
     const toggles = (s.toggles || []).filter((t) => want.includes(t.id));

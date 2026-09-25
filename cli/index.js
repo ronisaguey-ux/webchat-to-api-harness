@@ -233,11 +233,15 @@ async function screenDashboard() {
         return out;
     }
 
-      const gatesNow = G.read();
+      // The count says how many are USABLE, not how many were once marked connected: a
+      // session that has expired must not read as ready. Cached - this loop redraws
+      // every couple of seconds.
+      const gatesNow = await G.refresh(undefined, 30000);
+      const liveNow = gatesNow.gates.filter((g) => g.connected);
       const cfg = LC.read();
-      const ready = LC.validate(cfg, gatesNow.gates);
+      const ready = LC.validate({ ...cfg, gates: cfg.gates.filter((id) => liveNow.some((g) => g.id === id)) }, liveNow);
       const items = [
-          { label: 'Webchats', hint: `${gatesNow.gates.length} configured · ${gatesNow.gates.filter((g) => g.connected).length} connected`, value: 'webchats' },
+      { label: 'Webchats', hint: liveNow.length ? `${liveNow.length} connected · ${gatesNow.gates.length} configured` : `nothing connected yet · ${gatesNow.gates.length} configured`, value: 'webchats' },
           { label: 'Agentic harness', hint: cfg.harnesses.length ? cfg.harnesses.join(', ') : 'choose which agent to run', value: 'harnesses' },
           { label: 'Permission mode', hint: cfg.mode + (cfg.mode === 'yolo' ? ' — no gate at all' : ''), value: 'mode' },
           { label: ready.ok ? 'Launch' : 'Launch (not ready yet)', hint: ready.ok ? LC.summarize(cfg) : ready.problems[0], value: 'plan' },
@@ -548,7 +552,7 @@ async function screenCheck() {
       if (page && page.webSocketDebuggerUrl) S.setPath(raw, 'webchat.cdpWsUrl', page.webSocketDebuggerUrl);
       S.saveRaw(raw, file);
 
-      // Record what was connected, for `webchat connect` in the other terminal.
+      // Record what was connected, for `webchat start`.
       // Keeping the previously chosen agent means the second command never has to
       // ask again — it acts on the decision already made here.
       const prev = D.readConnection() || {};
@@ -565,7 +569,7 @@ async function screenCheck() {
           A.green('This webchat is marked connected.'),
           '',
           A.bold('Next — in a NEW terminal:'),
-          `    ${A.bold(A.cyan('webchat connect'))}`,
+          `    ${A.bold(A.cyan('webchat start'))}`,
           '',
           A.dim('It starts the harness against this browser and opens your agent.'),
           A.dim('Leave the browser window alone — the harness drives it from now on.'),
@@ -1435,7 +1439,7 @@ function cmdStatus() {
 }
 
 
-  // ── webchat connect ────────────────────────────────────────────────────────
+  // ── webchat start ────────────────────────────────────────────────────────
   //
   // The SECOND step, run in a different terminal once the CLI has launched the
   // browser and the user has signed in. It is deliberately non-interactive: the
@@ -1452,7 +1456,7 @@ function cmdStatus() {
   //
   // Every failure names the one command that fixes it, because the person running
   // this is in a fresh terminal with no context.
-  // ── `webchat connect` — the executor ────────────────────────────────────────
+  // ── `webchat start` — the executor ────────────────────────────────────────
 //
 // This runs the config the dashboard primed, and nothing else. It is deliberately
 // NOT a second configurator: every choice lives in .webchat/launch.json, which the
@@ -1462,7 +1466,7 @@ function cmdStatus() {
 // `--dry-run` prints that plan without starting or launching anything, which is also
 // how it is tested — spawning a real interactive agent is not something a test can
 // assert on, but the plan it would execute is.
-async function cmdConnect(argv) {
+async function cmdStart(argv) {
     //   --dry-run    print the plan, touch nothing
     //   --no-launch  do everything except hand the terminal to the harness. The
     //                plumbing (browsers, one gateway per gate, config files) is
@@ -1484,7 +1488,10 @@ async function cmdConnect(argv) {
     // a harness that is already installed are both facts, not preferences, so they are
     // filled in and the launch proceeds.
     if (!cfg.gates.length || !cfg.harnesses.length) {
-        const { cfg: filled, filled: auto } = LC.autofill(cfg, allGates, H.firstInstalled);
+        // Only gates that are live RIGHT NOW are candidates. A stale `connected: true`
+        // pointed the agent at a tab that could never answer.
+        const usable = await G.liveGates(0);
+        const { cfg: filled, filled: auto } = LC.autofill(cfg, usable, H.firstInstalled);
         if (Object.keys(auto).length) {
             Object.assign(cfg, LC.write(filled));
             A.line('');
@@ -1526,13 +1533,25 @@ async function cmdConnect(argv) {
         return 1;
     }
 
+    const liveNow = await G.liveGates(0);
+    const liveIds = new Set(liveNow.map((g) => g.id));
     const chosen = cfg.gates.map((id) => allGates.find((g) => g.id === id)).filter(Boolean);
+    const dead = chosen.filter((g) => !liveIds.has(g.id));
+    if (dead.length) {
+        A.line('');
+        A.line(`  ${A.red('✗')} ${dead.map((g) => g.label).join(', ')} ${dead.length > 1 ? 'are' : 'is'} not signed in.`);
+        A.line('');
+        A.line('  A webchat is only usable while its tab is signed in and answering.');
+        A.line(`      ${A.bold(A.cyan('webchat'))}   →  ${A.bold('Webchats')}  →  ${A.bold('Open the browser')}  →  sign in`);
+        A.line('');
+        return 1;
+    }
     const primary = chosen[0];
     const cwd = cfg.cwd && fs.existsSync(cfg.cwd) ? cfg.cwd : LC.ensureAgentDir();
     const env = H.envFor(chosen);
 
     A.line('');
-    A.line(`  ${A.bold('webchat connect')}   ${A.dim(`${chosen.length} webchat(s) · ${cfg.harnesses.join(', ')} · ${cfg.mode}`)}`);
+    A.line(`  ${A.bold('webchat start')}   ${A.dim(`${chosen.length} webchat(s) · ${cfg.harnesses.join(', ')} · ${cfg.mode}`)}`);
     A.line('');
 
     // ── one gateway per gate ────────────────────────────────────────────────
@@ -1685,25 +1704,35 @@ async function cmdConnect(argv) {
         connectedAt: new Date().toISOString(),
     });
 
-    // The agent owns the TTY from here, so the TUI must give it back first.
-    D.restoreForExec();
-    const { spawnSync } = require('child_process');
-    const args = first.argv;
-    const res = spawnSync(first.h.bin, args, {
+    // ── give the agent its OWN window ───────────────────────────────────────
+    //
+    // The agent is an interactive TUI, and handing it this terminal replaced the CLI -
+    // so the user lost the thing they were just using. It gets its own window now and
+    // this terminal stays a CLI.
+    const started = D.launchInTerminal({
+        bin: first.h.bin,
+        argv: first.argv,
         cwd,
-        stdio: 'inherit',
-        env: { ...process.env, ...env, HARNESS_MODE: cfg.mode },
+        env: { ...env, HARNESS_MODE: cfg.mode },
     });
-    if (res.error) {
-        A.line(`  ${A.red('could not launch:')} ${res.error.message}`);
+    if (!started.ok) {
+        A.line(`  ${A.red('could not launch:')} ${started.error}`);
         return 1;
     }
-    return res.status || 0;
+    if (started.how === 'window') {
+        A.line(`  ${A.green('✓')} ${first.h.label} opened in a new ${started.terminal} window`);
+        A.line(`  ${A.dim('this terminal stays yours — the webchat CLI is still here')}`);
+    } else {
+        A.line(`  ${A.green('✓')} ${first.h.label} started in the background`);
+        A.line(`  ${A.dim('log:')} ${shortHome(started.log)}`);
+    }
+    A.line('');
+    return 0;
 }
 
 module.exports = {
     screenDashboard, screenSite, screenSettings, screenGates, screenStart,
-    screenLogs, screenDoctor, cmdStatus, cmdConnect,
+    screenLogs, screenDoctor, cmdStatus, cmdStart,
 };
 
 // ── Interactive entry point ────────────────────────────────────────────────
@@ -2188,7 +2217,7 @@ async function interactive() {
               else if (choice === 'mode') await gatesScreens().screenMode();
               else if (choice === 'plan') {
                   const next = await gatesScreens().screenPlan();
-                  if (next === 'launch') return cmdConnect([]);
+                  if (next === 'launch') return cmdStart([]);
               } else if (choice === 'tools') await gatesScreens().screenTools();
               else if (choice === 'agentaccess') await screenAgentAccess();
               else if (choice === 'gates') await screenGates();
@@ -2218,7 +2247,7 @@ const USAGE = `
 
   ${A.bold('Two commands')}
     ${A.bold(A.cyan('webchat'))}          the dashboard: live status, and everything else
-    ${A.bold(A.cyan('webchat connect'))}  in a NEW terminal — start the harness and your agent
+      ${A.bold(A.cyan('webchat start'))}    bring it all up and open your agent in its own window
 
     Everything is reachable from ${A.bold('webchat')}’s menu: choose the site, launch and
     log in, start the harness, change any setting, read the logs, run the doctor.
@@ -2239,7 +2268,7 @@ const USAGE = `
       2. ${A.bold('Webchats → Add a webchat')}   pick the site, then "Open the browser"
       3. sign in to that window                 (you do this, not the CLI)
       4. ${A.bold('Webchats → Connect …')}       it checks the tab and records the webchat
-      5. new terminal → ${A.bold('webchat connect')}   harness + agent, wired up
+      5. ${A.bold('webchat start')}   harness + agent, wired up
 
     ${A.bold('Several webchats at once')}
       Each one gets its own browser, profile and ports, so Gemini and ChatGPT can
@@ -2304,7 +2333,9 @@ async function main(argv) {
     // invoking it keeps working; it is not advertised in --help.
     if (cmd === 'status') { await interactive(); return 0; }
 
-    if (cmd === 'connect' && argv[1] !== '--help') return cmdConnect(argv.slice(1));
+    // `start` is the name; `connect` is kept as an alias so an existing habit, script or
+    // README line does not break.
+    if ((cmd === 'start' || cmd === 'connect') && argv[1] !== '--help') return cmdStart(argv.slice(1));
 
     if (cmd === 'start') return withScreen(() => screenStart());
     if (cmd === 'doctor') return withScreen(() => screenDoctor());

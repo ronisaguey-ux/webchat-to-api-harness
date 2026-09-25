@@ -110,3 +110,28 @@ test('auto proceeds by itself and stops only for the risky commands', () => {
     assert.notDeepStrictEqual(P.auto, P.yolo);
     assert.notDeepStrictEqual(P.auto, P.manual);
 });
+
+test('the agent gets its own window, and the CLI keeps this terminal', () => {
+    // Launching used to spawnSync(..., stdio: 'inherit'), which REPLACES the terminal the
+    // user is standing in - so the CLI they were just using disappears. The agent is
+    // launched into its own window (or detached, with a log) instead.
+    const src = fs.readFileSync(path.join(REPO, 'cli', 'index.js'), 'utf8');
+    assert.ok(!/spawnSync\(first\.h\.bin/.test(src),
+        'the agent must not be spawned onto this terminal');
+    assert.match(src, /D\.launchInTerminal\(/, 'it goes through the launcher instead');
+    assert.match(src, /this terminal stays yours/, 'and it says so');
+
+    const D = require(path.join(REPO, 'cli', 'daemon.js'));
+    assert.strictEqual(typeof D.launchInTerminal, 'function');
+    // Either a terminal emulator was found, or the detached fallback is used - never a
+    // crash, and never a silent no-op.
+    const t = D.whichTerminal();
+    assert.ok(t === null || (t && typeof t.bin === 'string'));
+});
+
+test('start is the command and connect still works as an alias', () => {
+    const src = fs.readFileSync(path.join(REPO, 'cli', 'index.js'), 'utf8');
+    assert.match(src, /cmd === 'start' \|\| cmd === 'connect'/, 'both names dispatch');
+    assert.match(src, /async function cmdStart\(/, 'the implementation is named start');
+    assert.ok(!/cmdConnect\b/.test(src), 'the old name is gone, not left dangling');
+});

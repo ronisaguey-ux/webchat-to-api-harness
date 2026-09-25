@@ -111,8 +111,9 @@ test('manual mode never passes a write-enabling flag', () => {
 test('the model id carries the webchat id, so several model names exist', () => {
     // This is what makes multi-webchat useful inside an agent: it switches model and
     // gets a different account underneath.
-    assert.strictEqual(H.modelIdFor({ id: 'gemini' }), 'webchat/gemini');
-    assert.strictEqual(H.modelIdFor({ id: 'chatgpt' }), 'webchat/chatgpt');
+    assert.strictEqual(H.modelIdFor({ id: 'gemini', site: 'gemini' }), 'gemini-webchat');
+    assert.strictEqual(H.modelIdFor({ id: 'chatgpt' }), 'chatgpt-webchat',
+        'the id is <site>-webchat, and it is also the model NAME the harness sends');
 });
 
 test('the environment points at the primary gate and names all of them', () => {
@@ -122,7 +123,7 @@ test('the environment points at the primary gate and names all of them', () => {
     ]);
     assert.strictEqual(env.OPENAI_BASE_URL, 'http://127.0.0.1:8081/v1');
     assert.strictEqual(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:8081');
-    assert.strictEqual(env.HARNESS_MODEL_NAME, 'webchat/gemini');
+    assert.strictEqual(env.HARNESS_MODEL_NAME, 'gemini-webchat', 'the name IS the id the gateway answers to');
     assert.strictEqual(env.HARNESS_GATES, 'gemini,chatgpt');
 });
 

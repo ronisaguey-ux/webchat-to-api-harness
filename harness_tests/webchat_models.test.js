@@ -17,6 +17,15 @@ test('DeepSeek publishes exactly the four combinations the owner listed', () => 
     assert.deepStrictEqual(labels, ['default', 'Search', 'DeepThink', 'Search + DeepThink']);
 });
 
+test('the legacy webchat/<site> ids still parse, so an older agent keeps working', () => {
+    // An agent configured before the rename must not be silently proxied to the real
+    // upstream - which is what a 401 "Authentication Fails" actually was.
+    for (const id of ['webchat/deepseek', 'webchat/deepseek/search']) {
+        const p = W.parse(id);
+        assert.ok(p && p.site === 'deepseek', `${id} must still resolve to deepseek`);
+    }
+});
+
 test('a toggle id round-trips to the state it names', () => {
     assert.deepStrictEqual(
         W.toggleStateFor('deepseek', W.parse('webchat/deepseek/search').toggles),
@@ -55,8 +64,8 @@ test('a non-webchat model id is not ours', () => {
 test('sites whose UI was never read publish no guessed toggles', () => {
     // notegpt and claude could not be probed (site-side send gate; Cloudflare), so
     // they must advertise the bare id and NOT invent chip names.
-    assert.deepStrictEqual(W.modelIdsFor('notegpt'), ['webchat/notegpt']);
-    assert.deepStrictEqual(W.modelIdsFor('claude'), ['webchat/claude']);
+    assert.deepStrictEqual(W.modelIdsFor('notegpt'), ['notegpt-webchat']);
+    assert.deepStrictEqual(W.modelIdsFor('claude'), ['claude-webchat']);
 });
 
 test('requiresNewChat is carried through from the toggle that sets it', () => {
