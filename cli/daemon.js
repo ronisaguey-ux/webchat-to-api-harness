@@ -532,10 +532,26 @@ function chromePath() {
     return null;
 }
 
+// A port that ANSWERS is not a browser. Anything can hold a debug port — a stale process, an
+// unrelated service — and calling that "browser running" is the same lie as a stale connected
+// flag. It is also self-contradicting: cdpTargets() reads /json/list from the SAME port, so a
+// non-CDP listener made cdpAlive say up while cdpTargets said down, in one frame.
+// Require the body to actually identify CDP before reporting it up.
+const CDP_MARKERS = ['webSocketDebuggerUrl', 'Protocol-Version', 'Browser', 'V8-Version'];
+
 async function cdpAlive(port) {
     const res = await httpGet(`http://127.0.0.1:${port}/json/version`, 1500);
     if (!res.ok) return { up: false, error: res.error };
-    try { return { up: true, info: JSON.parse(res.body) }; } catch { return { up: true, info: null }; }
+    let info = null;
+    try {
+        info = JSON.parse(res.body);
+    } catch {
+        return { up: false, error: `port ${port} answered but is not a CDP endpoint (non-JSON body)` };
+    }
+    if (!info || typeof info !== 'object' || !CDP_MARKERS.some((k) => k in info)) {
+        return { up: false, error: `port ${port} answered but is not a CDP endpoint` };
+    }
+    return { up: true, info };
 }
 
 // What tabs the browser has, so the CLI can name the one it found.
