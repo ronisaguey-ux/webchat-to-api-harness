@@ -25,6 +25,7 @@ const G = require('./gates.js');
 const H = require('./harnesses.js');
 const LC = require('./launchconfig.js');
 const screensGates = require('./screens-gates.js');
+const { mcpSetupPrompt } = require('./mcp-setup.js');
 
 
 // The gates/harnesses/launch screens live in their own file; this wires the shared
@@ -178,6 +179,23 @@ async function screenDashboard() {
                 } else snap.metrics = null;
             } else snap.metrics = null;
             snap.cdp = await D.cdpAlive(cdpPort);
+            // cdpAlive reports whether the debug port answers and nothing about tabs —
+            // its shape is { up, info }. The render below reads a tab count, so ask for the
+            // targets too, and give pages a real (empty) array either way.
+            //
+            // Without this the render threw `Cannot read properties of undefined (reading
+            // 'length')` on every machine where the browser WAS running — and the menu
+            // swallows a failing tick, so the whole status panel silently vanished from the
+            // dashboard, which is the main screen. Measured: no `gateway`/`stopped` line ever
+            // reached the terminal while the browser was up.
+            if (snap.cdp && snap.cdp.up) {
+                try {
+                    const t = await D.cdpTargets(cdpPort);
+                    snap.cdp.pages = (t && Array.isArray(t.pages)) ? t.pages : [];
+                } catch { snap.cdp.pages = []; }
+            } else if (snap.cdp) {
+                snap.cdp.pages = [];
+            }
             snap.conn = await resolveConnection();
             snap.at = new Date();
             snap.err = null;
@@ -203,7 +221,7 @@ async function screenDashboard() {
             ? A.green(`up  http://${host}:${port}`)
             : A.gray('stopped')}${m && m.uptimeMs != null ? A.gray(`   up ${fmtDuration(m.uptimeMs)}`) : ''}`);
         body.push(`${A.dim('browser')}    ${snap.cdp.up
-            ? A.green(`running, CDP :${cdpPort}`) + A.gray(`  ${snap.cdp.pages.length} tab(s)`)
+            ? A.green(`running, CDP :${cdpPort}`) + A.gray(`  ${(snap.cdp.pages || []).length} tab(s)`)
             : A.gray('not running')}`);
         body.push(`${A.dim('webchat')}    ${A.bold(m ? m.model || '—' : (get('webchat.mode').value || '—'))}`
             + (connectionBadge(conn) ? A.green('   connected') : ''));
@@ -1381,11 +1399,16 @@ async function screenAgentAccess() {
     A.newline();
 
     const choice = await A.menu([
+        { label: 'Copy a setup prompt for my agent', hint: 'it wires this up for you', value: 'prompt' },
         { label: 'Copy the config block', hint: 'paste it into your agent', value: 'copy' },
         { label: 'List the tools', hint: `${toolCount} available`, value: 'list' },
         { label: 'Back', value: 'back' },
     ], { title: '' });
 
+    if (choice === 'prompt') {
+        await screenMcpSetupPrompt();
+        return screenAgentAccess();
+    }
     if (choice === 'copy') {
         const block = JSON.stringify({ webchat: { type: 'local', command: ['node', serverPath] } }, null, 2);
         const res = D.copyToClipboard ? D.copyToClipboard(block) : { ok: false, reason: 'no clipboard helper' };
@@ -1408,6 +1431,98 @@ async function screenAgentAccess() {
         await A.readKey();
         return screenAgentAccess();
     }
+}
+
+// ── Agent setup prompt (MCP) ───────────────────────────────────────────────
+//
+// A prompt the user copies into THEIR OWN agent so that agent wires this harness up as an
+// MCP server. We cannot write into another product's config: the client may be on another
+// machine (that is what the platform question a screen earlier is about), its config path
+// and schema vary by client and version, and guessing wrong leaves a server that never
+// starts with no error anywhere. An agent on the user's machine can read that config and
+// write it correctly, so the deliverable is a briefing for it.
+//
+// The prompt is PLATFORM-AWARE. It is generated from the answer the user just gave, because
+// that answer decides the shell, the path separators, and whether a path must be escaped
+// inside JSON - and a Windows path handed to a POSIX agent is a setup that fails with a
+// parse error the user cannot interpret.
+async function screenMcpSetupPrompt(platformOverride) {
+    const platform = platformOverride === 'windows' ? 'windows'
+        : platformOverride === 'linux' ? 'linux'
+            : (() => { try { return String(S.resolveAll().platform || 'linux'); } catch { return 'linux'; } })();
+    const serverPath = path.join(__dirname, '..', 'src', 'tools', 'mcp-server.js');
+    let toolCount = 0;
+    try { toolCount = require('../src/tools/mcp-server').TOOLS.length; } catch { /* reported as 0, not guessed */ }
+
+    const build = () => mcpSetupPrompt({ platform, serverPath, toolCount });
+    const outFile = path.join(D.stateDir(), 'mcp-setup-prompt.md');
+
+    const save = () => {
+        try {
+            D.ensureStateDir();
+            fs.writeFileSync(outFile, build(), { mode: 0o600 });
+            return { ok: true, file: outFile };
+        } catch (e) { return { ok: false, reason: e && e.message }; }
+    };
+
+    A.clear();
+    header(['Agent setup prompt', 'MCP']);
+    const shown = shortHome(outFile);
+    for (const l of A.boxLines('Let your own agent wire this up', [
+        'This builds a prompt you paste into YOUR agent - Claude Code, opencode,',
+        'Cursor, any agent with MCP support. That agent reads its own config and',
+        `registers this harness as an MCP server (${toolCount} tools).`,
+        '',
+        `Written for ${platform === 'windows' ? 'Windows (cmd.exe, backslashes)' : 'Linux (bash, forward slashes)'} from your platform answer.`,
+        '',
+        `Copy it, or read ${shown}`,
+    ])) A.line(l);
+    A.newline();
+
+    const choice = await A.menu([
+        { label: 'Copy the prompt', hint: 'paste it into your agent', value: 'copy' },
+        { label: 'Save it to a file', hint: shown, value: 'save' },
+        { label: 'Preview it', hint: `${build().length} characters`, value: 'preview' },
+        { label: 'Back', value: 'back' },
+    ], { title: '' });
+
+    if (choice === 'copy') {
+        const res = D.copyToClipboard ? D.copyToClipboard(build()) : { ok: false, reason: 'no clipboard helper' };
+        // A clipboard copy is the request; the file is the fallback for when it fails, so a
+        // failed copy still leaves the user with the prompt rather than with nothing.
+        const saved = res.ok ? null : save();
+        await A.message(res.ok ? 'Copied' : 'Could not copy', res.ok
+            ? ['Paste it into your agent and let it do the setup.']
+            : [A.red(res.reason || 'clipboard unavailable'),
+                saved && saved.ok
+                    ? `The prompt is at ${shortHome(saved.file)} - open and copy it from there.`
+                    : 'and it could not be written to a file either.']);
+        return screenMcpSetupPrompt(platform);
+    }
+    if (choice === 'save') {
+        const res = save();
+        await A.message(res.ok ? 'Saved' : 'Could not save', res.ok
+            ? [`${shortHome(res.file)}`, 'Open it and copy the whole thing into your agent.']
+            : [A.red(res.reason || 'write failed')]);
+        return screenMcpSetupPrompt(platform);
+    }
+    if (choice === 'preview') {
+        A.clear();
+        header(['Agent setup prompt', 'preview']);
+        const text = build();
+        const lines = text.split('\n');
+        // The prompt is longer than any terminal, so show a head and say so rather than
+        // truncating silently and letting the user think that is all of it.
+        const room = Math.max(8, A.termHeight() - 6);
+        for (const l of lines.slice(0, room)) A.line('  ' + A.gray(A.truncate(l, A.termWidth() - 6)));
+        A.newline();
+        A.line(A.gray(`  ... ${lines.length - room} more lines (${text.length} characters total). Use Copy or Save for the whole thing.`));
+        A.newline();
+        A.line(A.gray('  any key to go back'));
+        await A.readKey();
+        return screenMcpSetupPrompt(platform);
+    }
+    return A.BACK;
 }
 
 // ── Doctor ─────────────────────────────────────────────────────────────────
@@ -1911,8 +2026,16 @@ async function screenWelcome() {
         return rows;
     };
 
+    // resolveAll() returns an ARRAY of resolved rows, not an object — so this used to read
+    // `.platform` off an array, which is always undefined. Two consequences, both silent:
+    // the "(current)" marker below never rendered on any launch (a display that could not
+    // show which value was in force), and the one-off setup prompt was shown to EVERY user
+    // on EVERY launch instead of only to someone who has not answered the question yet.
     let current = '';
-    try { current = String(S.resolveAll().platform || ''); } catch { /* unset is fine */ }
+    try {
+        const row = S.resolveAll().find((r) => r.setting.path === 'platform');
+        current = row && row.value !== undefined && row.value !== null ? String(row.value) : '';
+    } catch { /* unset is fine */ }
     const mine = (v) => (current === v ? '   (current)' : '');
 
     const pick = await A.menu([
@@ -1937,6 +2060,13 @@ async function screenWelcome() {
     if (res && res.ok === false) {
         await A.message('Could not save', [`${res.reason || 'the platform was not written'}`]);
     }
+
+    // The setup prompt follows the platform answer ON FIRST RUN, because that is the moment
+    // the answer is fresh and the user is being told how the pieces fit. It is offered again
+    // from Agent access (MCP) at any time, so this is a convenience rather than the only way
+    // in - and it is deliberately NOT shown on every launch, since the walk runs every launch
+    // and a prompt nobody asked for becomes a keypress to dismiss.
+    if (!current) await screenMcpSetupPrompt(pick);
     return 'next';
 }
 
