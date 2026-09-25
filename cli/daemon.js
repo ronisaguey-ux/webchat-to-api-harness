@@ -565,8 +565,36 @@ function connectFile() { return path.join(stateDir(), 'connected.json'); }
 function readConnection() {
     try {
         const d = JSON.parse(fs.readFileSync(connectFile(), 'utf-8'));
-        return d && typeof d === 'object' ? d : null;
+        return d && typeof d === 'object' ? normalizeConnection(d) : null;
     } catch { return null; }
+}
+
+// connected.json has been written in THREE shapes over time, by three different call sites:
+//
+//   {gates:[{id,gatewayPort,cdpPort}], mode, agent, cwd}   the current, correct one
+//   {gate:'deepseek', mode, cdpPort, gatewayPort}          screens-gates.js — singular key
+//   {mode, cdpPort, cdpWsUrl, targetUrl}                   the older single-connection flow,
+//                                                          which named no gate at all
+//
+// Only the first names a gate, so a reader that trusted it reported "nothing connected"
+// after a connect that had genuinely happened — a false negative, which is the same class
+// of dishonesty as a false positive. Normalising on READ fixes every consumer at once,
+// including ones not written yet.
+function normalizeConnection(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const out = { ...raw };
+    if (!Array.isArray(out.gates) || !out.gates.length) {
+        if (raw.gate) {
+            out.gates = [{ id: raw.gate, gatewayPort: raw.gatewayPort, cdpPort: raw.cdpPort }];
+        } else if (raw.cdpPort) {
+            // No gate named: keep the port so a caller can still match it against the
+            // registry. `id: null` is honest about not knowing, not a fabricated name.
+            out.gates = [{ id: null, cdpPort: raw.cdpPort }];
+        } else {
+            out.gates = [];
+        }
+    }
+    return out;
 }
 
 function writeConnection(info) {
@@ -641,6 +669,7 @@ module.exports = {
     copyToClipboard, restoreForExec,
     launchInTerminal, whichTerminal,
     realDisplay, connectFile, readConnection, writeConnection, clearConnection,
+    normalizeConnection,
 };
 
 // Hand the terminal back to cooked mode before spawning something that owns the

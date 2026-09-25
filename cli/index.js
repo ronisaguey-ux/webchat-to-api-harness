@@ -71,6 +71,14 @@ async function panel(title, bodyLines, backLabel = 'Back') {
     return A.menu([{ label: backLabel, value: 'back' }], { title: '' });
 }
 
+// Pure, so the rule is testable without a terminal: what the dashboard is allowed to
+// claim about the connection. `conn` is the resolved connection from resolveConnection(),
+// which carries `live` from a real probe. Anything but a proven-live connection yields
+// null — the caller then shows NOTHING rather than a reassuring label.
+function connectionBadge(conn) {
+    return conn && conn.live === true ? 'connected' : null;
+}
+
 // ── Dashboard ──────────────────────────────────────────────────────────────
 // ── Helpers for the live view ──────────────────────────────────────────────
 function fmtDuration(ms) {
@@ -124,8 +132,40 @@ async function screenDashboard() {
 
     const snap = {
         gw: { up: false }, metrics: null, cdp: { up: false, pages: [] },
-        at: new Date(), err: null,
+        conn: null, at: new Date(), err: null,
     };
+
+    // Is the RECORDED connection actually live right now?
+    //
+    // `connected.json` is written when the user confirms a tab, and NOTHING ever clears it
+    // (clearConnection is defined and never called), so reading it alone reported
+    // "connected" for a browser that had been closed. The Webchats list has always
+    // re-verified with G.refresh(); the header did not, so the two contradicted each other
+    // on the same screen.
+    //
+    // The rule is the gate list's own rule (G.live): the browser answers, a tab for the
+    // site exists, it has a composer, and the page carries no sign-in copy. Using the same
+    // standard means the header and the list can never disagree. Cached inside G, so a
+    // 2s redraw does not open a browser connection every time.
+    async function resolveConnection() {
+        const recorded = D.readConnection();
+        if (!recorded || !Array.isArray(recorded.gates) || !recorded.gates.length) return null;
+        const want = recorded.gates[0];
+        const reg = G.read();
+        // Match by id, and fall back to the port: the oldest writer recorded no gate name,
+        // only the CDP port, and normalisation deliberately keeps it `null` rather than
+        // inventing one.
+        const gate = (reg.gates || []).find((g) => want.id && g.id === want.id)
+            || (reg.gates || []).find((g) => want.cdpPort && g.cdpPort === want.cdpPort);
+        if (!gate) return { ...recorded, live: false, why: 'that webchat is no longer configured' };
+        let state;
+        try {
+            state = await G.liveCached(gate, 30000);
+        } catch (e) {
+            state = { live: false, why: (e && e.message) || 'could not be checked' };
+        }
+        return { ...recorded, live: Boolean(state.live), why: state.live ? null : state.why };
+    }
 
     async function refresh() {
         try {
@@ -138,6 +178,7 @@ async function screenDashboard() {
                 } else snap.metrics = null;
             } else snap.metrics = null;
             snap.cdp = await D.cdpAlive(cdpPort);
+            snap.conn = await resolveConnection();
             snap.at = new Date();
             snap.err = null;
         } catch (e) {
@@ -153,7 +194,9 @@ async function screenDashboard() {
         out.push(A.gray(`  ${shortHome(st.file)}`));
 
         const m = snap.metrics;
-        const conn = D.readConnection();
+        // LIVE, never the recorded file: a connection that has gone away must not read as
+        // connected. When it is not live, show nothing rather than a reassuring label.
+        const conn = snap.conn && snap.conn.live ? snap.conn : null;
 
         const body = [];
         body.push(`${A.dim('gateway')}    ${snap.gw.up
@@ -163,7 +206,7 @@ async function screenDashboard() {
             ? A.green(`running, CDP :${cdpPort}`) + A.gray(`  ${snap.cdp.pages.length} tab(s)`)
             : A.gray('not running')}`);
         body.push(`${A.dim('webchat')}    ${A.bold(m ? m.model || '—' : (get('webchat.mode').value || '—'))}`
-            + (conn ? A.green('   connected') : A.gray('   not connected')));
+            + (connectionBadge(conn) ? A.green('   connected') : ''));
 
         if (!snap.gw.up) {
             body.push('');
@@ -289,14 +332,31 @@ async function screenSite() {
 
           A.clear();
           header(['Webchat & browser']);
-          const conn = D.readConnection();
+          // The same live rule as the dashboard header. This screen already probes the
+          // browser on the line above, so reading the recorded file here let one frame
+          // claim "browser: not running" AND "connected" at once.
+          const recorded = D.readConnection();
+          let connLive = false;
+          let connWhy = null;
+          if (recorded && Array.isArray(recorded.gates) && recorded.gates.length) {
+              const reg = G.read();
+              const gate = (reg.gates || []).find((g) => g.id === recorded.gates[0].id);
+              if (!gate) {
+                  connWhy = 'that webchat is no longer configured';
+              } else {
+                  let stt;
+                  try { stt = await G.liveCached(gate, 30000); } catch (e) { stt = { live: false, why: (e && e.message) || 'could not be checked' }; }
+                  connLive = Boolean(stt.live);
+                  connWhy = stt.live ? null : stt.why;
+              }
+          }
           const body = [
               `${A.dim('selected')}  ${A.bold(modeRow.value || '(unset)')}`,
               `${A.dim('browser')}   ${cdp.up ? A.green(`running on CDP :${cdpPort}`) : A.gray('not running')}`,
               `${A.dim('profile')}   ${shortHome(D.profileDir())}`,
-              `${A.dim('connected')} ${conn
-                  ? A.green(`${conn.mode}${conn.agent ? ` → ${conn.agent}` : ''}`)
-                  : A.gray('not yet — launch, log in, then Connect')}`,
+              `${A.dim('connected')} ${connLive
+                  ? A.green(`${recorded.mode}${recorded.agent ? ` → ${recorded.agent}` : ''}`)
+                  : A.gray(connWhy ? `no — ${connWhy}` : 'not yet — launch, log in, then Connect')}`,
           ];
         if (modeRow.shadowedBy) {
             body.push('');
@@ -556,7 +616,13 @@ async function screenCheck() {
       // Keeping the previously chosen agent means the second command never has to
       // ask again — it acts on the decision already made here.
       const prev = D.readConnection() || {};
+      // Record the gate in the CANONICAL shape so every reader (the dashboard header, the
+      // launcher, the MCP) sees the same thing. This used to omit `gates` entirely, which
+      // read back as "nothing connected" after a successful connect.
+      const reg = G.read();
+      const gcfg = (reg.gates || []).find((g) => g.cdpPort === port);
       D.writeConnection({
+          gates: gcfg ? [{ id: gcfg.id, gatewayPort: gcfg.gatewayPort, cdpPort: gcfg.cdpPort }] : [],
           mode,
           cdpPort: port,
           cdpWsUrl: (page && page.webSocketDebuggerUrl) || null,
@@ -1730,11 +1796,6 @@ async function cmdStart(argv) {
     return 0;
 }
 
-module.exports = {
-    screenDashboard, screenSite, screenSettings, screenGates, screenStart,
-    screenLogs, screenDoctor, cmdStatus, cmdStart,
-};
-
 // ── Interactive entry point ────────────────────────────────────────────────
 // ── The greeting ────────────────────────────────────────────────────────────
 //
@@ -2354,4 +2415,12 @@ async function main(argv) {
     return 0;
 }
 
-module.exports = { main, interactive, platformChosen, screenWelcome, screenTourChoice, screenTutorial };
+module.exports = {
+    main, interactive, platformChosen, screenWelcome, screenTourChoice, screenTutorial,
+    connectionBadge,
+    // These were exported by a SECOND module.exports earlier in the file, which the
+    // assignment below silently overwrote — so anything importing them got undefined.
+    // One export object, at the end, is the only safe shape.
+    screenDashboard, screenSite, screenSettings, screenGates, screenStart,
+    screenLogs, screenDoctor, cmdStatus, cmdStart,
+};
