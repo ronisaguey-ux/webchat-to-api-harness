@@ -1182,10 +1182,13 @@ async function screenLogs() {
 //
 // It never includes a secret. The env is filtered to names, never values — a bug
 // report is the last place an API key should end up.
-function collectDiagnostics(extra = {}) {
+async function collectDiagnostics(extra = {}) {
     const st = state();
     const rows = rowsOf(st);
-    const gates = G.read();
+    // Refreshed, not read: this is a PROBLEM REPORT, and a stale `connected` flag makes the
+    // report describe a harness the user does not have. It is the one artifact that has to
+    // be honest, because it is what gets pasted into a bug report.
+    const gates = await G.refresh(undefined, 0);
     const cfg = LC.read();
     const sh = (c, a) => {
         try {
@@ -1268,7 +1271,9 @@ function issueUrl(diag) {
 }
 
 async function screenReport(extra = {}) {
-    const diag = collectDiagnostics(extra);
+    // await: collectDiagnostics probes the gates live now, so a report cannot describe a
+    // harness state that has already gone away.
+    const diag = await collectDiagnostics(extra);
     const txt = reportText(diag);
 
     A.clear();
