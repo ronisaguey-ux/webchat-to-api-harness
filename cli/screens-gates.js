@@ -27,7 +27,9 @@ function build(ctx) {
     async function screenGates() {
         let menuStart = 0;
         for (;;) {
-            const { gates, active } = G.read();
+            // Refreshed: a gate is only offered as connected while its tab is actually
+            // signed in and answering, so an expired session stops being selectable.
+            const { gates, active } = await G.refresh(undefined, 30000);
 
             A.clear();
             header(['Webchats']);
