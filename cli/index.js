@@ -1476,13 +1476,41 @@ async function cmdConnect(argv) {
     const { gates: allGates } = G.read();
     const problems = [];
 
-    if (!cfg.gates.length && !cfg.harnesses.length) {
+    // ── configure it ourselves rather than sending the user away ────────────
+    //
+    // This used to print "Nothing is configured yet" and tell the user to go and set it
+    // up in another terminal. The point of `connect` is that it just connects: anything
+    // the machine can answer for itself, it answers. A gate that is already connected and
+    // a harness that is already installed are both facts, not preferences, so they are
+    // filled in and the launch proceeds.
+    if (!cfg.gates.length || !cfg.harnesses.length) {
+        const { cfg: filled, filled: auto } = LC.autofill(cfg, allGates, H.firstInstalled);
+        if (Object.keys(auto).length) {
+            Object.assign(cfg, LC.write(filled));
+            A.line('');
+            A.line(`  ${A.dim('nothing was configured — filled in')} ${A.bold(Object.entries(auto)
+                .map(([k, v]) => `${k}: ${v.join(', ')}`).join(' · '))}`);
+        }
+    }
+
+    if (!cfg.gates.length) {
+        // A webchat cannot be invented: it is an account someone has to sign into.
         A.line('');
-        A.line(`  ${A.red('Nothing is configured yet.')}`);
+        A.line(`  ${A.red('No webchat yet.')}`);
         A.line('');
-        A.line('  Set it up in another terminal:');
-        A.line(`      ${A.bold(A.cyan('webchat'))}`);
-        A.line(`  then  ${A.bold('Webchats → Add a webchat')}  and  ${A.bold('Launch → Choose harness')}.`);
+        A.line('  Add one - it opens a browser for you to log into:');
+        A.line(`      ${A.bold(A.cyan('webchat'))}   →  ${A.bold('Webchats → Add a webchat')}`);
+        A.line('');
+        A.line(`  ${A.dim('That is the only step only you can do; everything after it is automatic.')}`);
+        A.line('');
+        return 1;
+    }
+    if (!cfg.harnesses.length) {
+        A.line('');
+        A.line(`  ${A.red('No agentic harness found on PATH.')}`);
+        A.line('');
+        A.line('  Install one of these, then run this again:');
+        A.line(`      ${A.dim('opencode')}  ·  ${A.dim('claude')}  ·  ${A.dim('aider')}`);
         A.line('');
         return 1;
     }

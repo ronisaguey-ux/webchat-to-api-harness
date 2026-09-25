@@ -84,6 +84,22 @@ function clear() {
     try { fs.unlinkSync(f); } catch { /* already gone */ }
 }
 
+// Fill in what the machine can answer for itself, so `connect` never sends the user to
+// another terminal to configure things that are already true. `gates` is the gate list,
+// `pickHarness` returns an installed harness id (or null). Pure: no I/O, so it is testable.
+function autofill(cfg, gates, pickHarness) {
+    const filled = {};
+    if (!cfg.gates || !cfg.gates.length) {
+        const ready = (gates || []).filter((g) => g.connected !== false).map((g) => g.id);
+        if (ready.length) filled.gates = [ready[0]];
+    }
+    if (!cfg.harnesses || !cfg.harnesses.length) {
+        const h = typeof pickHarness === 'function' ? pickHarness() : pickHarness;
+        if (h) filled.harnesses = [h];
+    }
+    return { cfg: { ...cfg, ...filled }, filled };
+}
+
 // Is this config ready to run? Returns the reasons it is not, so the CLI can say
 // what is missing instead of launching something half-configured.
 function validate(cfg, gates) {
@@ -107,4 +123,4 @@ function summarize(cfg) {
     return parts.join('  ·  ');
 }
 
-module.exports = { read, write, clear, validate, summarize, DEFAULT, file, agentDir, ensureAgentDir };
+module.exports = { read, write, clear, validate, summarize, autofill, DEFAULT, file, agentDir, ensureAgentDir };

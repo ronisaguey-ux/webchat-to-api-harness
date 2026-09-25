@@ -62,3 +62,26 @@ test('the generated agent config is written into the isolated folder, not HOME',
     assert.strictEqual(fs.existsSync(homeCfg), hadHome,
         'writing the agent config must not create or touch ~/opencode.json');
 });
+
+test('connect fills in what the machine already knows, instead of asking the user', () => {
+    // It used to print "Nothing is configured yet" and send the user to another terminal.
+    // A connected gate and an installed harness are facts, not preferences, so they are
+    // filled in. Pure function, so this needs no TTY and no launch.
+    const gates = [
+        { id: 'deepseek', connected: true },
+        { id: 'gemini', connected: false },
+    ];
+    const r = LC.autofill({ gates: [], harnesses: [], mode: 'auto' }, gates, () => 'opencode');
+    assert.deepStrictEqual(r.filled, { gates: ['deepseek'], harnesses: ['opencode'] });
+    assert.deepStrictEqual(r.cfg.gates, ['deepseek'], 'the CONNECTED gate is chosen');
+    assert.deepStrictEqual(r.cfg.harnesses, ['opencode']);
+
+    // A choice the user already made is never overridden.
+    const kept = LC.autofill({ gates: ['gemini'], harnesses: ['claude'] }, gates, () => 'opencode');
+    assert.deepStrictEqual(kept.filled, {}, 'an explicit selection is left alone');
+    assert.deepStrictEqual(kept.cfg.gates, ['gemini']);
+
+    // Nothing usable to pick: no invention, and no crash.
+    const none = LC.autofill({ gates: [], harnesses: [] }, [], () => null);
+    assert.deepStrictEqual(none.filled, {});
+});

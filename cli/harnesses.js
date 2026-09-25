@@ -298,7 +298,19 @@ function argvFor(h, mode, extra = [], env = {}) {
     return [...pin, ...flags, ...extra];
 }
 
+// The first harness that is actually installed, preferring the two most common agents.
+// Used to fill in a launch the user has not configured yet, so `webchat connect` sets
+// itself up instead of sending them to another terminal.
+function firstInstalled(preferred = ['opencode', 'claude']) {
+    for (const id of preferred) {
+        const h = harnessById(id);
+        if (h && installed(h)) return id;
+    }
+    return (HARNESSES.find((h) => installed(h)) || {}).id || null;
+}
+
 module.exports = {
+    firstInstalled,
     MODES,
     HARNESSES,
     harnessById,
