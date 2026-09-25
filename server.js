@@ -256,10 +256,20 @@ function lineRangeFromDiff(text, sign) {
 // 09-12 (owner): a FIXED gap is itself a bot signature. Pick a fresh random
 // delay in [MIN, MAX] for EVERY send, on EVERY lane, so the cadence never
 // repeats. MIN_SEND_INTERVAL_MS stays as the floor for backwards compatibility;
-// SEND_GAP_MIN_MS / SEND_GAP_MAX_MS set the range (default 20s-80s).
+// SEND_GAP_MIN_MS / SEND_GAP_MAX_MS set the range (default 3s-15s).
 const MIN_SEND_INTERVAL_MS = parseInt(process.env.MIN_SEND_INTERVAL_MS || '6000', 10);
-const SEND_GAP_MIN_MS = parseInt(process.env.SEND_GAP_MIN_MS || '20000', 10);
-const SEND_GAP_MAX_MS = parseInt(process.env.SEND_GAP_MAX_MS || '80000', 10);
+// DEFAULTS LOWERED 20000/80000 -> 3000/15000, and they are now editable from the CLI
+// (webchat settings -> Webchat & connection), which they were not before: they were
+// env-only, so the name for this delay existed nowhere the user could see.
+//
+// The old range averaged 50s a send and a single agent turn makes several sends (each
+// tool round-trip is another one), so a one-word reply measured ~150s of waiting and
+// ~7s of actual thinking. The anti-bot property comes from the gap being RANDOM and
+// never repeating, not from it being enormous — and a person replying in a chat waits
+// seconds, not a minute. Raise the pair if you want more padding; set both to 0 to
+// remove the random gap entirely (MIN_SEND_INTERVAL_MS still spaces the sends).
+const SEND_GAP_MIN_MS = parseInt(process.env.SEND_GAP_MIN_MS || '3000', 10);
+const SEND_GAP_MAX_MS = parseInt(process.env.SEND_GAP_MAX_MS || '15000', 10);
 function nextSendGapMs() {
     const lo = Math.max(0, Math.min(SEND_GAP_MIN_MS, SEND_GAP_MAX_MS));
     const hi = Math.max(lo, SEND_GAP_MAX_MS);
@@ -575,8 +585,9 @@ async function countedSend(msg, defs) {
             return Math.max(0, prev + MIN_SEND_INTERVAL_MS - Date.now());
         } catch { return 0; }
     })();
-    // 09-12: the RANDOM 20-80s gap is a DeepSeek anti-ban measure (owner rule:
-    // "to make it seem less botted"). Gemini is a different account on a
+    // 09-12: the RANDOM gap is a DeepSeek anti-ban measure (owner rule: "to make it seem
+    // less botted"). Its range is SEND_GAP_MIN_MS/MAX (3-15s by default, editable in the
+    // CLI settings). Gemini is a different account on a
     // different host and needs no such padding — applying it there only added up
     // to 80s to every gemini send on top of its own latency, which is what made
     // the engine's lane budget expire (measured: `gemini failed (timeout after
@@ -2278,8 +2289,9 @@ app.get('/metrics', (req, res) => {
     // is what a user watches while a run looks slow.
     //
     // The random gap is a DeepSeek anti-ban measure and is NOT applied to other
-    // webchats (see countedSend). Gemini therefore has NO pacing gap, and the
-    // dashboard said "20-80s between sends" for it — a wait that never happens.
+    // webchats (see countedSend). Gemini therefore has NO pacing gap, and the dashboard
+    // used to print a fixed range for it regardless — a wait that never happened. It now
+    // reports the range actually in force, per account.
     const account = process.env.WEBCHAT_ACCOUNT || String(process.env.PORT || '');
     const pacing = (() => {
         const lo = Math.max(0, Math.min(SEND_GAP_MIN_MS, SEND_GAP_MAX_MS));
