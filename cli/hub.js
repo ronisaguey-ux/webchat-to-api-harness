@@ -42,7 +42,12 @@ function targetFor(modelId, gates, models) {
     if (!site) return { error: `cannot tell which webchat "${id}" belongs to` };
 
     const gate = gates.find((g) => g.site === site);
-    if (!gate) return { error: `no connected webchat serves "${site}"` };
+    // The wording matters: this checks the REGISTRY for a matching site, not whether that
+    // webchat is usable. Saying "no connected webchat" for a site whose gate exists but is
+    // signed out sends the reader hunting for a missing configuration that is present —
+    // the relay's own 502 is the layer that reports an unreachable gateway. Say what was
+    // actually tested.
+    if (!gate) return { error: `no webchat is configured for "${site}"` };
     if (!gate.gatewayPort) return { error: `the "${site}" gateway has no port` };
     return { url: `http://127.0.0.1:${gate.gatewayPort}`, site };
 }
