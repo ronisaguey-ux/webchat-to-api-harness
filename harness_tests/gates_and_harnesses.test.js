@@ -357,3 +357,20 @@ test('the config model names a key that exists under its own provider', () => {
     assert.strictEqual(cfg.model, `webchat/${env.HARNESS_MODEL_NAME}`,
         'and it must be the same id the -m flag uses, so flag and fallback cannot disagree');
 });
+
+// ── the Anthropic route needs a model the gateway knows ──────────────────────
+//
+// envFor set ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN but NOT ANTHROPIC_MODEL, so the
+// claude harness sent its own default name. /v1/messages does not recognise
+// `claude-sonnet-4-20250514`: it misses WEBCHAT_ROUTES and proxies to the PAID upstream.
+// Measured on the live gateway: 'deepseek-webchat' -> 200 (our tab),
+// 'claude-sonnet-4-20250514' -> 401 "auth header format should be Bearer sk-..." (paid).
+// Base URL and token alone are not a configuration; the model has to be named too.
+test('envFor names the Anthropic model, so claude cannot fall through to the paid proxy', () => {
+    const gates = [{ id: 'deepseek', site: 'deepseek', label: 'DeepSeek', gatewayPort: 8081, cdpPort: 9225 }];
+    const env = H.envFor(gates, {});
+    assert.strictEqual(env.ANTHROPIC_MODEL, 'deepseek-webchat',
+        'without this claude sends its own model name and /v1/messages proxies to the paid API');
+    assert.strictEqual(env.ANTHROPIC_MODEL, env.HARNESS_MODEL_NAME,
+        'the anthropic and openai routes must name the same model, or the two harnesses disagree');
+});
