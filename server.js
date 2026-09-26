@@ -1642,7 +1642,13 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                     console.log('⚠️ submit_answer arrived having run ZERO tools — marking the answer as unverified (possible phantom completion)');
                     onProgress?.({ type: 'rejected', text: 'submit after zero tool calls — answer marked unverified' });
                 }
-                return verdict.text || '[webchat model completed the task]';
+                // Never manufacture an answer. This used to fall back to the literal
+                // "[webchat model completed the task]" after the one empty-submit nudge,
+                // so two empty submits reached the caller as a confident completion.
+                if (!String(verdict.text || '').trim()) {
+                    throw new HarnessIncomplete('empty', 'webchat model submitted an empty answer twice — no result to return');
+                }
+                return verdict.text;
             }
             if (call.toolName !== 'send_message') {
                 onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
