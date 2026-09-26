@@ -15,6 +15,9 @@ const path = require('path');
 const G = require('./_gateway');
 const tools = require('../src/tools/tools');
 
+// stdout is the test runner's IPC channel; the tool log must not write into it.
+console.log = (...a) => process.stderr.write(a.join(' ') + '\n');
+
 const BIN = path.join(G.TMP, 'bin');
 const LOG = path.join(G.TMP, 'git.log');
 fs.mkdirSync(BIN, { recursive: true });

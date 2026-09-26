@@ -216,4 +216,91 @@ function pushDenial(cmd) {
     return null;
 }
 
-module.exports = { lex, commands, argvs, unwrap, pushDenial, pushArgvDenial };
+// ── Destructive commands ────────────────────────────────────────────────────
+//
+// The Linux deny-list was a substring list, which failed both ways (measured
+// 2026-09-25): `rm -r -f`, `rm  -rf /` (two spaces) and `find / -delete` ran, while
+// `grep -r halting src/` and `echo reboot notes` were refused because "halt" and
+// "reboot" appear somewhere in the string. Commands are now matched on argv: the
+// program actually run and the flags actually passed. What is refused is unchanged in
+// intent — irreversible system destruction with no place in a coding agent's work.
+
+// Still matched as text: these are not commands but things that must never appear in
+// one (secrets, the settings backup) or shapes that are not a single argv (fork bomb,
+// raw writes to a block device, a download piped into a shell).
+const TEXT_DENY = [
+    [/:\s*\(\s*\)\s*\{/, 'fork bomb'],
+    [/>\s*\/dev\/(sd|hd|vd|xvd|nvme|mmcblk)/, '> /dev/<disk>'],
+    [/\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b/, 'download piped into a shell'],
+    [/settings_backup\.json/, 'settings_backup.json'],
+    [/ghp_/, 'ghp_'],
+    [/TELEGRAM_TOKEN/, 'TELEGRAM_TOKEN'],
+    [/BOT_TOKEN/, 'BOT_TOKEN'],
+];
+
+const POWER = new Set(['shutdown', 'reboot', 'halt', 'poweroff']);
+const DISK = new Set(['wipefs', 'shred']);
+
+// Short flags as a set of letters (`-rf`, `-r -f`, `-fR` all give r and f); long
+// flags by name. Stops at `--`.
+function flagSet(args) {
+    const short = new Set();
+    const long = new Set();
+    for (const w of args) {
+        if (w === '--') break;
+        if (w.startsWith('--')) long.add(w.split('=')[0]);
+        else if (w.startsWith('-') && w.length > 1) for (const c of w.slice(1)) short.add(c);
+    }
+    return { short, long };
+}
+
+function argvDanger(a) {
+    const prog = a[0].split('/').pop();
+    const args = a.slice(1);
+    const f = flagSet(args);
+    if (prog === 'rm') {
+        const recursive = f.short.has('r') || f.short.has('R') || f.long.has('--recursive');
+        const force = f.short.has('f') || f.long.has('--force');
+        if (recursive && force) return 'rm -rf';
+    }
+    if (prog === 'find') {
+        if (args.includes('-delete')) return 'find -delete';
+        const ex = args.findIndex((w) => w === '-exec' || w === '-execdir' || w === '-ok' || w === '-okdir');
+        if (ex !== -1 && args[ex + 1] && args[ex + 1].split('/').pop() === 'rm') return 'find -exec rm';
+    }
+    if (POWER.has(prog)) return prog;
+    if ((prog === 'init' || prog === 'telinit') && /^[06]$/.test(args[0] || '')) return prog + ' ' + args[0];
+    if (prog === 'systemctl' && args.some((w) => /^(poweroff|reboot|halt|kexec)$/.test(w))) return 'systemctl ' + args.find((w) => /^(poweroff|reboot|halt|kexec)$/.test(w));
+    if (prog === 'mkfs' || prog.startsWith('mkfs.')) return 'mkfs';
+    if (DISK.has(prog)) return prog;
+    if (prog === 'dd' && args.some((w) => /^(if|of)=/.test(w))) return 'dd';
+    if (prog === 'pkill' && (f.short.has('f') || f.long.has('--full'))) return 'pkill -f';
+    if ((prog === 'node' || prog === 'nodejs') && (f.short.has('e') || f.short.has('p') || f.long.has('--eval') || f.long.has('--print'))) {
+        // `node -e` is refused because the command text is the whole program: nothing
+        // about it can be checked here. Scripts on disk go through the path fence.
+        return 'node -e';
+    }
+    if (prog === 'chown' && (f.short.has('R') || f.long.has('--recursive'))) return 'chown -R';
+    if (prog === 'chmod' && (f.short.has('R') || f.long.has('--recursive')) && args.includes('/')) return 'chmod -R … /';
+    return null;
+}
+
+// The reason `cmd` is refused as destructive, or null. `windowsPatterns` is the
+// platform's text list, used as-is on Windows, where cmd.exe syntax is not parsed here.
+function dangerDenial(cmd, { windows = false, windowsPatterns = [] } = {}) {
+    const text = String(cmd || '');
+    if (windows) {
+        const hit = windowsPatterns.find((p) => text.includes(p));
+        return hit ? 'run_bash DENIED: command matches dangerous pattern: ' + hit : null;
+    }
+    for (const [re, name] of TEXT_DENY) {
+        if (re.test(text)) return 'run_bash DENIED: command matches dangerous pattern: ' + name;
+    }
+    for (const a of argvs(text)) {
+        const hit = argvDanger(a);
+        if (hit) return 'run_bash DENIED: command matches dangerous pattern: ' + hit;
+    }
+    return null;
+}
+
+module.exports = { lex, commands, argvs, unwrap, pushDenial, pushArgvDenial, dangerDenial };
