@@ -73,7 +73,8 @@ test('the failure path NEVER re-sends text the client already has', () => {
 test('the partial count is still reported in usage', () => {
     const frames = streamFailureEvents({ partial: 'abcde' });
     const delta = frames.find((f) => f.event === 'message_delta');
-    assert.strictEqual(delta.data.usage.output_tokens, 5);
+    // Tokens, estimated as chars/4 — not the character count.
+    assert.strictEqual(delta.data.usage.output_tokens, 2);
 });
 
 test('the terminal events come last, in order', () => {

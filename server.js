@@ -553,6 +553,36 @@ async function jevCheckReply(msg, reply) {
     }
 }
 
+// ── Usage (estimated) ───────────────────────────────────────────────────────
+// Responses used to report input_tokens 0 and output_tokens = CHARACTERS of the final
+// answer, so a caller's token breaker summed ~0 per request however much was sent —
+// a 12-round tool loop resending 150K-char receipts read as free. The webchat reports
+// no token counts, so these are estimates (chars/4, like estimateTokens) of what was
+// actually exchanged with the tab: every send's full composed prompt in, every reply
+// out, tool rounds and retries included. X-Harness-Usage-Estimated marks them.
+let turnUsage = null;
+function noteUsage(msg, defs, reply) {
+    if (!turnUsage) return;
+    let sent;
+    try { sent = buildFullPrompt(msg, defs).length; } catch { sent = String(msg ?? '').length; }
+    turnUsage.sentChars += sent;
+    turnUsage.recvChars += String(reply ?? '').length;
+    turnUsage.sends += 1;
+}
+function usageTokens(u) {
+    const input = Math.ceil(((u && u.sentChars) || 0) / 4);
+    const output = Math.ceil(((u && u.recvChars) || 0) / 4);
+    return { input, output };
+}
+function openaiUsage(u) {
+    const t = usageTokens(u);
+    return { prompt_tokens: t.input, completion_tokens: t.output, total_tokens: t.input + t.output };
+}
+function anthropicUsage(u) {
+    const t = usageTokens(u);
+    return { input_tokens: t.input, output_tokens: t.output };
+}
+
 async function countedSend(msg, defs) {
     // Counted here, ACTED ON only at a request boundary (see
     // maybeResetThreadAtBoundary) — a tool-loop send must never navigate the tab.
@@ -601,6 +631,7 @@ async function countedSend(msg, defs) {
         const _latencyStart = Date.now();
         const r = await sendPrompt(msg, defs);
         recordLatency(Date.now() - _latencyStart);
+        noteUsage(msg, defs, r);
         await jevCheckReply(msg, r);
         lastReqBodyChars = await getReqBodyChars();
         // 08-14 EXPERT-SWAP PIN: the send swapped an instant thread for a
@@ -658,6 +689,7 @@ async function countedSend(msg, defs) {
                 defs
             );
             recordLatency(Date.now() - _retryStart);
+            noteUsage('### RETRY (the previous message may not have reached you — here it is again)\n' + msg, defs, r);
             lastReqBodyChars = await getReqBodyChars();
             return r;
         }
@@ -1370,6 +1402,8 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
         console.warn('⚠️ boundary fresh-chat open failed:', e.message);
     }
     requestInFlight = true;
+    turnUsage = { sentChars: 0, recvChars: 0, sends: 0 };
+    opts.usage = turnUsage;
     try {
         opts.threadReset = !!reset;
         if (reset && opts.history) {
@@ -1377,7 +1411,13 @@ async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAbo
             userPrompt = opts.history + userPrompt;
         }
         return await handleRequestInner(systemText, userPrompt, toolDefs, onProgress, isAborted);
+    } catch (e) {
+        // An unfinished turn spent tokens too — the runaway loop is exactly the case a
+        // caller's breaker exists for, so its usage travels with the error.
+        if (e instanceof HarnessIncomplete) e.usage = opts.usage;
+        throw e;
     } finally {
+        turnUsage = null;
         requestInFlight = false;
     }
 }
@@ -2000,7 +2040,7 @@ function streamFailureEvents({ partial = '', openBlock = -1, message = '', error
     emit('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'error', stop_sequence: null },
-        usage: { output_tokens: String(partial).length },
+        usage: { output_tokens: Math.ceil(String(partial).length / 4) },
     });
     emit('message_stop', { type: 'message_stop' });
     return out;
@@ -2010,10 +2050,11 @@ function streamFailureEvents({ partial = '', openBlock = -1, message = '', error
 // the gateway could not get a usable answer from its upstream (the webchat).
 function sendIncomplete(res, error, shape) {
     res.set('X-Harness-Outcome', error.outcome);
+    res.set('X-Harness-Usage-Estimated', 'chars/4');
     if (shape === 'openai') {
-        return res.status(502).json({ error: { message: error.message, type: 'harness_incomplete', code: error.outcome } });
+        return res.status(502).json({ error: { message: error.message, type: 'harness_incomplete', code: error.outcome }, usage: openaiUsage(error.usage) });
     }
-    return res.status(502).json({ type: 'error', error: { type: 'harness_incomplete', outcome: error.outcome, message: error.message } });
+    return res.status(502).json({ type: 'error', error: { type: 'harness_incomplete', outcome: error.outcome, message: error.message }, usage: anthropicUsage(error.usage) });
 }
 
 // The exhausted-path markers must never carry a raw broken JSON envelope
@@ -2819,6 +2860,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             handleRequest(systemText, prompt, toolDefs, undefined, undefined, turnOpts)
         );
         if (turnOpts.threadReset) res.set('X-Harness-Thread-Reset', '1');
+        res.set('X-Harness-Usage-Estimated', 'chars/4');
 
         // 09-13: the webchat can answer the throttle notice as its REPLY (a 200
         // with the text). Detect it, start the cooldown, and surface a 429 so the
@@ -2860,7 +2902,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             for (let i = 0; i < text.length; i += 512) {
                 res.write(`data: ${JSON.stringify(chunk({ content: text.slice(i, i + 512) }))}\n\n`);
             }
-            res.write(`data: ${JSON.stringify(chunk({}, 'stop'))}\n\n`);
+            res.write(`data: ${JSON.stringify({ ...chunk({}, 'stop'), usage: openaiUsage(turnOpts.usage) })}\n\n`);
             res.write('data: [DONE]\n\n');
             return res.end();
         }
@@ -2878,7 +2920,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     finish_reason: 'stop',
                 },
             ],
-            usage: { prompt_tokens: 0, completion_tokens: text.length, total_tokens: text.length },
+            usage: openaiUsage(turnOpts.usage),
         });
     } catch (error) {
         if (error instanceof HarnessIncomplete) {
@@ -3022,6 +3064,7 @@ app.post('/v1/messages', async (req, res) => {
             const turnOpts = { history: historyTranscript(messages) };
             const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, undefined, undefined, turnOpts));
             if (turnOpts.threadReset) res.set('X-Harness-Thread-Reset', '1');
+            res.set('X-Harness-Usage-Estimated', 'chars/4');
             res.set('X-Harness-Outcome', 'ok');
             return res.json({
                 id: 'msg_' + Math.random().toString(36).slice(2, 12),
@@ -3030,7 +3073,7 @@ app.post('/v1/messages', async (req, res) => {
                 model: modelName,
                 content: [{ type: 'text', text }],
                 stop_reason: 'end_turn',
-                usage: { input_tokens: 0, output_tokens: text.length },
+                usage: anthropicUsage(turnOpts.usage),
             });
         }
 
@@ -3128,7 +3171,8 @@ app.post('/v1/messages', async (req, res) => {
 
         // Headers are already sent on a stream, so a reset is announced only in the
         // server log here; the history is replayed all the same.
-        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted, { history: historyTranscript(messages) }));
+        const turnOpts = { history: historyTranscript(messages) };
+        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted, turnOpts));
         if (text === null) { if (heartbeat) clearInterval(heartbeat); return; } // aborted — nothing more to write
 
 
@@ -3152,7 +3196,7 @@ app.post('/v1/messages', async (req, res) => {
         ev('message_delta', {
             type: 'message_delta',
             delta: { stop_reason: 'end_turn', stop_sequence: null },
-            usage: { output_tokens: text.length },
+            usage: anthropicUsage(turnOpts.usage),
         });
         ev('message_stop', { type: 'message_stop' });
         if (heartbeat) clearInterval(heartbeat);
