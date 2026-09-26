@@ -22,7 +22,7 @@ process.env.JEV_INTERCEPT = 'off';
 process.env.NARRATION = 'false';
 process.env.ANTI_SPIRAL = process.env.ANTI_SPIRAL || 'false';
 process.env.MAX_TOOL_ROUNDS = process.env.MAX_TOOL_ROUNDS || '8';
-process.env.NEW_CHAT_EVERY_SENDS = '0';
+process.env.NEW_CHAT_EVERY_SENDS = process.env.NEW_CHAT_EVERY_SENDS || '0';
 process.env.SEND_SPACING_FILE = path.join(TMP, 'last_send');
 delete process.env.API_TOKEN;
 delete process.env.UPSTREAM_ANTHROPIC_AUTH_TOKEN;
