@@ -177,7 +177,13 @@ async function screenDashboard() {
                     try { snap.metrics = JSON.parse(r.body); } catch { snap.metrics = null; }
                 } else snap.metrics = null;
             } else snap.metrics = null;
-            snap.cdp = await D.cdpAlive(cdpPort);
+            // cdpAlive() answers up/down only; the tab count comes from the target list.
+            // frame() reads `pages.length`, and without this it threw on every frame —
+            // silently, since the menu swallows a failed tick — so the whole Status
+            // panel was never drawn.
+            const cdp = await D.cdpAlive(cdpPort);
+            const pages = cdp.up ? ((await D.cdpTargets(cdpPort)).pages || []) : [];
+            snap.cdp = { ...cdp, pages };
             snap.conn = await resolveConnection();
             snap.at = new Date();
             snap.err = null;
