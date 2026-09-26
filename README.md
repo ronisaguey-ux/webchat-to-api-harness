@@ -318,11 +318,20 @@ If your agent is not in the table, `./scripts/launch-agent.sh any` prints them.
 | Endpoint | Purpose |
 |---|---|
 | `GET /status` | online?, connected?, tool count |
+| `GET /health` | browser + in-flight status. **Read the BODY, not the status code** — see below. |
+| `GET /metrics` | observation surface: always 200, pacing, send count, latency, in-flight |
 | `GET /tools` | tool schemas (handlers stripped) |
 | `GET /v1/models` | model list (for OpenAI-compatible clients) |
 | `POST /v1/chat/completions` | OpenAI chat format (accepts `tools` with OpenAI function schema) |
 | `POST /v1/messages` | Anthropic messages format (accepts `tools` with `input_schema`) |
 | `POST /connect` | (re)connect the browser without a request |
+
+**`/health` returns 503 while the browser is not attached — that is UP, not down.** It is a
+liveness probe whose status code other tooling depends on, so a `curl -f` (or any client that
+treats a non-2xx as a failure) reports a perfectly healthy gateway as broken. Read the body:
+`{"ok":true,"browserAlive":true,"wedged":false}` is healthy, and the browser attaches on the
+first request. If you want a probe that never implies readiness, use `GET /metrics`, which is
+always 200 — that split is deliberate, so do not "fix" either one.
 
 `/v1/messages` with `stream: true` returns the full Anthropic SSE sequence
 (live one-line progress per tool execution and per correction, then the final
