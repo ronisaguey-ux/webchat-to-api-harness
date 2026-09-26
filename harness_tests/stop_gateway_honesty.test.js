@@ -103,7 +103,19 @@ test('a zombie is not "still alive" (the bug the first fix introduced)', async (
     // accepts signal 0. isAlive() says true for it; processExited() must say true as well,
     // or a successful stop is mis-reported as a failure.
     const c = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
-    await wait(300);   // exits, and this test process has not reaped it yet
+    // Wait for the child to become a zombie or be reaped, rather than a fixed 300ms: under
+    // full-suite load node can take just over 300ms to exit, which made this a coin-flip.
+    // A zombie state is the case being asserted, so never require it to be one.
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+        let state = null;
+        try {
+            const stat = fs.readFileSync(`/proc/${c.pid}/stat`, 'utf8');
+            state = stat.slice(stat.lastIndexOf(')') + 2).charAt(0);
+        } catch { state = 'GONE'; }
+        if (state === 'Z' || state === 'GONE') break;
+        await wait(10);
+    }
     try {
         withScratchState((D) => {
             assert.strictEqual(D.processExited(c.pid), true,
