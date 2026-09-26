@@ -5,6 +5,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const config = require('../core/config');
 const sandbox = require('./sandbox');
+const bashGuard = require('./bash_guard');
 const platform = require('../core/platform');
 const memory = require('../runtime/memory');
 
@@ -281,18 +282,12 @@ const TOOL_DEFINITIONS = [
                         error: "run_bash DENIED: command matches dangerous pattern: " + denied,
                     });
                 }
-                const toks = cmd.split(" ").filter(Boolean);
-                const gi = toks.indexOf("git");
-                const pi = toks.indexOf("push");
-                if (gi !== -1 && pi !== -1 && pi > gi) {
-                    const rest = toks.slice(pi + 1);
-                    const branch = rest.filter((t) => t[0] !== "-" && t !== "origin" && t !== "upstream").pop();
-                    if (!branch || branch === "master" || branch === "main") {
-                        return resolve({
-                            success: false,
-                            error: "run_bash DENIED: git push requires an explicit feature branch (master/main forbidden)",
-                        });
-                    }
+                // git push goes only to a named feature branch. Read as argv per simple
+                // command (bash_guard.js), because `HEAD:main`, `+master` and a trailing
+                // `&& echo ok` all fooled the old split-on-space check.
+                const pushDenied = bashGuard.pushDenial(cmd);
+                if (pushDenied) {
+                    return resolve({ success: false, error: pushDenied });
                 }
                 // Log EVERY executed command (denied ones are NOT executed).
                 try {
