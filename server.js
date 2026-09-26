@@ -1047,6 +1047,23 @@ async function ensureMcpDiscovered() {
     }
 }
 
+// A request that ended WITHOUT a usable answer.
+//
+// These used to be RETURNED as the answer text ("[⚠️ webchat model did not submit a
+// final answer within the round budget] ...") and the HTTP layer wrapped them as a
+// normal completion: 200 + stop_reason end_turn / finish_reason stop. A caller that
+// did not grep for the marker string — the orchestrator, a subagent job, the swarm —
+// recorded the step as DONE over code nothing had touched. A failure is now thrown,
+// and every API surface turns it into a real error: HTTP 502 before headers, or an
+// error-terminated stream (stop_reason "error") once streaming has started.
+class HarnessIncomplete extends Error {
+    constructor(outcome, message) {
+        super(message);
+        this.name = 'HarnessIncomplete';
+        this.outcome = outcome; // round_budget | no_tool_json | malformed | spiral | empty | unverified
+    }
+}
+
 // Is a submit_answer credible?
 //
 // Measured: a real run executed ZERO tools and then answered
@@ -1392,7 +1409,10 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             let _calls = [];
             try { _calls = (parseToolCalls(_text) || {}).toolCalls || []; } catch { _calls = []; }
             const _fetch = _calls.find((c) => c && (c.toolName === 'read_file' || c.toolName === 'see_next_chunk'));
-            if (!_fetch) return _text;
+            if (!_fetch) {
+                if (!String(_text || '').trim()) throw new HarnessIncomplete('empty', 'webchat model gave no reply');
+                return _text;
+            }
             // The engine writes REPO-RELATIVE paths into its prompts
             // ("execution/signals.py"), but sandbox.checkPath resolves a relative path
             // against the GATEWAY's cwd (/home/roni/Roni_workspace/webchat-api) and
@@ -1532,7 +1552,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 console.log(`🛑 anti-spiral: ${ANTI_SPIRAL.describe(spiral)} (strike ${spiralStrikes}) round ${round + 1}`);
                 onProgress?.({ type: 'rejected', text: 'anti-spiral: generation paused — ' + ANTI_SPIRAL.describe(spiral) });
                 if (spiralStrikes >= 2) {
-                    return ANTI_SPIRAL.spiralBanner(spiral) + exhaustedMarker('', response);
+                    throw new HarnessIncomplete('spiral', ANTI_SPIRAL.spiralBanner(spiral) + exhaustedMarker('', response));
                 }
                 response = await countedSend(ANTI_SPIRAL.spiralRedirect(spiral), toolDefs);
                 continue;
@@ -1744,11 +1764,11 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 continue;
             }
             if (verdict.action === 'stop') {
-                return exhaustedMarker(
+                throw new HarnessIncomplete('malformed', exhaustedMarker(
                     `[⚠️ STOPPED — the model sent malformed JSON ${malformedRounds} times in a row ${verdict.why}. ` +
                     `Last failure: ${reason}. Wake it again to continue.] `,
                     response
-                );
+                ));
             }
             response = await countedSend(malformedCorrectionMsg(reason, malformedRounds, config.maxMalformedRounds), toolDefs);
             continue;
@@ -1784,12 +1804,12 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
         // reply after context overflow can be a multi-KB echo of its own
         // prompt (08-12: ~30KB dumped into the exhausted marker) — never
         // ship that to the client.
-        return exhaustedMarker('[⚠️ webchat model kept replying without tool-call JSON] ', response);
+        throw new HarnessIncomplete('no_tool_json', exhaustedMarker('[⚠️ webchat model kept replying without tool-call JSON] ', response));
     }
 
     // Round budget exhausted without a submit_answer. Cap what the client sees
     // (08-12: the degraded model echoed the entire system prompt here).
-    return exhaustedMarker('[⚠️ webchat model did not submit a final answer within the round budget] ', response);
+    throw new HarnessIncomplete('round_budget', exhaustedMarker('[⚠️ webchat model did not submit a final answer within the round budget] ', response));
 }
 
 // The Anthropic SSE sequence a FAILED stream must end with.
@@ -1801,7 +1821,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
 // A client that already has an open block only learns the turn is over from
 // message_stop; without it Claude Code reports "Server error mid-response" and the
 // session cannot continue cleanly.
-function streamFailureEvents({ partial = '', openBlock = -1, message = '' } = {}) {
+function streamFailureEvents({ partial = '', openBlock = -1, message = '', errorType = 'api_error' } = {}) {
     const out = [];
     const emit = (event, data) => out.push({ event, data });
 
@@ -1819,7 +1839,7 @@ function streamFailureEvents({ partial = '', openBlock = -1, message = '' } = {}
         emit('content_block_stop', { type: 'content_block_stop', index: openBlock });
     }
 
-    emit('error', { type: 'error', error: { type: 'api_error', message: String(message) } });
+    emit('error', { type: 'error', error: { type: errorType, message: String(message) } });
     emit('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'error', stop_sequence: null },
@@ -1827,6 +1847,16 @@ function streamFailureEvents({ partial = '', openBlock = -1, message = '' } = {}
     });
     emit('message_stop', { type: 'message_stop' });
     return out;
+}
+
+// How each API shape reports a HarnessIncomplete before any byte was sent. 502:
+// the gateway could not get a usable answer from its upstream (the webchat).
+function sendIncomplete(res, error, shape) {
+    res.set('X-Harness-Outcome', error.outcome);
+    if (shape === 'openai') {
+        return res.status(502).json({ error: { message: error.message, type: 'harness_incomplete', code: error.outcome } });
+    }
+    return res.status(502).json({ type: 'error', error: { type: 'harness_incomplete', outcome: error.outcome, message: error.message } });
 }
 
 // The exhausted-path markers must never carry a raw broken JSON envelope
@@ -1847,9 +1877,10 @@ function finalAnswerFor(text) {
     // lanes forever. Pass the caller's answer through untouched.
     if (config.passthroughFormat) return text;
     if (looksLikeBrokenToolJson(text)) {
-        return '[⚠️ webchat model kept sending malformed tool calls — please retry the request]';
+        throw new HarnessIncomplete('malformed', 'webchat model kept sending malformed tool calls — please retry the request');
     }
-    return text || '[webchat model gave no reply]';
+    if (!text) throw new HarnessIncomplete('empty', 'webchat model gave no reply');
+    return text;
 }
 
 // Did this reply LOOK like a tool-call attempt that failed to parse? (a
@@ -2675,6 +2706,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             return res.end();
         }
 
+        res.set('X-Harness-Outcome', 'ok');
         res.json({
             id: 'chatcmpl_' + Math.random().toString(36).slice(2, 12),
             object: 'chat.completion',
@@ -2690,6 +2722,11 @@ app.post('/v1/chat/completions', async (req, res) => {
             usage: { prompt_tokens: 0, completion_tokens: text.length, total_tokens: text.length },
         });
     } catch (error) {
+        if (error instanceof HarnessIncomplete) {
+            console.log(`⛔ request incomplete (${error.outcome}) — returned as an API error, not an answer`);
+            if (!res.headersSent && !res.writableEnded && !res.destroyed) return sendIncomplete(res, error, 'openai');
+            return;
+        }
         console.error('❌ Error:', error);
         // 09-13: the throttle does NOT always arrive as reply TEXT. DeepSeek throws
         // it as a stream error ("DeepSeek stream error: Messages too frequent …
@@ -2824,6 +2861,7 @@ app.post('/v1/messages', async (req, res) => {
 
         if (!stream) {
             const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs));
+            res.set('X-Harness-Outcome', 'ok');
             return res.json({
                 id: 'msg_' + Math.random().toString(36).slice(2, 12),
                 type: 'message',
@@ -2982,16 +3020,26 @@ app.post('/v1/messages', async (req, res) => {
         // ERR_HTTP_HEADERS_SENT → whole process crashed → "connection refused"
         // for every client. Guard headersSent too; on the stream, end with an
         // SSE error event instead of a 500.
+        const incomplete = error instanceof HarnessIncomplete;
         if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+            if (incomplete) return sendIncomplete(res, error, 'anthropic');
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: error.message } });
         } else if (!res.writableEnded && !res.destroyed) {
             try {
                 const message = String(error && error.message ? error.message : error);
-                for (const frame of streamFailureEvents({ partial, openBlock, message })) {
-                    ev(frame.event, frame.data);
+                const errorType = incomplete ? 'harness_incomplete' : 'api_error';
+                // Written directly: `ev` is a const inside the try block and is NOT in
+                // scope here. Calling it threw a ReferenceError that the bare catch
+                // below swallowed, so res.end() never ran and EVERY failed stream left
+                // the client hanging on an open connection until its own timeout.
+                for (const frame of streamFailureEvents({ partial, openBlock, message, errorType })) {
+                    res.write(`event: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`);
                 }
                 res.end();
-            } catch (e) { /* client already gone */ }
+            } catch (e) {
+                console.warn('⚠️ could not terminate the failed stream:', e.message);
+                try { res.end(); } catch { /* socket gone */ }
+            }
         }
     }
 });
@@ -3185,6 +3233,7 @@ module.exports = {
     NEW_CHAT_EVERY_SENDS,
     needsSingleThread,
     __test: {
+        HarnessIncomplete,
         // The express app itself, so a test can drive the real HTTP surface
         // (status codes, stop reasons) on an ephemeral port — no browser.
         app,
