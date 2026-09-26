@@ -638,10 +638,11 @@ const TOOL_DEFINITIONS = [
             required: [],
         },
         handler: async (args) => {
+            const reposRoot = process.env.REPOS_ROOT || path.dirname(PATHS.workspaceRoot());
             const repos = {
-                oculus: path.join(PATHS.workspaceRoot(), 'oculus'),
-                'webchat-api': path.join(PATHS.workspaceRoot(), 'webchat-api'),
-                helpotron: path.join(PATHS.workspaceRoot(), 'helpotron'),
+                oculus: path.join(reposRoot, 'oculus'),
+                'webchat-api': path.join(reposRoot, 'webchat-api'),
+                helpotron: path.join(reposRoot, 'helpotron'),
             };
             const dir = repos[String((args && args.repo) || 'oculus')];
             if (!dir) {
@@ -649,11 +650,15 @@ const TOOL_DEFINITIONS = [
             }
             const st = await runCmd(['git', '-C', dir, 'status', '--short', '--branch']);
             const lg = await runCmd(['git', '-C', dir, 'log', '--oneline', '-3']);
-            return {
+            const result = {
                 success: st.success,
                 branchStatus: st.stdout,
                 recentCommits: lg.stdout,
             };
+            if (!st.success || !lg.success) {
+                result.error = (st.stderr || lg.stderr || 'git command failed').trim();
+            }
+            return result;
         },
     },
     {
@@ -779,9 +784,15 @@ const TOOL_DEFINITIONS = [
             const sendScript = process.env.TELEGRAM_SEND_SCRIPT
                 || path.join(PATHS.workspaceRoot(), 'oculus', 'scripts', 'telegram_monitor', 'telegram-monitor', 'bin', 'send-telegram.sh');
             const envFile = `${os.homedir()}/.config/oculus/orchestrator.env`;
-            const cmd = `set -a; [ -f "${envFile}" ] && source "${envFile}"; set +a; bash "${sendScript}" "${text.replace(/"/g, '\\"')}"`;
             return new Promise((resolve) => {
-                const child = spawn('/bin/bash', ['-c', cmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+                const child = spawn('/bin/bash', [
+                    '-c',
+                    'set -a; [ -f "$1" ] && source "$1"; set +a; exec bash "$2" "$3"',
+                    'bash',
+                    envFile,
+                    sendScript,
+                    text
+                ], { stdio: ['ignore', 'pipe', 'pipe'] });
                 child.on('close', (code) => {
                     resolve({ success: code === 0, message: code === 0 ? 'Sent to Telegram.' : 'Failed sending to Telegram.' });
                 });
