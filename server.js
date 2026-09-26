@@ -21,6 +21,8 @@ const {
 } = browser;
 const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./src/tools/tools');
 const SLOP = require('./src/tools/slop');
+const FS_SNAPSHOT = require('./src/runtime/fs_snapshot');
+const SANDBOX = require('./src/tools/sandbox');
 const { McpPool } = require('./src/tools/mcp');
 const compactor = require('./src/runtime/compactor');
 const memory = require('./src/runtime/memory');
@@ -1110,6 +1112,18 @@ const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'edit_memory']);
 // A bash command that changes a repository. Deliberately narrow: a false positive adds
 // a warning to an honest answer, so only unambiguous verbs count.
 const MUTATING_BASH_RE = /(^|[;&|]\s*)(git\s+(commit|push|merge|rebase|cherry-pick|add)|rm\s|mv\s|cp\s|sed\s+-i|tee\s|>>?\s*\S)/;
+// git changes .git, which the disk snapshot skips (it churns on every status call), so
+// the verbs that change a repository are still read from the command.
+const GIT_MUTATING_RE = /(^|[;&|(]\s*)git\s+(commit|push|merge|rebase|cherry-pick|add|rm|mv|reset|revert|am|apply|stash|tag)\b/;
+
+// Whether a run_bash changed anything: by the files under the sandbox roots when they
+// can be walked within the limit, by the command text when they cannot.
+function bashMutated(command, before, after) {
+    const cmd = String(command || '');
+    if (GIT_MUTATING_RE.test(cmd)) return true;
+    const diff = FS_SNAPSHOT.changed(before, after);
+    return diff === null ? MUTATING_BASH_RE.test(cmd) : diff;
+}
 
 // An answer that says the work LANDED. Distinct from claimsWorkDone, which matches any
 // "done" — this is specifically about changes being written or committed somewhere.
@@ -1714,7 +1728,9 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                     try { before = fs.readFileSync(call.args.path, 'utf8'); } catch { /* new file */ }
                     slopBaseline.set(call.args.path, before);
                 }
+                const bashBefore = call.toolName === 'run_bash' ? FS_SNAPSHOT.snapshot(SANDBOX.roots) : null;
                 result = await runTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
+                const bashAfter = bashBefore ? FS_SNAPSHOT.snapshot(SANDBOX.roots) : null;
                 if (writesFile && result && result.success === true) {
                     let after = null;
                     try { after = fs.readFileSync(call.args.path, 'utf8'); } catch { /* removed */ }
@@ -1741,11 +1757,12 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 const ok = !!(result && result.success === true);
                 if (ok) workToolsRun++;
                 // And separately, whether anything here could have changed state at all.
-                // A run_bash only counts when its command actually mutates — `pytest` and
+                // A run_bash only counts when it actually changed something — `pytest` and
                 // `git log` are reads, and treating them as writes is what let
-                // "changes committed and pushed" pass unchallenged.
+                // "changes committed and pushed" pass unchallenged. Judged by the files
+                // under the sandbox roots before and after (see bashMutated).
                 if (ok && MUTATING_TOOLS.has(call.toolName)) mutationsRun++;
-                else if (ok && call.toolName === 'run_bash' && MUTATING_BASH_RE.test(String(call.args?.command || ''))) mutationsRun++;
+                else if (ok && call.toolName === 'run_bash' && bashMutated(call.args?.command, bashBefore, bashAfter)) mutationsRun++;
                 if (call.toolName === 'run_bash' && TEST_COMMAND_RE.test(String(call.args?.command || ''))) {
                     testRuns.ran++;
                     testRuns.lastOk = ok;
