@@ -104,8 +104,19 @@ const req = http.request({
         const answer = choice && choice.message && typeof choice.message.content === 'string'
             ? choice.message.content
             : '';
-        if (!answer) {
+        // A 200 is not proof of an answer: the gateway reports an unfinished turn in
+        // X-Harness-Outcome, and an older gateway put the same verdict in the body as
+        // "[⚠️ Harness stopped: …]" text. Either one is a failure of the task, and must
+        // not be written out as its result.
+        const outcome = res.headers['x-harness-outcome'];
+        if (outcome && outcome !== 'ok') {
+            return fail(`gateway outcome ${outcome}: ${answer.slice(0, 400)}`);
+        }
+        if (!answer.trim()) {
             return fail('the webchat returned no message content (it may have replied with only a tool call, or the tab is wedged)');
+        }
+        if (/^\s*\[⚠️/.test(answer)) {
+            return fail('the gateway stopped without an answer: ' + answer.slice(0, 400));
         }
         try { fs.writeFileSync(job.resultFile, answer); } catch (e) { return fail('could not write the result: ' + e.message); }
         job.state = 'done';
