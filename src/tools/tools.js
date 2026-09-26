@@ -71,6 +71,29 @@ function changedHunk(before, after, { context = 3, maxLines = 120 } = {}) {
     return [header, ...body].join('\n');
 }
 
+// Tool arguments as they may appear in a log line. The log used to print them whole, so
+// every write_file put the file's full text in the gateway log — including a .env the
+// model was asked to write. File bodies are reduced to their size, a value under a
+// secret-looking key is masked, known token shapes are scrubbed from any string, and
+// anything else long is cut at 200 characters.
+const BODY_KEYS = new Set(['content', 'new_string', 'old_string', 'text', 'data']);
+const SECRET_KEY_RE = /key|token|secret|passw|auth|cookie|credential/i;
+const TOKEN_SHAPE_RE = /\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[abprs]-[A-Za-z0-9-]{8,}|AKIA[A-Z0-9]{12,}|\d{6,}:[A-Za-z0-9_-]{30,})/g;
+function redactArgs(v, key = '', depth = 0) {
+    if (key && SECRET_KEY_RE.test(key) && v != null && v !== '') return '[redacted]';
+    if (typeof v === 'string') {
+        if (BODY_KEYS.has(key)) return `<${v.length} chars>`;
+        const s = v.replace(TOKEN_SHAPE_RE, '[redacted]');
+        return s.length > 200 ? s.slice(0, 200) + `… [${s.length} chars]` : s;
+    }
+    if (!v || typeof v !== 'object') return v;
+    if (depth >= 4) return '[…]';
+    if (Array.isArray(v)) return v.slice(0, 20).map((x) => redactArgs(x, '', depth + 1));
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = redactArgs(x, k, depth + 1);
+    return out;
+}
+
 // ── Paid search ──────────────────────────────────────────────────────────────
 // Pinned to flash: the paid key is flash-only, never pro.
 const SEARCH_MODEL = 'deepseek-v4-flash';
@@ -985,7 +1008,7 @@ async function executeTool(toolName, args, ctx) {
         console.warn(`⛔ ${toolName} blocked by a ${verdict.enforce} limit (${verdict.pattern})`);
         return { success: false, error: LIMITS.refusalMessage(toolName, verdict), limit: verdict };
     }
-    console.log(`🔧 Executing: ${toolName}(${JSON.stringify(args)})`);
+    console.log(`🔧 Executing: ${toolName}(${JSON.stringify(redactArgs(args))})`);
     try {
         const result = await tool.handler(args || {}, ctx || {});
         console.log(`✅ Tool ${toolName} executed.`);
@@ -1213,4 +1236,5 @@ module.exports = {
     parseToolCalls,
     cleanProse,
     changedHunk,
+    redactArgs,
 };
