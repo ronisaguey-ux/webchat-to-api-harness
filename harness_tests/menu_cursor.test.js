@@ -36,7 +36,15 @@ function withKeys(keys, fn) {
     fake.setRawMode = () => {};
     fake.pause = () => {};
     Object.defineProperty(process, 'stdin', { value: fake, configurable: true, writable: true });
-    return Promise.resolve(fn()).finally(() => { Object.defineProperty(process, 'stdin', desc); });
+    // The menu draws with escape sequences on stdout, and under `node --test` stdout is
+    // the runner's IPC channel: the drawn bytes corrupted its framing and the file failed
+    // with "Unable to deserialize cloned data" (measured 10 of 15 runs). Capture them.
+    const realWrite = process.stdout.write;
+    process.stdout.write = () => true;
+    return Promise.resolve(fn()).finally(() => {
+        process.stdout.write = realWrite;
+        Object.defineProperty(process, 'stdin', desc);
+    });
 }
 
 const ITEMS = [
