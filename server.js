@@ -20,6 +20,7 @@ const {
     resetTeeForHandoff, takeThreadSwap, browserAlive, markShuttingDown,
 } = browser;
 const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./src/tools/tools');
+const SLOP = require('./src/tools/slop');
 const { McpPool } = require('./src/tools/mcp');
 const compactor = require('./src/runtime/compactor');
 const memory = require('./src/runtime/memory');
@@ -1544,6 +1545,11 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     let mutationsRun = 0;
     // Test commands run this turn, and whether the most recent one exited 0.
     const testRuns = { ran: 0, lastOk: false };
+    // Placeholder code this turn's writes introduced, per file, against the file as
+    // it was before the turn first touched it. A later write that removes the stub
+    // clears the entry; anything left at submit fails the request.
+    const slopBaseline = new Map();
+    const slopOutstanding = new Map();
     let wrapUpSent = false; // 09-13: near the round budget, demand a final submit_answer
     let spiralStrikes = 0; // 09-13: repeated reasoning loops in the tab
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
@@ -1664,6 +1670,14 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 // The rationale lives with markUnverifiedSubmit, so the rule is stated
                 // once instead of drifting in two places.
                 const offeredWorkTools = !config.noTools && !config.allowPlainText;
+                if (slopOutstanding.size) {
+                    const where = [...slopOutstanding].map(([f, hits]) =>
+                        `${f}: ${hits.map((h) => `line ${h.line} (${h.rule}) ${h.text}`).join('; ')}`).join(' | ');
+                    console.log(`⚠️ submit with placeholder code still in place — ${where}`);
+                    onProgress?.({ type: 'rejected', text: 'answer rejected: the written code still contains placeholders' });
+                    throw new HarnessIncomplete('unverified_slop',
+                        `[⚠️ the files written in this turn still contain placeholder code — ${where}] ` + (final || ''));
+                }
                 const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun, mutationsRun, testRuns });
                 if (verdict.marked) {
                     // A claim the harness can contradict is a failed request, not an
@@ -1694,7 +1708,30 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 if (text) onProgress?.({ type: 'text', text });
                 result = { success: true, delivered: true, instruction: 'Message delivered to user. Now proceed with your work tool call (read_file, run_bash, etc.) or deliver final answer via submit_answer.' };
             } else {
+                const writesFile = (call.toolName === 'write_file' || call.toolName === 'edit_file') && typeof call.args?.path === 'string';
+                if (writesFile && !slopBaseline.has(call.args.path)) {
+                    let before = '';
+                    try { before = fs.readFileSync(call.args.path, 'utf8'); } catch { /* new file */ }
+                    slopBaseline.set(call.args.path, before);
+                }
                 result = await runTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
+                if (writesFile && result && result.success === true) {
+                    let after = null;
+                    try { after = fs.readFileSync(call.args.path, 'utf8'); } catch { /* removed */ }
+                    const hits = after === null ? [] : SLOP.slopScan(slopBaseline.get(call.args.path), after, call.args.path);
+                    if (hits.length) {
+                        slopOutstanding.set(call.args.path, hits);
+                        // Tell the model now, while it can still fix it.
+                        result = {
+                            ...result,
+                            slop: hits,
+                            warning: `This write introduced placeholder code (${hits.map((h) => `line ${h.line}: ${h.text}`).join('; ')}). ` +
+                                'Replace it with the real implementation — the task cannot be submitted while it is there.',
+                        };
+                    } else {
+                        slopOutstanding.delete(call.args.path);
+                    }
+                }
                 // Count only real work: send_message is conversation and the submit
                 // aliases end the turn, so neither is evidence the task was touched.
                 //
@@ -1745,6 +1782,9 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             // receipt: its text was already delivered to the client above.
             const followUp =
                 (call.toolName === 'send_message' ? '' : formatToolResultView(call, maybeCompactResult(call, result), config.modelToolResultCap, { forModel: true }) + '\n\n') +
+                // The receipt formatter shows the diff, not extra result fields, so a
+                // placeholder warning is appended explicitly or the model never sees it.
+                (result && result.warning ? `⚠️ ${result.warning}\n\n` : '') +
                 (config.allowPlainText
                     ? 'Task is NOT complete until every part is done AND verified. Send ONE 💬 line, then your ' +
                       'next fenced tool call. Verify with run_bash (syntax checks, imports, the project tests); ' +
@@ -3293,6 +3333,7 @@ module.exports = {
         markUnverifiedSubmit,
         claimsWorkDone,
         claimsTestsPass,
+        SLOP,
         TEST_COMMAND_RE,
         UNVERIFIED_MARKER,
         // Malformed-JSON reporting. Exported so the test drives the SHIPPED reason
