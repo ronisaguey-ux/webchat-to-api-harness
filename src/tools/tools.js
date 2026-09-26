@@ -271,16 +271,12 @@ const TOOL_DEFINITIONS = [
                 // Platform-specific: `rm -rf` means nothing to cmd, and
                 // `del /f /s /q` means nothing to bash. One list applied
                 // everywhere would let a destructive Windows command through.
-                const DANGER = platform.dangerPatterns();
-                let denied = null;
-                for (const s of DANGER) {
-                    if (cmd.includes(s)) { denied = s; break; }
-                }
+                const denied = bashGuard.dangerDenial(cmd, {
+                    windows: platform.isWindows(),
+                    windowsPatterns: platform.dangerPatterns(),
+                });
                 if (denied) {
-                    return resolve({
-                        success: false,
-                        error: "run_bash DENIED: command matches dangerous pattern: " + denied,
-                    });
+                    return resolve({ success: false, error: denied });
                 }
                 // git push goes only to a named feature branch. Read as argv per simple
                 // command (bash_guard.js), because `HEAD:main`, `+master` and a trailing
