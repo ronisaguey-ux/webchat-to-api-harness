@@ -863,6 +863,36 @@ function isToolDisabled(toolName) {
     }
 }
 
+// Returns { error } or { args } with number/boolean fields spelled as strings
+// coerced to their real type. The coercion matters: a handler reading
+// `args.replace_all` treats the STRING "false" as truthy.
+function validateArgs(tool, args) {
+    const schema = tool.parameters || {};
+    const props = schema.properties || {};
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return { error: 'arguments must be a JSON object' };
+    for (const name of schema.required || []) {
+        if (args[name] === undefined || args[name] === null) return { error: `missing required argument "${name}"` };
+    }
+    const out = { ...args };
+    for (const [name, value] of Object.entries(args)) {
+        const want = props[name] && props[name].type;
+        if (!want || value === undefined || value === null) continue;
+        let ok = true;
+        if (want === 'string') ok = typeof value === 'string';
+        else if (want === 'boolean') {
+            if (value === 'true' || value === 'false') out[name] = value === 'true';
+            else ok = typeof value === 'boolean';
+        } else if (want === 'number' || want === 'integer') {
+            const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+            ok = typeof n === 'number' && Number.isFinite(n);
+            if (ok) out[name] = n;
+        } else if (want === 'array') ok = Array.isArray(value);
+        else if (want === 'object') ok = typeof value === 'object' && !Array.isArray(value);
+        if (!ok) return { error: `argument "${name}" must be a ${want}, got ${Array.isArray(value) ? 'array' : typeof value}` };
+    }
+    return { args: out };
+}
+
 async function executeTool(toolName, args, ctx) {
     const tool = TOOL_DEFINITIONS.find((t) => t.name === toolName);
     if (!tool) {
@@ -879,6 +909,17 @@ async function executeTool(toolName, args, ctx) {
             error: `Tool "${toolName}" is not available on this install (its requirement is unmet).`,
         };
     }
+    // ── Schema: required arguments and their primitive types ─────────────────
+    // The handlers trusted the model to send every required field. It does not:
+    // edit_file without new_string ran content.replace(old, () => undefined) and
+    // wrote the literal text "undefined" into the file, then reported success.
+    // A call that does not match its own schema is refused before it runs.
+    const checked = validateArgs(tool, args);
+    if (checked.error) {
+        console.warn(`⛔ ${toolName} refused: ${checked.error}`);
+        return { success: false, error: `${toolName}: ${checked.error}. Resend the call with every required argument.`, content_is_error: true };
+    }
+    args = checked.args;
     // ── Per-tool limits ───────────────────────────────────────────────────────
     // Checked here, on the arguments, because this is the last point where the action can
     // still be stopped and the first point where its real arguments are known. A limit is
