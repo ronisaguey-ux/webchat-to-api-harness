@@ -767,9 +767,16 @@ function resolve(setting, raw, env = process.env, dotenv = {}) {
   // no dotenv, so an envOnly setting read back as unset the moment it was saved). A display
   // that says "unset" about a live value is the same lie as a stale connected flag.
   //
-  // Pass an explicit object to resolve against a fixture; only omitting the argument loads
-  // the file, so a test stays isolated and a caller cannot forget.
-  function resolveAll(raw, env = process.env, dotenv) {
+  //  Pass an explicit object to resolve against a fixture; only omitting the argument loads
+  //  the file, so a test stays isolated and a caller cannot forget.
+  //
+  //  ★ `raw` HAD NO DEFAULT, SO OMITTING IT DID NOT LOAD THE FILE — it resolved against
+  //  `undefined`, and every file-backed setting fell through to its default. The comment above
+  //  described the intent; the signature did the opposite. Measured on this box: the config
+  //  says platform "windows" while resolveAll() reported "linux" (source default), and
+  //  file-backed settings resolved 45 -> 17 without raw. Eight callers passed raw explicitly
+  //  and worked; the one that omitted it was silently wrong.
+  function resolveAll(raw = loadRaw().raw, env = process.env, dotenv) {
       const dotenvVars = dotenv === undefined ? loadDotenv().vars : dotenv;
       const rows = [];
       for (const group of SCHEMA) {

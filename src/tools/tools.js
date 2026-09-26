@@ -21,6 +21,50 @@ const MAX_READ_FILE_CHARS = parseInt(process.env.MAX_READ_FILE_CHARS || '200000'
 const lastChunkEnd = new Map();
 const CHUNK_CHARS = parseInt(process.env.CHUNK_CHARS || '20000', 10);
 
+/**
+ * Which branch would `git push <tokens...>` actually write to?
+ *
+ * The guard that used this was matching a WORD against 'main'/'master', so any refspec that
+ * names the destination some other way slipped through: `git push origin HEAD:main`,
+ * `refs/heads/main`, `+main` (a force push) and `feature/x:main` all evaluated to an allowed
+ * branch while writing to main. It was checking the spelling, not the destination.
+ *
+ * A refspec is `<src>[:<dst>]`, and the DESTINATION is the only part that decides where the
+ * code lands. So: take the source ref, strip a leading '+' (force marker), strip the
+ * `refs/heads/` prefix, and use whatever a valid branch name would be.
+ *
+ * Pure and exported on purpose - the behaviour is a decision about a string, and a test
+ * against the real executor would need BASH_ALLOWED, a sandbox and a live model.
+ */
+const PUSH_REMOTES = new Set(['origin', 'upstream', '--all', '--tags']);
+function pushDestination(tokens) {
+    // Drop flags (-f, --force, --set-upstream). Keep --all/--tags: they are refspecs in
+    // spirit and must not read as "a branch named --all".
+    const positional = (tokens || []).filter((t) => t && t[0] !== '-');
+    const refspecs = positional.filter((t) => !PUSH_REMOTES.has(t));
+    // `git push` with no refspec pushes the CURRENT branch - an unreviewed default, not an
+    // explicit feature branch, so it is denied (the caller asked for explicitness).
+    if (refspecs.length === 0) return { branch: null, forbidden: true, reason: 'no refspec' };
+
+    // The last refspec is the one a bare `git push` would use; check them all, because a
+    // denied push is far cheaper than one that reached main.
+    for (const raw of refspecs) {
+        const dst = raw.includes(':') ? raw.slice(raw.indexOf(':') + 1) : raw;
+        const branch = dst.replace(/^\+/, '').replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
+        if (!branch) return { branch: null, forbidden: true, reason: 'empty destination' };
+        // Compare the WHOLE destination, not its last path segment. `release/master` is a
+        // different ref from `master` (it lives at refs/heads/release/master), so blocking it
+        // would be a false positive that stops legitimate work.
+        const normalized = branch.replace(/\/+$/, '');
+        if (normalized === 'main' || normalized === 'master') {
+            return { branch, forbidden: true, reason: 'destination is the default branch' };
+        }
+    }
+    const last = refspecs[refspecs.length - 1];
+    const dst = last.includes(':') ? last.slice(last.indexOf(':') + 1) : last;
+    return { branch: dst.replace(/^\+/, ''), forbidden: false };
+}
+
 // Small read-only command runner (git_status). Captures stdout/stderr with a
 // hard timeout — never used for interactive or long-running commands.
 function runCmd(argv, timeoutMs = 8000) {
@@ -285,12 +329,12 @@ const TOOL_DEFINITIONS = [
                 const gi = toks.indexOf("git");
                 const pi = toks.indexOf("push");
                 if (gi !== -1 && pi !== -1 && pi > gi) {
-                    const rest = toks.slice(pi + 1);
-                    const branch = rest.filter((t) => t[0] !== "-" && t !== "origin" && t !== "upstream").pop();
-                    if (!branch || branch === "master" || branch === "main") {
+                    const dest = pushDestination(toks.slice(pi + 1));
+                    if (!dest.branch || dest.forbidden) {
                         return resolve({
                             success: false,
-                            error: "run_bash DENIED: git push requires an explicit feature branch (master/main forbidden)",
+                            error: "run_bash DENIED: git push requires an explicit feature branch (master/main forbidden)"
+                                + (dest.branch ? ` (destination was '${dest.branch}')` : " (no branch named)"),
                         });
                     }
                 }
@@ -1115,5 +1159,6 @@ module.exports = {
     limitsFor: LIMITS.limitsFor,
     parseToolCall,
     parseToolCalls,
+    pushDestination,
     cleanProse,
 };

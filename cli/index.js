@@ -1442,6 +1442,22 @@ async function screenAgentAccess() {
 // starts with no error anywhere. An agent on the user's machine can read that config and
 // write it correctly, so the deliverable is a briefing for it.
 //
+// The platform this install is configured for, or '' when it has never been answered.
+//
+// ONE definition, because this rule was written twice and the two copies disagreed:
+// resolveAll() returns an ARRAY of resolved rows, so reading `.platform` off it is always
+// undefined. Site A (the platform screen) was fixed to use .find(); site B (the MCP setup
+// prompt, below) still read the array, so a Windows user was handed a Linux briefing with
+// POSIX paths — a setup that fails with a parse error the user cannot interpret.
+function currentPlatform() {
+    try {
+        const row = S.resolveAll().find((r) => r.setting.path === 'platform');
+        return row && row.value !== undefined && row.value !== null ? String(row.value) : '';
+    } catch {
+        return '';   // unset is a legitimate state, not an error to guess around
+    }
+}
+
 // The prompt is PLATFORM-AWARE. It is generated from the answer the user just gave, because
 // that answer decides the shell, the path separators, and whether a path must be escaped
 // inside JSON - and a Windows path handed to a POSIX agent is a setup that fails with a
@@ -1449,7 +1465,7 @@ async function screenAgentAccess() {
 async function screenMcpSetupPrompt(platformOverride) {
     const platform = platformOverride === 'windows' ? 'windows'
         : platformOverride === 'linux' ? 'linux'
-            : (() => { try { return String(S.resolveAll().platform || 'linux'); } catch { return 'linux'; } })();
+            : (currentPlatform() || 'linux');
     const serverPath = path.join(__dirname, '..', 'src', 'tools', 'mcp-server.js');
     let toolCount = 0;
     try { toolCount = require('../src/tools/mcp-server').TOOLS.length; } catch { /* reported as 0, not guessed */ }
@@ -2033,8 +2049,7 @@ async function screenWelcome() {
     // on EVERY launch instead of only to someone who has not answered the question yet.
     let current = '';
     try {
-        const row = S.resolveAll().find((r) => r.setting.path === 'platform');
-        current = row && row.value !== undefined && row.value !== null ? String(row.value) : '';
+        current = currentPlatform();
     } catch { /* unset is fine */ }
     const mine = (v) => (current === v ? '   (current)' : '');
 
@@ -2574,6 +2589,7 @@ async function main(argv) {
 module.exports = {
     main, interactive, platformChosen, screenWelcome, screenTourChoice, screenTutorial,
     connectionBadge,
+    currentPlatform,
     // These were exported by a SECOND module.exports earlier in the file, which the
     // assignment below silently overwrote — so anything importing them got undefined.
     // One export object, at the end, is the only safe shape.
