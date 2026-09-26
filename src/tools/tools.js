@@ -83,6 +83,62 @@ function runCmd(argv, timeoutMs = 8000) {
 }
 
 // ──────────────────────────────────────────────────────
+// OUTWARD-FACING TOOLS ARE OPT-IN AND DEPENDENCY-CHECKED
+// ──────────────────────────────────────────────────────
+// 2026-09-26 (owner): a handful of tools reach OUTSIDE the sandbox — the owner's
+// Telegram, another agent's inbox, the oculus pipeline. They were advertised to
+// every model on every run, which is wrong twice over:
+//
+//   1. They message a person, or feed another agent, without being asked to. That
+//      is consent the operator never gave, so these are OFF unless switched on.
+//   2. Most of them talk to files or bridges that only exist on the box that owns
+//      them (the oculus pipeline state, a telegram-monitor script, another
+//      session's inbox). Where that target is absent the tool cannot work at all —
+//      and advertising a tool that cannot work teaches the model to try it, fail,
+//      and burn a round discovering that.
+//
+// So both conditions are required, and they are independent:
+//
+//   OPT-IN   tools.outwardEnabled (env OUTWARD_TOOLS_ENABLED) enables the set;
+//            tools.outward::<name> (env OUTWARD_TOOL_<NAME>) enables just one.
+//            Absent both, the tool is not offered.
+//   PRESENT  the tool's own predicate — the file, script or bridge it needs.
+//            A missing target keeps it out even when the operator opted in.
+//
+// The existing per-tool disable switch (tools.disabled / DISABLED_TOOLS) still
+// applies on top: this only decides what MAY be offered, never overrides a "no".
+const OUTWARD_TOOLS = new Set([
+    'audit_status',
+    'telegram_send',
+    'send_message_to_main',
+    'send_message_to_antigravity',
+    'send_telegram_message',
+]);
+
+function outwardToolEnabled(name) {
+    try {
+        const MC = require('../core/master_config');
+        const envName = `OUTWARD_TOOL_${String(name).toUpperCase()}`;
+        const perTool = MC.pickBool(envName, 'tools', `outward::${name}`);
+        if (perTool === true) return true;
+        if (perTool === false) return false;
+    } catch { /* no master config — the master switch alone decides */ }
+    return config.outwardToolsEnabled === true;
+}
+
+// `present` is a predicate, not a value, so the filesystem is only touched when the
+// operator has actually opted in.
+function outwardToolAvailable(name, present) {
+    if (!outwardToolEnabled(name)) return false;
+    try {
+        return present() === true;
+    } catch {
+        // A predicate that throws is a missing target, not a reason to offer the tool.
+        return false;
+    }
+}
+
+// ──────────────────────────────────────────────────────
 // TOOL DEFINITIONS
 // ──────────────────────────────────────────────────────
 const TOOL_DEFINITIONS = [
@@ -590,13 +646,17 @@ const TOOL_DEFINITIONS = [
         // the audit finish" itself — same data the main session reads.
         name: 'audit_status',
         category: 'oculus',
-        description: 'Get the Oculus pipeline status: cycle, phase, running/paused, and audit pass/batch progress.',
-        parameters: {
-            type: 'object',
-            properties: {},
-            required: [],
-        },
-        handler: async () => {
+          description: 'Get the Oculus pipeline status: cycle, phase, running/paused, and audit pass/batch progress.',
+          parameters: {
+              type: 'object',
+              properties: {},
+              required: [],
+          },
+          // Opt-in + present: the oculus pipeline state files only exist on a box
+          // that actually runs that pipeline.
+          available: () => outwardToolAvailable('audit_status',
+              () => [PATHS.workflowStateFile(), PATHS.auditStateFile()].some((p) => p && fs.existsSync(p))),
+          handler: async () => {
             const read = (p) => {
                 try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch { return null; }
             };
@@ -697,15 +757,19 @@ const TOOL_DEFINITIONS = [
         // enforced per the user's 08-13 contract.
         name: 'telegram_send',
         category: 'telegram',
-        description: 'Send a Telegram message to the owner (delivered via the outbox relay; "webchat: " prefix auto-added).',
-        parameters: {
-            type: 'object',
-            properties: {
-                text: { type: 'string', description: 'Message text' },
-            },
-            required: ['text'],
-        },
-        handler: async (args) => {
+          description: 'Send a Telegram message to the owner (delivered via the outbox relay; "webchat: " prefix auto-added).',
+          parameters: {
+              type: 'object',
+              properties: {
+                  text: { type: 'string', description: 'Message text' },
+              },
+              required: ['text'],
+          },
+          // Opt-in + present: the outbox relay is how the message actually leaves this
+          // box, so a tool with nothing to write to must not be offered.
+          available: () => outwardToolAvailable('telegram_send',
+              () => { const f = PATHS.outboxFile(); return !!f && fs.existsSync(f); }),
+          handler: async (args) => {
             const OUTBOX = PATHS.outboxFile();
             let text = String((args && args.text) || '').trim();
             if (!text) return { success: false, error: 'empty text' };
@@ -731,15 +795,19 @@ const TOOL_DEFINITIONS = [
         description:
             'Send a message to the MAIN Claude session (backup operator/fixer). Use when you need ' +
             'something beyond your tools: real file access, system decisions, or escalation. ' +
-            'The main session wakes immediately and its reply is shown to you in your next message.',
-        parameters: {
-            type: 'object',
-            properties: {
-                text: { type: 'string', description: 'The message to main (what you need, what you found)' },
-            },
-            required: ['text'],
-        },
-        handler: async (args, ctx) => {
+               'The main session wakes immediately and its reply is shown to you in your next message.',
+          parameters: {
+              type: 'object',
+              properties: {
+                  text: { type: 'string', description: 'The message to main (what you need, what you found)' },
+              },
+              required: ['text'],
+          },
+          // Opt-in + present: this writes into another session's inbox, which only
+          // exists when that session is part of the same workspace.
+          available: () => outwardToolAvailable('send_message_to_main',
+              () => { const f = PATHS.mainInboxFile(); return !!f && fs.existsSync(f); }),
+          handler: async (args, ctx) => {
             const INBOX = PATHS.webchatInboxFile();
             const text = String((args && args.text) || '').trim();
             if (!text) return { success: false, error: 'empty text' };
@@ -770,6 +838,10 @@ const TOOL_DEFINITIONS = [
             },
             required: ['content'],
         },
+        // Opt-in + present: this writes into Antigravity's inbox, so it is only
+        // offered where the bridge is actually installed.
+        available: () => outwardToolAvailable('send_message_to_antigravity',
+            () => fs.existsSync(path.join(os.homedir(), '.config', 'antigravity-bridge'))),
         handler: async (args) => {
             const INBOX = `${os.homedir()}/.claude/inbox/messages.jsonl`;
             const content = String(args?.content || '').trim();
@@ -805,6 +877,15 @@ const TOOL_DEFINITIONS = [
             },
             required: ['text'],
         },
+        // Opt-in + present: resolved exactly as the handler resolves it, so the tool
+        // is offered only when the script it will actually spawn exists. NOTE: this
+        // points at the oculus telegram-monitor path, which is absent on a box that
+        // does not run that stack — set TELEGRAM_SEND_SCRIPT to point it elsewhere.
+        available: () => outwardToolAvailable('send_telegram_message', () => {
+            const s = process.env.TELEGRAM_SEND_SCRIPT
+                || path.join(PATHS.workspaceRoot(), 'oculus', 'scripts', 'telegram_monitor', 'telegram-monitor', 'bin', 'send-telegram.sh');
+            return !!s && fs.existsSync(s);
+        }),
         handler: async (args) => {
             let text = String(args?.text || '').trim();
             if (!text) return { success: false, error: 'empty text' };

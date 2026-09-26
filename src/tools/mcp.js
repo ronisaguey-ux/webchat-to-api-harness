@@ -236,23 +236,75 @@ class McpPool {
     constructor(servers = []) {
         this.servers = [];
         this._serverByName = new Map();
-        for (const s of servers) {
-            if (!s || !s.name) continue;
-            const srv = new McpServer(s.name, s);
-            this.servers.push(srv);
-            this._serverByName.set(s.name, srv);
-        }
-        this._discovered = false;
+        // Per-server, not one global latch: a server is listed once, and a server that
+        // arrives later (config edited while the gateway runs) is listed on its own.
+        this._listed = new Set();
         this._external = [];   // [{ name: '<server>.<tool>', _mcp, def }]
         this._byName = new Map();
+        this._addServers(servers);
     }
 
     get configured() { return this.servers.length; }
 
+    _addServers(servers = []) {
+        const added = [];
+        for (const s of servers) {
+            if (!s || !s.name || this._serverByName.has(s.name)) continue;
+            const srv = new McpServer(s.name, s);
+            this.servers.push(srv);
+            this._serverByName.set(s.name, srv);
+            added.push(srv);
+        }
+        return added;
+    }
+
+    // Drop a server that is no longer in the config, along with every tool it published.
+    // Leaving it advertised would offer the model a tool whose server is gone.
+    _dropServer(srv) {
+        this.servers = this.servers.filter((s) => s !== srv);
+        this._serverByName.delete(srv.name);
+        this._listed.delete(srv.name);
+        const prefix = `${srv.name}.`;
+        this._external = this._external.filter((d) => !String(d.name).startsWith(prefix));
+        for (const k of [...this._byName.keys()]) {
+            if (k.startsWith(prefix)) this._byName.delete(k);
+        }
+        try { srv.close(); } catch { /* already gone */ }
+    }
+
     async discover() {
-        if (this._discovered) return this._external;
-        this._discovered = true;
-        for (const srv of this.servers) {
+        await this._listServers(this.servers);
+        return this._external;
+    }
+
+    // 2026-09-26 (owner): "any new mcps added should automatically show up".
+    // Discovery used to run once and latch for the life of the process, so an MCP added
+    // to the config while the gateway was running did not exist until a restart — which
+    // reads as the feature being broken. sync() reconciles the pool against the config
+    // it is handed and lists only what is new, so a new entry appears on the next
+    // request. Returns how many servers were added or removed, so a caller can tell
+    // "nothing changed" from "the set moved" without re-serialising every definition.
+    async sync(servers = []) {
+        const wanted = new Set();
+        for (const s of servers) if (s && s.name) wanted.add(s.name);
+
+        let changes = 0;
+        for (const srv of this.servers.filter((s) => !wanted.has(s.name))) {
+            this._dropServer(srv);
+            changes++;
+        }
+        const added = this._addServers(servers);
+        if (added.length) {
+            await this._listServers(added);
+            changes += added.length;
+        }
+        return changes;
+    }
+
+    async _listServers(list) {
+        for (const srv of list) {
+            if (this._listed.has(srv.name)) continue;
+            this._listed.add(srv.name);
             try {
                 const tools = await srv.listTools();
                 for (const tool of tools) {
@@ -300,7 +352,9 @@ class McpPool {
 
     closeAll() {
         for (const srv of this.servers) srv.close();
-        this._discovered = false;
+        this.servers = [];
+        this._serverByName.clear();
+        this._listed.clear();
         this._external = [];
         this._byName.clear();
     }

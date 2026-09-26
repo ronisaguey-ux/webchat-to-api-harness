@@ -267,6 +267,15 @@ const cfg = {
     memoryEnabled: MC.pickBool('MEMORY_ENABLED', 'features', 'memory') === true,
     memoryMaxChars: MC.pickNum('MAX_MEMORY_CHARS', 'memory', 'maxChars') || 20000,
 
+    // ── 09-26 (owner): outward-facing tools are OPT-IN ──────────────────────
+    // The tools that reach outside the sandbox — Telegram, another agent's inbox,
+    // the oculus pipeline — were offered to every model on every run. Messaging a
+    // person or feeding another agent is consent the operator has to give, so the
+    // set is off unless switched on. Per-tool overrides live in tools.js
+    // (`outwardToolEnabled`), and each tool is additionally dropped when the file,
+    // script or bridge it talks to is absent.
+    outwardToolsEnabled: MC.pickBool('OUTWARD_TOOLS_ENABLED', 'tools', 'outwardEnabled') === true,
+
     // ── 09-22 (owner): attach ANY MCP server ────────────────────────────────
     // Raw section, read directly: mcp.servers = [{ name, command, args, url }].
     // Discovered lazily (see mcp.js) and merged into the executable tool set.

@@ -1014,10 +1014,40 @@ function externalToolDefs() {
     return externalDefs.map((d) => ({ ...d }));
 }
 
+// The MCP servers as the CONFIG FILE has them right now. config.mcpServers is read
+// once at require, which is why a server added while the gateway runs never appeared —
+// the running process was still holding the boot-time list. Re-reading here is a small
+// file read, and it is what makes "add an MCP and it shows up" true without a restart.
+function readMcpServers() {
+    try {
+        const MC = require('./src/core/master_config');
+        const text = fs.readFileSync(MC.CONFIG_FILE, 'utf-8');
+        const parsed = JSON.parse(text);
+        const list = parsed && parsed.mcp && Array.isArray(parsed.mcp.servers) ? parsed.mcp.servers : [];
+        return list.filter((s) => s && s.name);
+    } catch {
+        // A missing or malformed config falls back to the boot-time list rather than
+        // silently dropping every MCP the operator configured.
+        return Array.isArray(config.mcpServers) ? config.mcpServers : [];
+    }
+}
+
 async function ensureMcpDiscovered() {
+    if (!mcpPool) return;
+    // Reconcile against the live config first, so a newly-added server is listed and a
+    // removed one stops being advertised. No-ops (and re-serialises nothing) when the
+    // set has not moved, so this is cheap on the hot path.
+    try {
+        const changes = await mcpPool.sync(readMcpServers());
+        if (changes) {
+            externalDefs = mcpPool.externalDefinitions();
+            console.log(`🔌 MCP set changed (${changes}) — ${externalDefs.length} external tool(s) now advertised`);
+        }
+    } catch (e) {
+        console.log('⚠️ MCP re-sync failed:', String(e.message).slice(0, 100));
+    }
     if (mcpDiscovered) return;
     mcpDiscovered = true;
-    if (!mcpPool || !mcpPool.configured) return;
     try {
         await mcpPool.discover();
         externalDefs = mcpPool.externalDefinitions();
