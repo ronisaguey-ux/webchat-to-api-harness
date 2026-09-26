@@ -43,6 +43,34 @@ function runCmd(argv, timeoutMs = 8000) {
 // ──────────────────────────────────────────────────────
 // TOOL DEFINITIONS
 // ──────────────────────────────────────────────────────
+// The changed region of an edit as a unified-style hunk, with `context` lines around
+// it. edit_file used to return the WHOLE pre-edit file as `oldContent`, and that result
+// is sent back to the tab: a one-line edit to a 3,000-line file resent ~100KB, which
+// fills the chat's context and forces handoffs. The region is found by trimming the
+// common leading and trailing lines, so it is exact for one change and spans from the
+// first to the last for replace_all; it is capped at `maxLines`.
+function changedHunk(before, after, { context = 3, maxLines = 120 } = {}) {
+    const A = String(before).split('\n');
+    const B = String(after).split('\n');
+    let pre = 0;
+    while (pre < A.length && pre < B.length && A[pre] === B[pre]) pre++;
+    let suf = 0;
+    while (suf < A.length - pre && suf < B.length - pre && A[A.length - 1 - suf] === B[B.length - 1 - suf]) suf++;
+    const from = Math.max(0, pre - context);
+    const oldEnd = A.length - suf;
+    const newEnd = B.length - suf;
+    const lines = [];
+    for (let i = from; i < pre; i++) lines.push(' ' + A[i]);
+    for (let i = pre; i < oldEnd; i++) lines.push('-' + A[i]);
+    for (let i = pre; i < newEnd; i++) lines.push('+' + B[i]);
+    for (let i = oldEnd; i < Math.min(A.length, oldEnd + context); i++) lines.push(' ' + A[i]);
+    const header = `@@ -${from + 1},${Math.min(A.length, oldEnd + context) - from} +${from + 1},${Math.min(B.length, newEnd + context) - from} @@`;
+    const body = lines.length > maxLines
+        ? [...lines.slice(0, maxLines), `… [${lines.length - maxLines} more diff lines]`]
+        : lines;
+    return [header, ...body].join('\n');
+}
+
 // ── Paid search ──────────────────────────────────────────────────────────────
 // Pinned to flash: the paid key is flash-only, never pro.
 const SEARCH_MODEL = 'deepseek-v4-flash';
@@ -245,7 +273,7 @@ const TOOL_DEFINITIONS = [
                 success: true,
                 message: `Edited ${args.path} (${count} replacement${count === 1 ? '' : 's'})`,
                 replacements: count,
-                oldContent: content,
+                diff: changedHunk(content, newContent),
                 newLength: newContent.length,
             };
         },
@@ -1184,4 +1212,5 @@ module.exports = {
     parseToolCall,
     parseToolCalls,
     cleanProse,
+    changedHunk,
 };
