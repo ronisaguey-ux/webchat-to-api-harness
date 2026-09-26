@@ -22,6 +22,7 @@ const {
 const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./src/tools/tools');
 const SLOP = require('./src/tools/slop');
 const FS_SNAPSHOT = require('./src/runtime/fs_snapshot');
+const COMPACTOR = require('./src/runtime/compactor');
 const SANDBOX = require('./src/tools/sandbox');
 const { McpPool } = require('./src/tools/mcp');
 const compactor = require('./src/runtime/compactor');
@@ -1306,6 +1307,42 @@ function greetingDirective(userPrompt) {
     return '';
 }
 
+// The caller's turns BEFORE the latest user message, as plain text for a fresh chat.
+// Each message is clipped, and the oldest are dropped first once HISTORY_REPLAY_CHARS
+// is reached: the recent turns are what "that" refers to. '' when there is no history.
+const HISTORY_REPLAY_CHARS = parseInt(process.env.HISTORY_REPLAY_CHARS || '12000', 10);
+const HISTORY_MESSAGE_CHARS = 2000;
+function messageText(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return content == null ? '' : JSON.stringify(content);
+    return content.map((b) => {
+        if (!b || typeof b !== 'object') return String(b ?? '');
+        if (b.type === 'text') return b.text || '';
+        if (b.type === 'tool_use') return `[tool call ${b.name} ${JSON.stringify(b.input ?? {}).slice(0, 200)}]`;
+        if (b.type === 'tool_result') return `[tool result: ${messageText(b.content).slice(0, 400)}]`;
+        return `[${b.type} content]`;
+    }).join('\n');
+}
+function historyTranscript(messages) {
+    const turns = (messages || []).filter((m) => m && (m.role === 'user' || m.role === 'assistant'));
+    let last = -1;
+    for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === 'user') { last = i; break; }
+    const prior = last > 0 ? turns.slice(0, last) : [];
+    if (!prior.length) return '';
+    const lines = [];
+    let used = 0;
+    for (let i = prior.length - 1; i >= 0; i--) {
+        const text = COMPACTOR.truncateText(messageText(prior[i].content).trim(), HISTORY_MESSAGE_CHARS);
+        if (!text) continue;
+        const line = `${prior[i].role === 'user' ? 'User' : 'Assistant'}: ${text}`;
+        if (used + line.length > HISTORY_REPLAY_CHARS && lines.length) break;
+        lines.unshift(line);
+        used += line.length;
+    }
+    return 'This is a new chat. The conversation so far, for context:\n\n' + lines.join('\n\n') +
+        '\n\n--- The current request follows. ---\n\n';
+}
+
 // 09-21 BUGFIX (reported): the fresh-chat reset is performed at the REQUEST
 // BOUNDARY only, by this wrapper, and never from inside the tool loop.
 // Counting happens in countedSend(); acting on the count happens here, once per
@@ -1313,13 +1350,31 @@ function greetingDirective(userPrompt) {
 // the whole request (cleared in finally on every path) so a nested attempt can
 // never navigate the tab out from under a live response - which is what broke
 // multi-tool Claude Code requests ("Server error mid-response").
-async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
+//
+// A reset opens an EMPTY chat, and the gateway forwards only the latest user message —
+// so the caller's earlier turns were gone, and "now add tests for that" reached a model
+// that had never seen "that". When the thread was reset and the caller sent history,
+// the history is replayed (compacted) ahead of the new message, and `opts.threadReset`
+// tells the route to say so in X-Harness-Thread-Reset.
+//
+// The boundary check runs BEFORE requestInFlight is raised. It used to run after, and
+// maybeResetThreadAtBoundary refuses whenever requestInFlight is set — so the reset
+// never fired at all and the tab thread grew without bound (measured 2026-09-26:
+// sendCount 2 of 2, no fresh chat). Requests are serialised by enqueue(), so nothing
+// else is in flight at this point.
+async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted, opts = {}) {
+    let reset = false;
+    try {
+        reset = await maybeResetThreadAtBoundary('request start');
+    } catch (e) {
+        console.warn('⚠️ boundary fresh-chat open failed:', e.message);
+    }
     requestInFlight = true;
     try {
-        try {
-            await maybeResetThreadAtBoundary('request start');
-        } catch (e) {
-            console.warn('⚠️ boundary fresh-chat open failed:', e.message);
+        opts.threadReset = !!reset;
+        if (reset && opts.history) {
+            console.log(`📜 fresh chat — replaying ${opts.history.length} chars of the caller's earlier turns`);
+            userPrompt = opts.history + userPrompt;
         }
         return await handleRequestInner(systemText, userPrompt, toolDefs, onProgress, isAborted);
     } finally {
@@ -2759,9 +2814,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         await ensureMcpDiscovered();
         const toolDefs = buildExecutableToolDefs();
 
+        const turnOpts = { history: historyTranscript(messages) };
         const text = await enqueue(() =>
-            handleRequest(systemText, prompt, toolDefs)
+            handleRequest(systemText, prompt, toolDefs, undefined, undefined, turnOpts)
         );
+        if (turnOpts.threadReset) res.set('X-Harness-Thread-Reset', '1');
 
         // 09-13: the webchat can answer the throttle notice as its REPLY (a 200
         // with the text). Detect it, start the cooldown, and surface a 429 so the
@@ -2962,7 +3019,9 @@ app.post('/v1/messages', async (req, res) => {
         const modelName = model || config.modelName;
 
         if (!stream) {
-            const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs));
+            const turnOpts = { history: historyTranscript(messages) };
+            const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, undefined, undefined, turnOpts));
+            if (turnOpts.threadReset) res.set('X-Harness-Thread-Reset', '1');
             res.set('X-Harness-Outcome', 'ok');
             return res.json({
                 id: 'msg_' + Math.random().toString(36).slice(2, 12),
@@ -3067,7 +3126,9 @@ app.post('/v1/messages', async (req, res) => {
         let aborted = false;
         res.on('close', () => { aborted = true; });
 
-        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted));
+        // Headers are already sent on a stream, so a reset is announced only in the
+        // server log here; the history is replayed all the same.
+        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted, { history: historyTranscript(messages) }));
         if (text === null) { if (heartbeat) clearInterval(heartbeat); return; } // aborted — nothing more to write
 
 
@@ -3351,6 +3412,7 @@ module.exports = {
         claimsWorkDone,
         claimsTestsPass,
         SLOP,
+    historyTranscript,
         TEST_COMMAND_RE,
         UNVERIFIED_MARKER,
         // Malformed-JSON reporting. Exported so the test drives the SHIPPED reason

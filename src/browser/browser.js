@@ -1079,6 +1079,8 @@ async function selfHealDeadTab(reason) {
 }
 
 let _fakeSeq = { src: null, list: [], i: 0 };
+// What the fake webchat was sent, so a test can assert on the prompt itself.
+const FAKE_LOG = { sent: [], newChats: 0 };
 async function sendPrompt(prompt, toolDefinitions) {
     // Test hook: bypass the browser entirely (used by smoke tests)
     // TEST_FAKE_RESPONSES: a JSON array of replies, one per send, the last one
@@ -1090,6 +1092,7 @@ async function sendPrompt(prompt, toolDefinitions) {
         }
         const r = _fakeSeq.list[Math.min(_fakeSeq.i, _fakeSeq.list.length - 1)];
         _fakeSeq.i += 1;
+        FAKE_LOG.sent.push(String(prompt));
         return r;
     }
     if (process.env.TEST_FAKE_RESPONSE) {
@@ -3614,6 +3617,7 @@ async function conversationRowCount() {
 }
 
 async function openNewChat() {
+    if (process.env.TEST_FAKE_RESPONSES) { FAKE_LOG.newChats += 1; return; }
     // Fresh CDP session like every send (stale-session refresh).
     await initBrowser({ reconnect: true });
     // Re-pick the pinned tab (the old thread's tab gets navigated away — the
@@ -3882,6 +3886,7 @@ async function firstMatch(selectors) {
 }
 
 module.exports = {
+    FAKE_LOG,
     initBrowser,
     browserAlive,
     markShuttingDown,
