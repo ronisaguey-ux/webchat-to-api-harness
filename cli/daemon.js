@@ -141,6 +141,33 @@ function isAlive(pid) {
     }
 }
 
+/**
+ * Has this process actually EXITED, as opposed to merely not answering signals?
+ *
+ * isAlive() is wrong for this question in one specific way that matters: a ZOMBIE still
+ * accepts signal 0 until its parent reaps it, so a process that answered SIGTERM and died is
+ * reported alive. Measured while fixing stopGateway — a cooperative gateway read as
+ * "did not exit" because its parent had not waited on it yet.
+ *
+ * A stopped process (T/t state) is NOT dead: it still holds its memory and its ports, which is
+ * exactly what the caller is trying to release.
+ */
+function processExited(pid) {
+    if (!pid) return true;
+    try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        // Field 3 is the state. The comm field can contain spaces and parens, so parse from
+        // the LAST ')' rather than splitting on whitespace.
+        const after = stat.slice(stat.lastIndexOf(')') + 2);
+        const state = after.charAt(0);
+        if (state === 'Z' || state === 'X') return true;   // zombie / dead
+        return false;
+    } catch {
+        // No /proc entry: gone, or never ours. Either way it is not holding anything.
+        return true;
+    }
+}
+
 function writePid(name, pid) {
     ensureStateDir();
     fs.writeFileSync(pidFile(name), `${pid}\n`, { mode: 0o600 });
@@ -373,6 +400,29 @@ function stopGateway(port) {
         process.kill(pid, 'SIGTERM');
     } catch (e) {
         return { stopped: false, reason: e.message };
+    }
+    // SIGTERM is a REQUEST. A process that handles or ignores it (or is mid-syscall) is still
+    // holding the port, and clearing the pidfile over it loses the only handle we had — the
+    // next start then collides with a live gateway nothing knows about. Measured: a
+    // gateway-shaped process with a SIGTERM handler read as `stopped: true` while alive.
+    // Give it a moment, then escalate, and report what actually happened. The check is
+    // processExited(), not !isAlive() — a process that died but has not been reaped yet is a
+    // ZOMBIE, which still answers signal 0 and would otherwise look like a failed stop.
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && !processExited(pid)) {
+        try { execFileSync('/bin/sleep', ['0.05']); } catch { /* fall through to the check */ }
+    }
+    if (!processExited(pid)) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        const hard = Date.now() + 1000;
+        while (Date.now() < hard && !processExited(pid)) {
+            try { execFileSync('/bin/sleep', ['0.05']); } catch { /* ignore */ }
+        }
+    }
+    if (!processExited(pid)) {
+        // Still up. Do NOT clear the pidfile: it is the only way to reach this process again,
+        // and the honest answer is that the stop failed.
+        return { stopped: false, pid, reason: 'process did not exit after SIGTERM and SIGKILL' };
     }
     clearPid(key);
     return { stopped: true, pid };
@@ -811,7 +861,7 @@ function launchInTerminal({ bin, argv = [], cwd, env = {} }) {
 module.exports = {
     REPO, stateDir, ensureStateDir, profileDir,
     pidFile, logFile,
-    readPid, isAlive, writePid, clearPid,
+    readPid, isAlive, writePid, clearPid, processExited,
     httpGet, httpPost, probeGateway,
     gatewayRunning, startGateway, stopGateway, displayEnv,
     freePort, isPortFree, freePortPair, distinctPair,
