@@ -638,7 +638,10 @@ const TOOL_DEFINITIONS = [
             required: [],
         },
         handler: async (args) => {
-            const reposRoot = process.env.REPOS_ROOT || path.dirname(PATHS.workspaceRoot());
+            // reposRoot IS the workspace root — the repos sit directly under it
+            // (/home/roni/Roni_workspace/{oculus,webchat-api,helpotron}). Wrapping
+            // this in path.dirname() drops a level and every repo misses.
+            const reposRoot = process.env.REPOS_ROOT || PATHS.workspaceRoot();
             const repos = {
                 oculus: path.join(reposRoot, 'oculus'),
                 'webchat-api': path.join(reposRoot, 'webchat-api'),
