@@ -638,14 +638,41 @@ const TOOL_DEFINITIONS = [
             required: [],
         },
         handler: async (args) => {
-            // reposRoot IS the workspace root — the repos sit directly under it
-            // (/home/roni/Roni_workspace/{oculus,webchat-api,helpotron}). Wrapping
-            // this in path.dirname() drops a level and every repo misses.
-            const reposRoot = process.env.REPOS_ROOT || PATHS.workspaceRoot();
+            // ── Where do the sibling repos live? ─────────────────────────────────
+            // Measured on this box (WORKSPACE_ROOT unset in every running gateway):
+            //   PATHS.workspaceRoot()        = /home/roni/Roni_workspace/webchat_worker
+            //   path.dirname(workspaceRoot()) = /home/roni/Roni_workspace   <- the repos
+            // so the repos sit ONE LEVEL ABOVE the workspace root. But the layout
+            // legitimately differs when WORKSPACE_ROOT is set to the repo root
+            // itself, in which case workspaceRoot() IS where they live.
+            //
+            // Both have been hardcoded in turn — 06d8907 assumed workspaceRoot()
+            // was the repo root and every path missed with
+            // "fatal: cannot change to '/home/roni/Roni_workspace/webchat_worker/oculus'".
+            // Resolve per repo against the candidate roots and take the first that
+            // actually exists, instead of betting on one of the two layouts.
+            //
+            // REPOS_ROOT, when set, is authoritative and disables the search: an
+            // explicit override should be obeyed, not second-guessed.
+            const explicitRoot = process.env.REPOS_ROOT;
+            const candidateRoots = explicitRoot
+                ? [explicitRoot]
+                : [PATHS.workspaceRoot(), path.dirname(PATHS.workspaceRoot())];
+
+            const repoPath = (name) => {
+                for (const root of candidateRoots) {
+                    const p = path.join(root, name);
+                    if (fs.existsSync(p)) return p;
+                }
+                // Nothing matched — hand back the first candidate so the failure
+                // names a concrete path instead of hiding behind a guess.
+                return path.join(candidateRoots[0], name);
+            };
+
             const repos = {
-                oculus: path.join(reposRoot, 'oculus'),
-                'webchat-api': path.join(reposRoot, 'webchat-api'),
-                helpotron: path.join(reposRoot, 'helpotron'),
+                oculus: repoPath('oculus'),
+                'webchat-api': repoPath('webchat-api'),
+                helpotron: repoPath('helpotron'),
             };
             const dir = repos[String((args && args.repo) || 'oculus')];
             if (!dir) {
