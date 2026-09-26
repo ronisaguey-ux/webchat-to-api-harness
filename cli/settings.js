@@ -165,6 +165,21 @@ const SCHEMA = [
                 help: 'The master switch for shell access. With this off, run_bash is unavailable no matter what else is set.',
                 risk: true,
             },
+            {
+                // 09-26: the tools that reach OUTSIDE the sandbox — Telegram, another
+                // agent's inbox, the oculus pipeline. Off by default: messaging the owner
+                // or feeding another agent is consent the operator has to give, not a
+                // side effect of a file happening to exist. A tool is still additionally
+                // dropped when the file, script or bridge it talks to is absent, so this
+                // switch can only ever enable a tool that could actually work.
+                path: 'tools.outwardEnabled', label: 'Outward-facing tools', type: 'bool', env: 'OUTWARD_TOOLS_ENABLED',
+                default: false, group: 'tools', groupTitle: 'Tools',
+                help: 'Master switch for the tools that leave this machine or talk to another agent: '
+                    + 'audit_status, telegram_send, send_message_to_main, send_message_to_antigravity, '
+                    + 'send_telegram_message. Off by default, and each is offered only when its own '
+                    + 'target exists. Set OUTWARD_TOOL_<NAME>=true to enable a single one alone.',
+                risk: true,
+            },
         ]),
     },
     {
