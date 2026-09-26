@@ -352,10 +352,26 @@ async function startGateway(opts = {}) {
 // The hub is one process serving one url, so it has a single fixed key.
 const HUB_KEY = 'hub';
 
+// Same trap as the gateway and the browser: liveness is not identity. isAlive() only answers
+// "may I signal this pid?", so a reused pid read as a running hub — the CLI would refuse to
+// start a real one, or claim it stopped something it never touched. Prove it by argv.
+function pidLooksLikeHub(pid) {
+    if (!pid) return false;
+    try {
+        const argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+        // Exact argument match, not a substring: the hub is spawned as `node hub-server.js`.
+        return argv.split('\0').some((a) => a === 'hub-server.js' || a.endsWith('/hub-server.js'));
+    } catch {
+        return false;   // unreadable means NOT ours — one wasted start beats a false "running"
+    }
+}
+
 function hubRunning() {
     const pid = readPid(HUB_KEY);
     if (!pid) return 0;
-    try { process.kill(pid, 0); return pid; } catch { return 0; }
+    if (!isAlive(pid)) { clearPid(HUB_KEY); return 0; }
+    if (!pidLooksLikeHub(pid)) { clearPid(HUB_KEY); return 0; }
+    return pid;
 }
 
 // ASYNC for the same reason startGateway is: it verifies the port is free before spawning,
@@ -384,30 +400,22 @@ async function startHub(opts = {}) {
     return { started: true, pid: child.pid, port };
 }
 
-function stopHub() {
-    const pid = hubRunning();
-    if (!pid) return { stopped: false, reason: 'not running' };
-    try { process.kill(pid, 'SIGTERM'); } catch (e) { return { stopped: false, reason: e.message }; }
-    clearPid(HUB_KEY);
-    return { stopped: true, pid };
-}
-
-function stopGateway(port) {
-    const key = gatewayKey(port);
-    const pid = gatewayRunning(port);
-    if (!pid) return { stopped: false, reason: 'not running' };
+// Stop a process and PROVE it stopped.
+//
+// SIGTERM is a request, not an order: a process that handles or ignores it is still holding its
+// memory and its port. The first version of stopGateway cleared the pidfile straight after the
+// signal and reported success, which lost the only handle on a live process. This is one
+// function because stopHub had exactly the same defect — two copy-pasted termination blocks is
+// how the two drift apart.
+//
+// On a genuine failure the pidfile is deliberately NOT cleared: it is the only way to reach the
+// process again, and the honest answer is that the stop failed.
+function terminateAndConfirm(pid, clearFn) {
     try {
         process.kill(pid, 'SIGTERM');
     } catch (e) {
         return { stopped: false, reason: e.message };
     }
-    // SIGTERM is a REQUEST. A process that handles or ignores it (or is mid-syscall) is still
-    // holding the port, and clearing the pidfile over it loses the only handle we had — the
-    // next start then collides with a live gateway nothing knows about. Measured: a
-    // gateway-shaped process with a SIGTERM handler read as `stopped: true` while alive.
-    // Give it a moment, then escalate, and report what actually happened. The check is
-    // processExited(), not !isAlive() — a process that died but has not been reaped yet is a
-    // ZOMBIE, which still answers signal 0 and would otherwise look like a failed stop.
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline && !processExited(pid)) {
         try { execFileSync('/bin/sleep', ['0.05']); } catch { /* fall through to the check */ }
@@ -420,12 +428,23 @@ function stopGateway(port) {
         }
     }
     if (!processExited(pid)) {
-        // Still up. Do NOT clear the pidfile: it is the only way to reach this process again,
-        // and the honest answer is that the stop failed.
         return { stopped: false, pid, reason: 'process did not exit after SIGTERM and SIGKILL' };
     }
-    clearPid(key);
+    clearFn();
     return { stopped: true, pid };
+}
+
+function stopHub() {
+    const pid = hubRunning();
+    if (!pid) return { stopped: false, reason: 'not running' };
+    return terminateAndConfirm(pid, () => clearPid(HUB_KEY));
+}
+
+function stopGateway(port) {
+    const key = gatewayKey(port);
+    const pid = gatewayRunning(port);
+    if (!pid) return { stopped: false, reason: 'not running' };
+    return terminateAndConfirm(pid, () => clearPid(key));
 }
 
 /** Every gateway this box knows about, running or not. */
@@ -865,7 +884,7 @@ module.exports = {
     httpGet, httpPost, probeGateway,
     gatewayRunning, startGateway, stopGateway, displayEnv,
     freePort, isPortFree, freePortPair, distinctPair,
-    startHub, stopHub, hubRunning, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
+    startHub, stopHub, hubRunning, pidLooksLikeHub, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     pidLooksLikeBrowser, pidLooksLikeGateway,
     tailLines,

@@ -137,3 +137,53 @@ function gone(pid) {
     const state = stat.slice(stat.lastIndexOf(')') + 2).charAt(0);
     return state === 'Z' || state === 'X';
 }
+
+// ── the hub had the same two defects, so it gets the same coverage ───────────
+// hubRunning() accepted any live pid (liveness is not identity), and stopHub() claimed success
+// right after SIGTERM. Both now share terminateAndConfirm() with stopGateway, so a fix to one
+// cannot drift from the other.
+
+function hubChild({ ignoreSigterm }) {
+    const body = ignoreSigterm
+        ? 'process.on("SIGTERM",function(){});setTimeout(function(){},20000)'
+        : 'setTimeout(function(){},20000)';
+    // argv must END with hub-server.js for pidLooksLikeHub() to accept it.
+    const c = spawn(process.execPath, ['-e', body, 'hub-server.js'], { stdio: 'ignore' });
+    return { pid: c.pid, kill: () => { try { c.kill('SIGKILL'); } catch {} } };
+}
+
+test('hubRunning() rejects a live pid that is not the hub', async () => {
+    const c = spawn(process.execPath, ['-e', 'setTimeout(function(){},20000)'], { stdio: 'ignore' });
+    await wait(250);
+    try {
+        withScratchState((D) => {
+            D.writePid('hub', c.pid);
+            assert.strictEqual(D.hubRunning(), 0,
+                'a reused pid must not read as a running hub');
+        });
+    } finally { try { c.kill('SIGKILL'); } catch {} }
+});
+
+test('hubRunning() still reports a real hub pid', async () => {
+    const h = hubChild({ ignoreSigterm: false });
+    await wait(250);
+    try {
+        withScratchState((D) => {
+            D.writePid('hub', h.pid);
+            assert.strictEqual(D.hubRunning(), h.pid, 'a genuine hub pid must still be reported');
+        });
+    } finally { h.kill(); }
+});
+
+test('stopHub() verifies the process actually stopped', async () => {
+    const h = hubChild({ ignoreSigterm: true });
+    await wait(250);
+    try {
+        withScratchState((D) => {
+            D.writePid('hub', h.pid);
+            D.stopHub();
+            assert.strictEqual(gone(h.pid), true,
+                'a SIGTERM-ignoring hub must be escalated, not left holding its port');
+        });
+    } finally { h.kill(); }
+});
