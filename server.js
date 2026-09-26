@@ -1120,13 +1120,37 @@ function claimsMutation(text) {
     return MUTATION_CLAIM_RE.test(String(text || ''));
 }
 
-function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun, mutationsRun = null }) {
+// An answer that says the TESTS pass. Checked against what the test commands in
+// this turn actually returned (case 3 below).
+const TESTS_PASS_CLAIM_RE = /\b(tests?|suite|pytest|specs?)\b[^.\n]{0,40}?\b(pass(es|ed|ing)?|green|succeed(s|ed)?)\b/i;
+// A run_bash command that runs a test suite.
+const TEST_COMMAND_RE = /(^|[\s;&|(])(pytest|py\.test|npm (run )?test|npx (jest|vitest|mocha)|node --test|jest|vitest|mocha|cargo test|go test|make (test|check)|tox|nox|python3? -m (pytest|unittest))(?=$|[\s;&|)])/;
+
+function claimsTestsPass(text) {
+    return TESTS_PASS_CLAIM_RE.test(String(text || ''));
+}
+
+function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun, mutationsRun = null, testRuns = null }) {
     const answer = String(text || '');
+
+    // Case 3 (checked first — it is the most specific): the answer says the tests pass, but no test command succeeded in this
+    // turn — none ran, or the LAST one failed. Measured shape: `pytest` exits 1, the
+    // model reads the tail, and submits "fixed; all tests pass".
+    if (offeredWorkTools && testRuns && claimsTestsPass(answer) && !(testRuns.ran > 0 && testRuns.lastOk)) {
+        const why = testRuns.ran > 0
+            ? 'the last test command in this turn FAILED'
+            : 'no test command was run in this turn';
+        return {
+            marked: true,
+            text: `[⚠️ the answer says the tests pass, but ${why}. Verify before trusting it.] ` + answer,
+            reason: 'tests_claim',
+        };
+    }
 
     // Case 1: nothing ran at all, and the answer claims the job was done.
     // A bare answer asserts nothing, so there is nothing to contradict.
     if (offeredWorkTools && workToolsRun === 0 && claimsWorkDone(answer)) {
-        return { marked: true, text: UNVERIFIED_MARKER + answer };
+        return { marked: true, text: UNVERIFIED_MARKER + answer, reason: 'no_work' };
     }
 
     // Case 2: the answer says it CHANGED something (committed, pushed, wrote, hashed)
@@ -1151,6 +1175,7 @@ function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun, mutationsR
                 '[⚠️ no file was written and no command was run that changes anything — this answer ' +
                 'describes changes, but nothing in this turn could have made one. Verify before trusting it.] ' +
                 answer,
+            reason: 'mutation_claim',
         };
     }
 
@@ -1517,6 +1542,8 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     // Work that can actually CHANGE something. workToolsRun counts reads too, so it
     // cannot answer "did this run alter any state?" — see markUnverifiedSubmit case 2.
     let mutationsRun = 0;
+    // Test commands run this turn, and whether the most recent one exited 0.
+    const testRuns = { ran: 0, lastOk: false };
     let wrapUpSent = false; // 09-13: near the round budget, demand a final submit_answer
     let spiralStrikes = 0; // 09-13: repeated reasoning loops in the tab
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
@@ -1637,10 +1664,13 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 // The rationale lives with markUnverifiedSubmit, so the rule is stated
                 // once instead of drifting in two places.
                 const offeredWorkTools = !config.noTools && !config.allowPlainText;
-                const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun, mutationsRun });
+                const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun, mutationsRun, testRuns });
                 if (verdict.marked) {
-                    console.log('⚠️ submit_answer arrived having run ZERO tools — marking the answer as unverified (possible phantom completion)');
-                    onProgress?.({ type: 'rejected', text: 'submit after zero tool calls — answer marked unverified' });
+                    // A claim the harness can contradict is a failed request, not an
+                    // answer: the caller gets an error it cannot mistake for success.
+                    console.log(`⚠️ unverified submit (${verdict.reason}): work=${workToolsRun} mutations=${mutationsRun} tests=${testRuns.ran}/${testRuns.lastOk ? 'ok' : 'failed'}`);
+                    onProgress?.({ type: 'rejected', text: `answer rejected as unverified (${verdict.reason})` });
+                    throw new HarnessIncomplete('unverified', verdict.text);
                 }
                 // Never manufacture an answer. This used to fall back to the literal
                 // "[webchat model completed the task]" after the one empty-submit nudge,
@@ -1667,13 +1697,22 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 result = await runTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
                 // Count only real work: send_message is conversation and the submit
                 // aliases end the turn, so neither is evidence the task was touched.
-                workToolsRun++;
+                //
+                // Only a call that SUCCEEDED counts. Counting attempts let a turn whose
+                // every write was refused by the sandbox (or whose every edit_file missed
+                // its old_string) submit "implemented the fix" with mutationsRun=6.
+                const ok = !!(result && result.success === true);
+                if (ok) workToolsRun++;
                 // And separately, whether anything here could have changed state at all.
                 // A run_bash only counts when its command actually mutates — `pytest` and
                 // `git log` are reads, and treating them as writes is what let
                 // "changes committed and pushed" pass unchallenged.
-                if (MUTATING_TOOLS.has(call.toolName)) mutationsRun++;
-                else if (call.toolName === 'run_bash' && MUTATING_BASH_RE.test(String(call.args?.command || ''))) mutationsRun++;
+                if (ok && MUTATING_TOOLS.has(call.toolName)) mutationsRun++;
+                else if (ok && call.toolName === 'run_bash' && MUTATING_BASH_RE.test(String(call.args?.command || ''))) mutationsRun++;
+                if (call.toolName === 'run_bash' && TEST_COMMAND_RE.test(String(call.args?.command || ''))) {
+                    testRuns.ran++;
+                    testRuns.lastOk = ok;
+                }
             }
             // 08-16 (user): stream a readable receipt to the client — the exact
             // command / file / output, not a bare "🔧 toolname" — so anyone
@@ -3253,6 +3292,8 @@ module.exports = {
         // passing after the real one changed.
         markUnverifiedSubmit,
         claimsWorkDone,
+        claimsTestsPass,
+        TEST_COMMAND_RE,
         UNVERIFIED_MARKER,
         // Malformed-JSON reporting. Exported so the test drives the SHIPPED reason
         // detector and correction text — a re-implementation would keep passing after
