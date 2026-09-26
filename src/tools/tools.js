@@ -6,6 +6,7 @@ const { spawn } = require('child_process');
 const config = require('../core/config');
 const sandbox = require('./sandbox');
 const bashGuard = require('./bash_guard');
+const SPEND = require('../runtime/spend_ledger');
 const platform = require('../core/platform');
 const memory = require('../runtime/memory');
 
@@ -42,6 +43,23 @@ function runCmd(argv, timeoutMs = 8000) {
 // ──────────────────────────────────────────────────────
 // TOOL DEFINITIONS
 // ──────────────────────────────────────────────────────
+// ── Paid search ──────────────────────────────────────────────────────────────
+// Pinned to flash: the paid key is flash-only, never pro.
+const SEARCH_MODEL = 'deepseek-v4-flash';
+const SEARCH_API_URL = 'https://api.deepseek.com/anthropic/v1/messages';
+// USD per million tokens, and per search request. These are CONSERVATIVE ESTIMATES
+// set at or above flash list prices so the caps trip early rather than late; set the
+// env vars to the current price sheet. The cap is only as honest as these numbers.
+function searchCostUsd(usage) {
+    const n = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) && v >= 0 ? v : d; };
+    const inTok = Number(usage && usage.input_tokens) || 0;
+    const outTok = Number(usage && usage.output_tokens) || 0;
+    const searches = Number(usage && usage.server_tool_use && usage.server_tool_use.web_search_requests) || 1;
+    return inTok / 1e6 * n('SEARCH_PRICE_IN_PER_MTOK', 0.5)
+        + outTok / 1e6 * n('SEARCH_PRICE_OUT_PER_MTOK', 2)
+        + searches * n('SEARCH_PRICE_PER_REQUEST', 0.01);
+}
+
 const TOOL_DEFINITIONS = [
     {
         name: 'read_file',
@@ -430,8 +448,11 @@ const TOOL_DEFINITIONS = [
                         'harness.config.json).',
                 };
             }
+            // Hard spend caps ($2/hour, $10/day by default), checked BEFORE the paid call.
+            const budget = SPEND.check();
+            if (!budget.ok) return { success: false, error: budget.error, budget_exhausted: true };
             const body = {
-                model: 'deepseek-v4-flash',
+                model: SEARCH_MODEL,
                 max_tokens: 1000,
                 messages: [
                     {
@@ -444,7 +465,7 @@ const TOOL_DEFINITIONS = [
                 tool_choice: { type: 'auto' },
             };
             try {
-                const resp = await fetch('https://api.deepseek.com/anthropic/v1/messages', {
+                const resp = await fetch(SEARCH_API_URL, {
                     method: 'POST',
                     headers: { 'content-type': 'application/json', 'x-api-key': key },
                     body: JSON.stringify(body),
@@ -455,6 +476,14 @@ const TOOL_DEFINITIONS = [
                     return { success: false, error: `search API ${resp.status}: ${t.slice(0, 200)}` };
                 }
                 const data = await resp.json();
+                // Charge what the call reports; when it reports nothing, charge the most it
+                // could have cost, so a missing usage block can never read as free.
+                const usage = data && data.usage ? data.usage : null;
+                const usd = searchCostUsd(usage || {
+                    input_tokens: Math.ceil(JSON.stringify(body).length / 4),
+                    output_tokens: body.max_tokens,
+                });
+                SPEND.record(usd, 'search_web');
                 const results = [];
                 const textParts = [];
                 for (const block of (data.content || [])) {
@@ -470,11 +499,18 @@ const TOOL_DEFINITIONS = [
                         textParts.push(block.text);
                     }
                 }
+                const answer = textParts.join('\n').slice(0, 3000);
+                // Nothing came back: say so. Reporting success here let the model go on to
+                // "answer from the sources" it never received.
+                if (!results.length && !answer.trim()) {
+                    return { success: false, error: 'search returned no results', costUsd: usd };
+                }
                 return {
                     success: true,
-                    answer: textParts.join('\n').slice(0, 3000),
+                    answer,
                     results: results.slice(0, 8),
                     resultCount: results.length,
+                    costUsd: usd,
                 };
             } catch (e) {
                 return { success: false, error: String((e && e.message) || e) };
