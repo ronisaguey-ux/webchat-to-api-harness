@@ -73,3 +73,30 @@ chrome-profile/
 # --- webchat CLI runtime state (2026-09-22): pidfiles, logs, Chrome profile.
 # Must never be committed: the profile holds live session cookies.
 .webchat/
+
+# ---- credentials: never commit these (2026-10-05) --------------------------
+# Belt AND braces. .git/info/exclude carries the same rules because it is LOCAL
+# and untracked, so a bad edit to THIS file cannot un-protect the tree.
+.env
+.env.*
+!.env.example
+*.env
+*/.env
+*/.env.*
+*.token
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*_key.txt
+*_secret.txt
+credentials.json
+.netrc
+.npmrc
+.pypirc
+.cookies*.json
+cookies.json
+.git-credentials
+# ---------------------------------------------------------------------------
