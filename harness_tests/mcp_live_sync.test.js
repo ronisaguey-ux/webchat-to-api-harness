@@ -14,7 +14,10 @@ const path = require('path');
 
 const { McpPool } = require('../src/tools/mcp.js');
 
-const FAKE = '/tmp/opencode/fake_mcp_server.js';
+// The fixture lives IN THE REPO. It used to point at /tmp/opencode/..., which no
+// checkout ever created, so these four tests failed everywhere except the one
+// machine that had the file by accident.
+const FAKE = require('path').join(__dirname, 'fixtures', 'fake_mcp_server.js');
 const spec = () => ({ name: 'fake', command: 'node', args: [FAKE] });
 
 const names = (pool) => pool.externalDefinitions().map((d) => d.name).sort();
