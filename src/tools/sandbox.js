@@ -90,27 +90,66 @@ function logDenial(kind, value, why) {
     }
 }
 
-// Resolve a path to something comparable even when the leaf does not exist yet
-// (write_file creates files). Walk up to the nearest existing ancestor, realpath
-// that, then re-attach the remaining segments.
+// Resolve `abs` to the location it will actually be read from or written to, following
+// a symlink at EVERY component — including the leaf.
+//
+// MEASURED 2026-10-05: the previous version realpath'd only `path.dirname(abs)` and
+// re-attached `basename(abs)` untouched, so a symlink AT THE LEAF was never resolved.
+// With SANDBOX_ROOTS=<base>/root and `<root>/link.txt -> ../outside/secret.txt`,
+// checkPath returned ok:true and read_file returned the contents of a file outside the
+// root; writing through the same link created the file outside the root. Every symlinked
+// DIRECTORY component was resolved correctly (that case was already denied), which is
+// what made the hole easy to miss: the header's promise that "symlinks pointing outside
+// a root are both rejected" held for every shape except the file name itself.
+//
+// The walk is component by component from the filesystem root:
+//   - a component that does not exist ends the walk — nothing below it can be a link,
+//     and the rest of the path is re-attached verbatim (write_file's normal case);
+//   - a component that IS a link is replaced by its target and the walk restarts, so a
+//     chain (a -> b -> ../outside) and a DANGLING leaf (new.txt -> ../outside/new.txt,
+//     whose target does not exist yet — exactly what a write creates) both resolve to
+//     where the write lands;
+//   - a link loop, or more hops than MAX_HOPS, returns null, and null is treated as
+//     outside the roots. "Could not resolve it" must never read as "it is inside".
 function realpathAllowingMissing(abs) {
-    let dir = path.dirname(abs);
-    const tail = [path.basename(abs)];
-    for (let i = 0; i < 64; i++) {
+    const MAX_HOPS = 64;
+    let queue = path.resolve(abs).split(path.sep).filter(Boolean);
+    const out = []; // the symlink-free prefix resolved so far
+    for (let hop = 0; hop < MAX_HOPS; hop++) {
+        while (queue.length && queue[0] === '.') queue.shift(); // `./` in a link target
+        if (!queue.length) return path.sep + out.join(path.sep);
+        const next = path.sep + out.concat(queue[0]).join(path.sep);
+        let st = null;
         try {
-            const real = fs.realpathSync(dir);
-            return path.join(real, ...tail.reverse());
+            st = fs.lstatSync(next);
         } catch {
-            const parent = path.dirname(dir);
-            if (parent === dir) break; // hit the filesystem root
-            tail.push(path.basename(dir));
-            dir = parent;
+            st = null; // ENOENT (or EACCES): the remaining components do not exist either
         }
+        if (st && st.isSymbolicLink()) {
+            let target;
+            try {
+                target = fs.readlinkSync(next);
+            } catch {
+                return null;
+            }
+            // `out` already IS the symlink-free parent of `next`, so a relative target
+            // keeps it; an absolute target restarts the walk from the filesystem root.
+            if (path.isAbsolute(target)) out.length = 0;
+            queue = target.split(path.sep).filter(Boolean).concat(queue.slice(1));
+            continue;
+        }
+        if (!st) {
+            const tail = queue.slice(1);
+            return tail.length ? next + path.sep + tail.join(path.sep) : next;
+        }
+        out.push(queue.shift());
     }
-    return abs;
+    return null;
 }
 
 function isInside(candidate, root) {
+    // A path we could not resolve (null) is inside nothing. Fail closed.
+    if (typeof candidate !== 'string' || typeof root !== 'string' || !candidate) return false;
     if (candidate === root) return true;
     return candidate.startsWith(root + path.sep);
 }
