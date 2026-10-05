@@ -5,6 +5,8 @@ const os = require('os');
 const { spawn } = require('child_process');
 const config = require('../core/config');
 const sandbox = require('./sandbox');
+const bashGuard = require('./bash_guard');
+const SPEND = require('../runtime/spend_ledger');
 const platform = require('../core/platform');
 const memory = require('../runtime/memory');
 
@@ -141,6 +143,74 @@ function outwardToolAvailable(name, present) {
 // ──────────────────────────────────────────────────────
 // TOOL DEFINITIONS
 // ──────────────────────────────────────────────────────
+// The changed region of an edit as a unified-style hunk, with `context` lines around
+// it. edit_file used to return the WHOLE pre-edit file as `oldContent`, and that result
+// is sent back to the tab: a one-line edit to a 3,000-line file resent ~100KB, which
+// fills the chat's context and forces handoffs. The region is found by trimming the
+// common leading and trailing lines, so it is exact for one change and spans from the
+// first to the last for replace_all; it is capped at `maxLines`.
+function changedHunk(before, after, { context = 3, maxLines = 120 } = {}) {
+    const A = String(before).split('\n');
+    const B = String(after).split('\n');
+    let pre = 0;
+    while (pre < A.length && pre < B.length && A[pre] === B[pre]) pre++;
+    let suf = 0;
+    while (suf < A.length - pre && suf < B.length - pre && A[A.length - 1 - suf] === B[B.length - 1 - suf]) suf++;
+    const from = Math.max(0, pre - context);
+    const oldEnd = A.length - suf;
+    const newEnd = B.length - suf;
+    const lines = [];
+    for (let i = from; i < pre; i++) lines.push(' ' + A[i]);
+    for (let i = pre; i < oldEnd; i++) lines.push('-' + A[i]);
+    for (let i = pre; i < newEnd; i++) lines.push('+' + B[i]);
+    for (let i = oldEnd; i < Math.min(A.length, oldEnd + context); i++) lines.push(' ' + A[i]);
+    const header = `@@ -${from + 1},${Math.min(A.length, oldEnd + context) - from} +${from + 1},${Math.min(B.length, newEnd + context) - from} @@`;
+    const body = lines.length > maxLines
+        ? [...lines.slice(0, maxLines), `… [${lines.length - maxLines} more diff lines]`]
+        : lines;
+    return [header, ...body].join('\n');
+}
+
+// Tool arguments as they may appear in a log line. The log used to print them whole, so
+// every write_file put the file's full text in the gateway log — including a .env the
+// model was asked to write. File bodies are reduced to their size, a value under a
+// secret-looking key is masked, known token shapes are scrubbed from any string, and
+// anything else long is cut at 200 characters.
+const BODY_KEYS = new Set(['content', 'new_string', 'old_string', 'text', 'data']);
+const SECRET_KEY_RE = /key|token|secret|passw|auth|cookie|credential/i;
+const TOKEN_SHAPE_RE = /\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[abprs]-[A-Za-z0-9-]{8,}|AKIA[A-Z0-9]{12,}|\d{6,}:[A-Za-z0-9_-]{30,})/g;
+function redactArgs(v, key = '', depth = 0) {
+    if (key && SECRET_KEY_RE.test(key) && v != null && v !== '') return '[redacted]';
+    if (typeof v === 'string') {
+        if (BODY_KEYS.has(key)) return `<${v.length} chars>`;
+        const s = v.replace(TOKEN_SHAPE_RE, '[redacted]');
+        return s.length > 200 ? s.slice(0, 200) + `… [${s.length} chars]` : s;
+    }
+    if (!v || typeof v !== 'object') return v;
+    if (depth >= 4) return '[…]';
+    if (Array.isArray(v)) return v.slice(0, 20).map((x) => redactArgs(x, '', depth + 1));
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = redactArgs(x, k, depth + 1);
+    return out;
+}
+
+// ── Paid search ──────────────────────────────────────────────────────────────
+// Pinned to flash: the paid key is flash-only, never pro.
+const SEARCH_MODEL = 'deepseek-v4-flash';
+const SEARCH_API_URL = 'https://api.deepseek.com/anthropic/v1/messages';
+// USD per million tokens, and per search request. These are CONSERVATIVE ESTIMATES
+// set at or above flash list prices so the caps trip early rather than late; set the
+// env vars to the current price sheet. The cap is only as honest as these numbers.
+function searchCostUsd(usage) {
+    const n = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) && v >= 0 ? v : d; };
+    const inTok = Number(usage && usage.input_tokens) || 0;
+    const outTok = Number(usage && usage.output_tokens) || 0;
+    const searches = Number(usage && usage.server_tool_use && usage.server_tool_use.web_search_requests) || 1;
+    return inTok / 1e6 * n('SEARCH_PRICE_IN_PER_MTOK', 0.5)
+        + outTok / 1e6 * n('SEARCH_PRICE_OUT_PER_MTOK', 2)
+        + searches * n('SEARCH_PRICE_PER_REQUEST', 0.01);
+}
+
 const TOOL_DEFINITIONS = [
     {
         name: 'read_file',
@@ -326,7 +396,7 @@ const TOOL_DEFINITIONS = [
                 success: true,
                 message: `Edited ${args.path} (${count} replacement${count === 1 ? '' : 's'})`,
                 replacements: count,
-                oldContent: content,
+                diff: changedHunk(content, newContent),
                 newLength: newContent.length,
             };
         },
@@ -370,29 +440,19 @@ const TOOL_DEFINITIONS = [
                 // Platform-specific: `rm -rf` means nothing to cmd, and
                 // `del /f /s /q` means nothing to bash. One list applied
                 // everywhere would let a destructive Windows command through.
-                const DANGER = platform.dangerPatterns();
-                let denied = null;
-                for (const s of DANGER) {
-                    if (cmd.includes(s)) { denied = s; break; }
-                }
+                const denied = bashGuard.dangerDenial(cmd, {
+                    windows: platform.isWindows(),
+                    windowsPatterns: platform.dangerPatterns(),
+                });
                 if (denied) {
-                    return resolve({
-                        success: false,
-                        error: "run_bash DENIED: command matches dangerous pattern: " + denied,
-                    });
+                    return resolve({ success: false, error: denied });
                 }
-                const toks = cmd.split(" ").filter(Boolean);
-                const gi = toks.indexOf("git");
-                const pi = toks.indexOf("push");
-                if (gi !== -1 && pi !== -1 && pi > gi) {
-                    const dest = pushDestination(toks.slice(pi + 1));
-                    if (!dest.branch || dest.forbidden) {
-                        return resolve({
-                            success: false,
-                            error: "run_bash DENIED: git push requires an explicit feature branch (master/main forbidden)"
-                                + (dest.branch ? ` (destination was '${dest.branch}')` : " (no branch named)"),
-                        });
-                    }
+                // git push goes only to a named feature branch. Read as argv per simple
+                // command (bash_guard.js), because `HEAD:main`, `+master` and a trailing
+                // `&& echo ok` all fooled the old split-on-space check.
+                const pushDenied = bashGuard.pushDenial(cmd);
+                if (pushDenied) {
+                    return resolve({ success: false, error: pushDenied });
                 }
                 // Log EVERY executed command (denied ones are NOT executed).
                 try {
@@ -539,8 +599,11 @@ const TOOL_DEFINITIONS = [
                         'harness.config.json).',
                 };
             }
+            // Hard spend caps ($2/hour, $10/day by default), checked BEFORE the paid call.
+            const budget = SPEND.check();
+            if (!budget.ok) return { success: false, error: budget.error, budget_exhausted: true };
             const body = {
-                model: 'deepseek-v4-flash',
+                model: SEARCH_MODEL,
                 max_tokens: 1000,
                 messages: [
                     {
@@ -553,7 +616,7 @@ const TOOL_DEFINITIONS = [
                 tool_choice: { type: 'auto' },
             };
             try {
-                const resp = await fetch('https://api.deepseek.com/anthropic/v1/messages', {
+                const resp = await fetch(SEARCH_API_URL, {
                     method: 'POST',
                     headers: { 'content-type': 'application/json', 'x-api-key': key },
                     body: JSON.stringify(body),
@@ -564,6 +627,14 @@ const TOOL_DEFINITIONS = [
                     return { success: false, error: `search API ${resp.status}: ${t.slice(0, 200)}` };
                 }
                 const data = await resp.json();
+                // Charge what the call reports; when it reports nothing, charge the most it
+                // could have cost, so a missing usage block can never read as free.
+                const usage = data && data.usage ? data.usage : null;
+                const usd = searchCostUsd(usage || {
+                    input_tokens: Math.ceil(JSON.stringify(body).length / 4),
+                    output_tokens: body.max_tokens,
+                });
+                SPEND.record(usd, 'search_web');
                 const results = [];
                 const textParts = [];
                 for (const block of (data.content || [])) {
@@ -579,11 +650,18 @@ const TOOL_DEFINITIONS = [
                         textParts.push(block.text);
                     }
                 }
+                const answer = textParts.join('\n').slice(0, 3000);
+                // Nothing came back: say so. Reporting success here let the model go on to
+                // "answer from the sources" it never received.
+                if (!results.length && !answer.trim()) {
+                    return { success: false, error: 'search returned no results', costUsd: usd };
+                }
                 return {
                     success: true,
-                    answer: textParts.join('\n').slice(0, 3000),
+                    answer,
                     results: results.slice(0, 8),
                     resultCount: results.length,
+                    costUsd: usd,
                 };
             } catch (e) {
                 return { success: false, error: String((e && e.message) || e) };
@@ -1029,6 +1107,36 @@ function isToolDisabled(toolName) {
     }
 }
 
+// Returns { error } or { args } with number/boolean fields spelled as strings
+// coerced to their real type. The coercion matters: a handler reading
+// `args.replace_all` treats the STRING "false" as truthy.
+function validateArgs(tool, args) {
+    const schema = tool.parameters || {};
+    const props = schema.properties || {};
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return { error: 'arguments must be a JSON object' };
+    for (const name of schema.required || []) {
+        if (args[name] === undefined || args[name] === null) return { error: `missing required argument "${name}"` };
+    }
+    const out = { ...args };
+    for (const [name, value] of Object.entries(args)) {
+        const want = props[name] && props[name].type;
+        if (!want || value === undefined || value === null) continue;
+        let ok = true;
+        if (want === 'string') ok = typeof value === 'string';
+        else if (want === 'boolean') {
+            if (value === 'true' || value === 'false') out[name] = value === 'true';
+            else ok = typeof value === 'boolean';
+        } else if (want === 'number' || want === 'integer') {
+            const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+            ok = typeof n === 'number' && Number.isFinite(n);
+            if (ok) out[name] = n;
+        } else if (want === 'array') ok = Array.isArray(value);
+        else if (want === 'object') ok = typeof value === 'object' && !Array.isArray(value);
+        if (!ok) return { error: `argument "${name}" must be a ${want}, got ${Array.isArray(value) ? 'array' : typeof value}` };
+    }
+    return { args: out };
+}
+
 async function executeTool(toolName, args, ctx) {
     const tool = TOOL_DEFINITIONS.find((t) => t.name === toolName);
     if (!tool) {
@@ -1045,6 +1153,17 @@ async function executeTool(toolName, args, ctx) {
             error: `Tool "${toolName}" is not available on this install (its requirement is unmet).`,
         };
     }
+    // ── Schema: required arguments and their primitive types ─────────────────
+    // The handlers trusted the model to send every required field. It does not:
+    // edit_file without new_string ran content.replace(old, () => undefined) and
+    // wrote the literal text "undefined" into the file, then reported success.
+    // A call that does not match its own schema is refused before it runs.
+    const checked = validateArgs(tool, args);
+    if (checked.error) {
+        console.warn(`⛔ ${toolName} refused: ${checked.error}`);
+        return { success: false, error: `${toolName}: ${checked.error}. Resend the call with every required argument.`, content_is_error: true };
+    }
+    args = checked.args;
     // ── Per-tool limits ───────────────────────────────────────────────────────
     // Checked here, on the arguments, because this is the last point where the action can
     // still be stopped and the first point where its real arguments are known. A limit is
@@ -1055,7 +1174,7 @@ async function executeTool(toolName, args, ctx) {
         console.warn(`⛔ ${toolName} blocked by a ${verdict.enforce} limit (${verdict.pattern})`);
         return { success: false, error: LIMITS.refusalMessage(toolName, verdict), limit: verdict };
     }
-    console.log(`🔧 Executing: ${toolName}(${JSON.stringify(args)})`);
+    console.log(`🔧 Executing: ${toolName}(${JSON.stringify(redactArgs(args))})`);
     try {
         const result = await tool.handler(args || {}, ctx || {});
         console.log(`✅ Tool ${toolName} executed.`);
@@ -1283,4 +1402,6 @@ module.exports = {
     parseToolCalls,
     pushDestination,
     cleanProse,
+    changedHunk,
+    redactArgs,
 };

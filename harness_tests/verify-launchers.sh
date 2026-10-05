@@ -18,7 +18,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
 STUB="$(mktemp -d)"
-trap 'rm -rf "$STUB"' EXIT
+# HERMETIC. launch-agent.sh writes ./opencode.json in the harness directory, and this
+# test deletes it afterwards — which used to delete the USER's own opencode.json on
+# every run. An existing one is set aside and put back on exit, and HOME is a throwaway
+# so no recipe can read or write the real one.
+SAVED_OC=""
+if [ -f opencode.json ]; then SAVED_OC="$STUB/opencode.json.saved"; cp -p opencode.json "$SAVED_OC"; fi
+restore_oc() { rm -f opencode.json; if [ -n "$SAVED_OC" ]; then cp -p "$SAVED_OC" opencode.json; fi; }
+trap 'restore_oc; rm -rf "$STUB"' EXIT
+mkdir -p "$STUB/home"
+export HOME="$STUB/home"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -53,7 +62,7 @@ node -e '
   }).listen(port, "127.0.0.1");
 ' "$FAKE_PORT" &
 SRV_PID=$!
-trap 'kill $SRV_PID 2>/dev/null; rm -rf "$STUB"' EXIT
+trap 'kill $SRV_PID 2>/dev/null; restore_oc; rm -rf "$STUB"' EXIT
 # Wait for it to bind, and FAIL LOUDLY if it does not: an unbound fake gateway
 # makes every recipe look broken while the fault is in this test.
 BOUND=0

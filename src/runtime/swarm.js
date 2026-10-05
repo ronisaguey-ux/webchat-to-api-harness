@@ -22,8 +22,9 @@ const gatesMod = safeRequire('../../cli/gates');
 const GATE_ALIAS = { deepseek: 'ds', gemini: 'gm', chatgpt: 'cg' };
 const AGGREGATE = () => process.env.HARNESS_AGGREGATE_URL || 'http://127.0.0.1:8090';
 
-function post(url, body, timeoutMs) {
+function post(url, body, timeoutMs, signal) {
     return new Promise((resolve) => {
+        if (signal && signal.aborted) return resolve({ ok: false, error: 'cancelled', cancelled: true });
         let u;
         try { u = new URL(url); } catch (e) { return resolve({ ok: false, error: 'bad url' }); }
         const data = Buffer.from(JSON.stringify(body));
@@ -37,9 +38,15 @@ function post(url, body, timeoutMs) {
             res.on('end', () => {
                 let parsed = null;
                 try { parsed = JSON.parse(raw); } catch { /* non-JSON is still an answer */ }
-                resolve({ ok: true, status: res.statusCode, body: parsed, raw });
+                resolve({ ok: true, status: res.statusCode, headers: res.headers, body: parsed, raw });
             });
         });
+        if (signal) {
+            signal.addEventListener('abort', () => {
+                req.destroy();
+                resolve({ ok: false, error: 'cancelled', cancelled: true });
+            }, { once: true });
+        }
         req.on('timeout', () => { req.destroy(new Error('timed out after ' + timeoutMs + 'ms')); });
         req.on('error', (e) => resolve({ ok: false, error: e.message }));
         req.write(data);
@@ -76,20 +83,29 @@ async function reachableLanes(explicit) {
     return usable.length ? usable : wanted.map((g) => ({ id: g.id, alias: GATE_ALIAS[g.id] || g.id, gatewayPort: g.gatewayPort }));
 }
 
-async function oneTask(lane, prompt, timeoutMs) {
+async function oneTask(lane, prompt, timeoutMs, signal) {
     const t0 = Date.now();
     const r = await post(AGGREGATE() + '/v1/chat/completions', {
         model: lane.alias,
         messages: [{ role: 'user', content: prompt }],
         stream: false,
-    }, timeoutMs);
+    }, timeoutMs, signal);
     const ms = Date.now() - t0;
-    if (!r.ok) return { lane: lane.id, ok: false, elapsedMs: ms, error: r.error };
+    if (!r.ok) return { lane: lane.id, ok: false, elapsedMs: ms, error: r.error, cancelled: !!r.cancelled };
     if (r.status !== 200) {
         const msg = r.body && r.body.error && (r.body.error.message || r.body.error);
         return { lane: lane.id, ok: false, elapsedMs: ms, status: r.status, error: String(msg || r.raw).slice(0, 300) };
     }
+    // A 200 is not an answer by itself: a gateway that reports a non-ok outcome, or
+    // an empty message, produced nothing a caller can use.
+    const outcome = r.headers && r.headers['x-harness-outcome'];
+    if (outcome && outcome !== 'ok') {
+        return { lane: lane.id, ok: false, elapsedMs: ms, status: r.status, error: `gateway outcome ${outcome}` };
+    }
     const c = ((r.body && r.body.choices && r.body.choices[0] && r.body.choices[0].message) || {}).content || '';
+    if (!String(c).trim()) {
+        return { lane: lane.id, ok: false, elapsedMs: ms, status: r.status, error: 'empty answer' };
+    }
     return { lane: lane.id, ok: true, elapsedMs: ms, chars: c.length, answer: c };
 }
 
@@ -136,20 +152,47 @@ async function runSwarm({ prompts, gates, concurrency, timeoutMs }) {
     };
 }
 
+// A real race: the FIRST SUCCESSFUL lane wins and the others are cancelled.
+//
+// This used to await every lane (Promise.all — so a race cost the SLOWEST lane) and
+// then pick the lowest elapsedMs over ALL results, failures included: a lane that
+// errored in 2s "won" against a correct answer in 90s, and winner came back null
+// although a lane had succeeded.
+async function raceLanes(lanes, prompt, timeout) {
+    const t0 = Date.now();
+    const ctl = new AbortController();
+    const results = new Array(lanes.length);
+    let winner = null;
+    await new Promise((resolve) => {
+        let pending = lanes.length;
+        lanes.forEach((l, i) => {
+            oneTask(l, prompt, timeout, ctl.signal).then((r) => {
+                results[i] = r;
+                if (r.ok && !winner) {
+                    winner = r;
+                    ctl.abort(); // the rest are no longer needed
+                    resolve();
+                }
+                if (--pending === 0) resolve();
+            });
+        });
+    });
+    return {
+        winner: winner ? winner.lane : null,
+        answer: winner ? winner.answer : '',
+        elapsedMs: Date.now() - t0,
+        results: lanes.map((l, i) => {
+            const r = results[i] || { lane: l.id, ok: false, error: 'cancelled', cancelled: true };
+            return { lane: r.lane, ok: r.ok, elapsedMs: r.elapsedMs, answer: r.answer || '', error: r.error || '' };
+        }),
+    };
+}
+
 async function raceSwarm({ prompt, gates, timeoutMs }) {
     const lanes = await reachableLanes(gates);
     if (!lanes.length) return { ok: false, error: 'no webchat lanes configured' };
     const timeout = Math.min(Math.max(Number(timeoutMs) || 300000, 5000), 1800000);
-    const t0 = Date.now();
-    // Every lane gets the same prompt; Promise.all never rejects because oneTask resolves
-    // with an error shape, so a dead lane cannot sink the race.
-    const results = await Promise.all(lanes.map((l) => oneTask(l, prompt, timeout)));
-    const first = results.slice().sort((a, b) => (a.elapsedMs || 1e9) - (b.elapsedMs || 1e9))[0];
-    return {
-        winner: first && first.ok ? first.lane : null,
-        elapsedMs: Date.now() - t0,
-        results: results.map((r) => ({ lane: r.lane, ok: r.ok, elapsedMs: r.elapsedMs, answer: r.answer || '', error: r.error || '' })),
-    };
+    return raceLanes(lanes, prompt, timeout);
 }
 
-module.exports = { runSwarm, raceSwarm, reachableLanes };
+module.exports = { runSwarm, raceSwarm, raceLanes, oneTask, reachableLanes };
