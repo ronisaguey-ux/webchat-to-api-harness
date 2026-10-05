@@ -52,7 +52,19 @@ test('every tool refuses a call missing any one of its required arguments', asyn
             checked++;
         }
     }
-    assert.ok(checked >= 10, `only ${checked} (tool, argument) pairs were checked`);
+    // The guard must be a COVERAGE check, not an arbitrary number. A flat `>= 10`
+    // silently rots: the tool list changes (tools become unavailable, others are
+    // added) and the test starts failing for a reason that has nothing to do with
+    // the schema. Assert instead that EVERY required argument of EVERY AVAILABLE
+    // tool was exercised, and that the loop actually ran.
+    let expected = 0;
+    for (const def of T.TOOL_DEFINITIONS) {
+        if (typeof def.available === 'function' && !def.available()) continue;
+        expected += ((def.parameters && def.parameters.required) || []).length;
+    }
+    assert.strictEqual(checked, expected,
+        `${checked} pairs checked but ${expected} required arguments exist across the available tools`);
+    assert.ok(expected > 0, 'no available tool declares a required argument - the guard proves nothing');
 });
 
 test('a boolean spelled "false" means false, not a truthy string', async () => {
