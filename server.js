@@ -20,6 +20,10 @@ const {
     resetTeeForHandoff, takeThreadSwap, browserAlive, markShuttingDown,
 } = browser;
 const { getToolDefinitions, getExecutableToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./src/tools/tools');
+const SLOP = require('./src/tools/slop');
+const FS_SNAPSHOT = require('./src/runtime/fs_snapshot');
+const COMPACTOR = require('./src/runtime/compactor');
+const SANDBOX = require('./src/tools/sandbox');
 const { McpPool } = require('./src/tools/mcp');
 const compactor = require('./src/runtime/compactor');
 const memory = require('./src/runtime/memory');
@@ -559,6 +563,36 @@ async function jevCheckReply(msg, reply) {
     }
 }
 
+// ── Usage (estimated) ───────────────────────────────────────────────────────
+// Responses used to report input_tokens 0 and output_tokens = CHARACTERS of the final
+// answer, so a caller's token breaker summed ~0 per request however much was sent —
+// a 12-round tool loop resending 150K-char receipts read as free. The webchat reports
+// no token counts, so these are estimates (chars/4, like estimateTokens) of what was
+// actually exchanged with the tab: every send's full composed prompt in, every reply
+// out, tool rounds and retries included. X-Harness-Usage-Estimated marks them.
+let turnUsage = null;
+function noteUsage(msg, defs, reply) {
+    if (!turnUsage) return;
+    let sent;
+    try { sent = buildFullPrompt(msg, defs).length; } catch { sent = String(msg ?? '').length; }
+    turnUsage.sentChars += sent;
+    turnUsage.recvChars += String(reply ?? '').length;
+    turnUsage.sends += 1;
+}
+function usageTokens(u) {
+    const input = Math.ceil(((u && u.sentChars) || 0) / 4);
+    const output = Math.ceil(((u && u.recvChars) || 0) / 4);
+    return { input, output };
+}
+function openaiUsage(u) {
+    const t = usageTokens(u);
+    return { prompt_tokens: t.input, completion_tokens: t.output, total_tokens: t.input + t.output };
+}
+function anthropicUsage(u) {
+    const t = usageTokens(u);
+    return { input_tokens: t.input, output_tokens: t.output };
+}
+
 async function countedSend(msg, defs) {
     // Counted here, ACTED ON only at a request boundary (see
     // maybeResetThreadAtBoundary) — a tool-loop send must never navigate the tab.
@@ -608,6 +642,7 @@ async function countedSend(msg, defs) {
         const _latencyStart = Date.now();
         const r = await sendPrompt(msg, defs);
         recordLatency(Date.now() - _latencyStart);
+        noteUsage(msg, defs, r);
         await jevCheckReply(msg, r);
         lastReqBodyChars = await getReqBodyChars();
         // 08-14 EXPERT-SWAP PIN: the send swapped an instant thread for a
@@ -665,6 +700,7 @@ async function countedSend(msg, defs) {
                 defs
             );
             recordLatency(Date.now() - _retryStart);
+            noteUsage('### RETRY (the previous message may not have reached you — here it is again)\n' + msg, defs, r);
             lastReqBodyChars = await getReqBodyChars();
             return r;
         }
@@ -693,6 +729,27 @@ const UPSTREAM_OPENAI = {
     base: (process.env.UPSTREAM_OPENAI_BASE_URL || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
     token: process.env.UPSTREAM_ANTHROPIC_AUTH_TOKEN || '',
 };
+
+// The paid upstream is FLASH-ONLY (owner rule, after a pro-model burn). Any other
+// model name reaching the paid proxy is refused before a request is made, so a
+// caller's typo or a "best model" default can never spend on a pricier tier.
+const UPSTREAM_ALLOWED_MODELS = new Set(
+    String(process.env.UPSTREAM_ALLOWED_MODELS || 'deepseek-v4-flash')
+        .split(',').map((m) => m.trim()).filter(Boolean)
+);
+function refuseUnlistedUpstreamModel(body, res) {
+    const m = body && typeof body.model === 'string' ? body.model : '';
+    if (UPSTREAM_ALLOWED_MODELS.has(m)) return false;
+    console.log(`⛔ paid-upstream model "${m}" refused (allowed: ${[...UPSTREAM_ALLOWED_MODELS].join(', ')})`);
+    res.status(403).json({
+        type: 'error',
+        error: {
+            type: 'permission_error',
+            message: `model "${m}" is not allowed on the paid upstream (allowed: ${[...UPSTREAM_ALLOWED_MODELS].join(', ')})`,
+        },
+    });
+    return true;
+}
 
 function isWebchatModel(body) {
     const m = body && typeof body.model === 'string' ? body.model : config.modelName;
@@ -772,16 +829,26 @@ for (const pair of (process.env.WEBCHAT_ROUTES || '').split(',')) {
 }
 
 // Transparent proxy: status + headers + body (SSE passthrough when streaming).
-async function proxyTo(req, res, upstreamBase, path, body) {
+//
+// The credential is an explicit argument, never a default. This used to attach
+// UPSTREAM_ANTHROPIC.token — the PAID DeepSeek key — to EVERY proxied request,
+// including the WEBCHAT_ROUTES targets (OmniRoute on :20128, the per-webchat
+// gateways), so the paid key was sent to OmniRoute on every "omniroute" pick
+// even though the comment beside that call says "Never the paid key on this
+// route". Only the paid-upstream call sites pass { token }; a route gets none.
+async function proxyTo(req, res, upstreamBase, path, body, { token = '' } = {}) {
     try {
+        const headers = {
+            'content-type': 'application/json',
+            'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+        };
+        if (token) {
+            headers['x-api-key'] = token;
+            headers.authorization = `Bearer ${token}`;
+        }
         const resp = await fetch(`${upstreamBase}${path}`, {
             method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-                'x-api-key': UPSTREAM_ANTHROPIC.token,
-                authorization: `Bearer ${UPSTREAM_ANTHROPIC.token}`,
-            },
+            headers,
             body: JSON.stringify(body),
         });
         res.status(resp.status);
@@ -1057,6 +1124,23 @@ async function ensureMcpDiscovered() {
     }
 }
 
+// A request that ended WITHOUT a usable answer.
+//
+// These used to be RETURNED as the answer text ("[⚠️ webchat model did not submit a
+// final answer within the round budget] ...") and the HTTP layer wrapped them as a
+// normal completion: 200 + stop_reason end_turn / finish_reason stop. A caller that
+// did not grep for the marker string — the orchestrator, a subagent job, the swarm —
+// recorded the step as DONE over code nothing had touched. A failure is now thrown,
+// and every API surface turns it into a real error: HTTP 502 before headers, or an
+// error-terminated stream (stop_reason "error") once streaming has started.
+class HarnessIncomplete extends Error {
+    constructor(outcome, message) {
+        super(message);
+        this.name = 'HarnessIncomplete';
+        this.outcome = outcome; // round_budget | no_tool_json | malformed | spiral | empty | unverified
+    }
+}
+
 // Is a submit_answer credible?
 //
 // Measured: a real run executed ZERO tools and then answered
@@ -1102,6 +1186,18 @@ const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'edit_memory']);
 // A bash command that changes a repository. Deliberately narrow: a false positive adds
 // a warning to an honest answer, so only unambiguous verbs count.
 const MUTATING_BASH_RE = /(^|[;&|]\s*)(git\s+(commit|push|merge|rebase|cherry-pick|add)|rm\s|mv\s|cp\s|sed\s+-i|tee\s|>>?\s*\S)/;
+// git changes .git, which the disk snapshot skips (it churns on every status call), so
+// the verbs that change a repository are still read from the command.
+const GIT_MUTATING_RE = /(^|[;&|(]\s*)git\s+(commit|push|merge|rebase|cherry-pick|add|rm|mv|reset|revert|am|apply|stash|tag)\b/;
+
+// Whether a run_bash changed anything: by the files under the sandbox roots when they
+// can be walked within the limit, by the command text when they cannot.
+function bashMutated(command, before, after) {
+    const cmd = String(command || '');
+    if (GIT_MUTATING_RE.test(cmd)) return true;
+    const diff = FS_SNAPSHOT.changed(before, after);
+    return diff === null ? MUTATING_BASH_RE.test(cmd) : diff;
+}
 
 // An answer that says the work LANDED. Distinct from claimsWorkDone, which matches any
 // "done" — this is specifically about changes being written or committed somewhere.
@@ -1113,13 +1209,37 @@ function claimsMutation(text) {
     return MUTATION_CLAIM_RE.test(String(text || ''));
 }
 
-function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun, mutationsRun = null }) {
+// An answer that says the TESTS pass. Checked against what the test commands in
+// this turn actually returned (case 3 below).
+const TESTS_PASS_CLAIM_RE = /\b(tests?|suite|pytest|specs?)\b[^.\n]{0,40}?\b(pass(es|ed|ing)?|green|succeed(s|ed)?)\b/i;
+// A run_bash command that runs a test suite.
+const TEST_COMMAND_RE = /(^|[\s;&|(])(pytest|py\.test|npm (run )?test|npx (jest|vitest|mocha)|node --test|jest|vitest|mocha|cargo test|go test|make (test|check)|tox|nox|python3? -m (pytest|unittest))(?=$|[\s;&|)])/;
+
+function claimsTestsPass(text) {
+    return TESTS_PASS_CLAIM_RE.test(String(text || ''));
+}
+
+function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun, mutationsRun = null, testRuns = null }) {
     const answer = String(text || '');
+
+    // Case 3 (checked first — it is the most specific): the answer says the tests pass, but no test command succeeded in this
+    // turn — none ran, or the LAST one failed. Measured shape: `pytest` exits 1, the
+    // model reads the tail, and submits "fixed; all tests pass".
+    if (offeredWorkTools && testRuns && claimsTestsPass(answer) && !(testRuns.ran > 0 && testRuns.lastOk)) {
+        const why = testRuns.ran > 0
+            ? 'the last test command in this turn FAILED'
+            : 'no test command was run in this turn';
+        return {
+            marked: true,
+            text: `[⚠️ the answer says the tests pass, but ${why}. Verify before trusting it.] ` + answer,
+            reason: 'tests_claim',
+        };
+    }
 
     // Case 1: nothing ran at all, and the answer claims the job was done.
     // A bare answer asserts nothing, so there is nothing to contradict.
     if (offeredWorkTools && workToolsRun === 0 && claimsWorkDone(answer)) {
-        return { marked: true, text: UNVERIFIED_MARKER + answer };
+        return { marked: true, text: UNVERIFIED_MARKER + answer, reason: 'no_work' };
     }
 
     // Case 2: the answer says it CHANGED something (committed, pushed, wrote, hashed)
@@ -1144,6 +1264,7 @@ function markUnverifiedSubmit(text, { offeredWorkTools, workToolsRun, mutationsR
                 '[⚠️ no file was written and no command was run that changes anything — this answer ' +
                 'describes changes, but nothing in this turn could have made one. Verify before trusting it.] ' +
                 answer,
+            reason: 'mutation_claim',
         };
     }
 
@@ -1259,6 +1380,42 @@ function greetingDirective(userPrompt) {
     return '';
 }
 
+// The caller's turns BEFORE the latest user message, as plain text for a fresh chat.
+// Each message is clipped, and the oldest are dropped first once HISTORY_REPLAY_CHARS
+// is reached: the recent turns are what "that" refers to. '' when there is no history.
+const HISTORY_REPLAY_CHARS = parseInt(process.env.HISTORY_REPLAY_CHARS || '12000', 10);
+const HISTORY_MESSAGE_CHARS = 2000;
+function messageText(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return content == null ? '' : JSON.stringify(content);
+    return content.map((b) => {
+        if (!b || typeof b !== 'object') return String(b ?? '');
+        if (b.type === 'text') return b.text || '';
+        if (b.type === 'tool_use') return `[tool call ${b.name} ${JSON.stringify(b.input ?? {}).slice(0, 200)}]`;
+        if (b.type === 'tool_result') return `[tool result: ${messageText(b.content).slice(0, 400)}]`;
+        return `[${b.type} content]`;
+    }).join('\n');
+}
+function historyTranscript(messages) {
+    const turns = (messages || []).filter((m) => m && (m.role === 'user' || m.role === 'assistant'));
+    let last = -1;
+    for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === 'user') { last = i; break; }
+    const prior = last > 0 ? turns.slice(0, last) : [];
+    if (!prior.length) return '';
+    const lines = [];
+    let used = 0;
+    for (let i = prior.length - 1; i >= 0; i--) {
+        const text = COMPACTOR.truncateText(messageText(prior[i].content).trim(), HISTORY_MESSAGE_CHARS);
+        if (!text) continue;
+        const line = `${prior[i].role === 'user' ? 'User' : 'Assistant'}: ${text}`;
+        if (used + line.length > HISTORY_REPLAY_CHARS && lines.length) break;
+        lines.unshift(line);
+        used += line.length;
+    }
+    return 'This is a new chat. The conversation so far, for context:\n\n' + lines.join('\n\n') +
+        '\n\n--- The current request follows. ---\n\n';
+}
+
 // 09-21 BUGFIX (reported): the fresh-chat reset is performed at the REQUEST
 // BOUNDARY only, by this wrapper, and never from inside the tool loop.
 // Counting happens in countedSend(); acting on the count happens here, once per
@@ -1266,16 +1423,42 @@ function greetingDirective(userPrompt) {
 // the whole request (cleared in finally on every path) so a nested attempt can
 // never navigate the tab out from under a live response - which is what broke
 // multi-tool Claude Code requests ("Server error mid-response").
-async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted) {
-    requestInFlight = true;
+//
+// A reset opens an EMPTY chat, and the gateway forwards only the latest user message —
+// so the caller's earlier turns were gone, and "now add tests for that" reached a model
+// that had never seen "that". When the thread was reset and the caller sent history,
+// the history is replayed (compacted) ahead of the new message, and `opts.threadReset`
+// tells the route to say so in X-Harness-Thread-Reset.
+//
+// The boundary check runs BEFORE requestInFlight is raised. It used to run after, and
+// maybeResetThreadAtBoundary refuses whenever requestInFlight is set — so the reset
+// never fired at all and the tab thread grew without bound (measured 2026-09-26:
+// sendCount 2 of 2, no fresh chat). Requests are serialised by enqueue(), so nothing
+// else is in flight at this point.
+async function handleRequest(systemText, userPrompt, toolDefs, onProgress, isAborted, opts = {}) {
+    let reset = false;
     try {
-        try {
-            await maybeResetThreadAtBoundary('request start');
-        } catch (e) {
-            console.warn('⚠️ boundary fresh-chat open failed:', e.message);
+        reset = await maybeResetThreadAtBoundary('request start');
+    } catch (e) {
+        console.warn('⚠️ boundary fresh-chat open failed:', e.message);
+    }
+    requestInFlight = true;
+    turnUsage = { sentChars: 0, recvChars: 0, sends: 0 };
+    opts.usage = turnUsage;
+    try {
+        opts.threadReset = !!reset;
+        if (reset && opts.history) {
+            console.log(`📜 fresh chat — replaying ${opts.history.length} chars of the caller's earlier turns`);
+            userPrompt = opts.history + userPrompt;
         }
         return await handleRequestInner(systemText, userPrompt, toolDefs, onProgress, isAborted);
+    } catch (e) {
+        // An unfinished turn spent tokens too — the runaway loop is exactly the case a
+        // caller's breaker exists for, so its usage travels with the error.
+        if (e instanceof HarnessIncomplete) e.usage = opts.usage;
+        throw e;
     } finally {
+        turnUsage = null;
         requestInFlight = false;
     }
 }
@@ -1402,7 +1585,10 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             let _calls = [];
             try { _calls = (parseToolCalls(_text) || {}).toolCalls || []; } catch { _calls = []; }
             const _fetch = _calls.find((c) => c && (c.toolName === 'read_file' || c.toolName === 'see_next_chunk'));
-            if (!_fetch) return _text;
+            if (!_fetch) {
+                if (!String(_text || '').trim()) throw new HarnessIncomplete('empty', 'webchat model gave no reply');
+                return _text;
+            }
             // The engine writes REPO-RELATIVE paths into its prompts
             // ("execution/signals.py"), but sandbox.checkPath resolves a relative path
             // against the GATEWAY's cwd (/home/roni/Roni_workspace/webchat-api) and
@@ -1507,6 +1693,13 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
     // Work that can actually CHANGE something. workToolsRun counts reads too, so it
     // cannot answer "did this run alter any state?" — see markUnverifiedSubmit case 2.
     let mutationsRun = 0;
+    // Test commands run this turn, and whether the most recent one exited 0.
+    const testRuns = { ran: 0, lastOk: false };
+    // Placeholder code this turn's writes introduced, per file, against the file as
+    // it was before the turn first touched it. A later write that removes the stub
+    // clears the entry; anything left at submit fails the request.
+    const slopBaseline = new Map();
+    const slopOutstanding = new Map();
     let wrapUpSent = false; // 09-13: near the round budget, demand a final submit_answer
     let spiralStrikes = 0; // 09-13: repeated reasoning loops in the tab
     let lastToolInfo = null;  // most recent executed call, for the handoff doc
@@ -1542,7 +1735,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 console.log(`🛑 anti-spiral: ${ANTI_SPIRAL.describe(spiral)} (strike ${spiralStrikes}) round ${round + 1}`);
                 onProgress?.({ type: 'rejected', text: 'anti-spiral: generation paused — ' + ANTI_SPIRAL.describe(spiral) });
                 if (spiralStrikes >= 2) {
-                    return ANTI_SPIRAL.spiralBanner(spiral) + exhaustedMarker('', response);
+                    throw new HarnessIncomplete('spiral', ANTI_SPIRAL.spiralBanner(spiral) + exhaustedMarker('', response));
                 }
                 response = await countedSend(ANTI_SPIRAL.spiralRedirect(spiral), toolDefs);
                 continue;
@@ -1627,12 +1820,29 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 // The rationale lives with markUnverifiedSubmit, so the rule is stated
                 // once instead of drifting in two places.
                 const offeredWorkTools = !config.noTools && !config.allowPlainText;
-                const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun, mutationsRun });
-                if (verdict.marked) {
-                    console.log('⚠️ submit_answer arrived having run ZERO tools — marking the answer as unverified (possible phantom completion)');
-                    onProgress?.({ type: 'rejected', text: 'submit after zero tool calls — answer marked unverified' });
+                if (slopOutstanding.size) {
+                    const where = [...slopOutstanding].map(([f, hits]) =>
+                        `${f}: ${hits.map((h) => `line ${h.line} (${h.rule}) ${h.text}`).join('; ')}`).join(' | ');
+                    console.log(`⚠️ submit with placeholder code still in place — ${where}`);
+                    onProgress?.({ type: 'rejected', text: 'answer rejected: the written code still contains placeholders' });
+                    throw new HarnessIncomplete('unverified_slop',
+                        `[⚠️ the files written in this turn still contain placeholder code — ${where}] ` + (final || ''));
                 }
-                return verdict.text || '[webchat model completed the task]';
+                const verdict = markUnverifiedSubmit(final || '', { offeredWorkTools, workToolsRun, mutationsRun, testRuns });
+                if (verdict.marked) {
+                    // A claim the harness can contradict is a failed request, not an
+                    // answer: the caller gets an error it cannot mistake for success.
+                    console.log(`⚠️ unverified submit (${verdict.reason}): work=${workToolsRun} mutations=${mutationsRun} tests=${testRuns.ran}/${testRuns.lastOk ? 'ok' : 'failed'}`);
+                    onProgress?.({ type: 'rejected', text: `answer rejected as unverified (${verdict.reason})` });
+                    throw new HarnessIncomplete('unverified', verdict.text);
+                }
+                // Never manufacture an answer. This used to fall back to the literal
+                // "[webchat model completed the task]" after the one empty-submit nudge,
+                // so two empty submits reached the caller as a confident completion.
+                if (!String(verdict.text || '').trim()) {
+                    throw new HarnessIncomplete('empty', 'webchat model submitted an empty answer twice — no result to return');
+                }
+                return verdict.text;
             }
             if (call.toolName !== 'send_message') {
                 onProgress?.({ type: 'tool', name: call.toolName, args: call.args });
@@ -1648,16 +1858,51 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 if (text) onProgress?.({ type: 'text', text });
                 result = { success: true, delivered: true, instruction: 'Message delivered to user. Now proceed with your work tool call (read_file, run_bash, etc.) or deliver final answer via submit_answer.' };
             } else {
+                const writesFile = (call.toolName === 'write_file' || call.toolName === 'edit_file') && typeof call.args?.path === 'string';
+                if (writesFile && !slopBaseline.has(call.args.path)) {
+                    let before = '';
+                    try { before = fs.readFileSync(call.args.path, 'utf8'); } catch { /* new file */ }
+                    slopBaseline.set(call.args.path, before);
+                }
+                const bashBefore = call.toolName === 'run_bash' ? FS_SNAPSHOT.snapshot(SANDBOX.roots) : null;
                 result = await runTool(call.toolName, call.args, { threadId: config.webchatUrl || null });
+                const bashAfter = bashBefore ? FS_SNAPSHOT.snapshot(SANDBOX.roots) : null;
+                if (writesFile && result && result.success === true) {
+                    let after = null;
+                    try { after = fs.readFileSync(call.args.path, 'utf8'); } catch { /* removed */ }
+                    const hits = after === null ? [] : SLOP.slopScan(slopBaseline.get(call.args.path), after, call.args.path);
+                    if (hits.length) {
+                        slopOutstanding.set(call.args.path, hits);
+                        // Tell the model now, while it can still fix it.
+                        result = {
+                            ...result,
+                            slop: hits,
+                            warning: `This write introduced placeholder code (${hits.map((h) => `line ${h.line}: ${h.text}`).join('; ')}). ` +
+                                'Replace it with the real implementation — the task cannot be submitted while it is there.',
+                        };
+                    } else {
+                        slopOutstanding.delete(call.args.path);
+                    }
+                }
                 // Count only real work: send_message is conversation and the submit
                 // aliases end the turn, so neither is evidence the task was touched.
-                workToolsRun++;
+                //
+                // Only a call that SUCCEEDED counts. Counting attempts let a turn whose
+                // every write was refused by the sandbox (or whose every edit_file missed
+                // its old_string) submit "implemented the fix" with mutationsRun=6.
+                const ok = !!(result && result.success === true);
+                if (ok) workToolsRun++;
                 // And separately, whether anything here could have changed state at all.
-                // A run_bash only counts when its command actually mutates — `pytest` and
+                // A run_bash only counts when it actually changed something — `pytest` and
                 // `git log` are reads, and treating them as writes is what let
-                // "changes committed and pushed" pass unchallenged.
-                if (MUTATING_TOOLS.has(call.toolName)) mutationsRun++;
-                else if (call.toolName === 'run_bash' && MUTATING_BASH_RE.test(String(call.args?.command || ''))) mutationsRun++;
+                // "changes committed and pushed" pass unchallenged. Judged by the files
+                // under the sandbox roots before and after (see bashMutated).
+                if (ok && MUTATING_TOOLS.has(call.toolName)) mutationsRun++;
+                else if (ok && call.toolName === 'run_bash' && bashMutated(call.args?.command, bashBefore, bashAfter)) mutationsRun++;
+                if (call.toolName === 'run_bash' && TEST_COMMAND_RE.test(String(call.args?.command || ''))) {
+                    testRuns.ran++;
+                    testRuns.lastOk = ok;
+                }
             }
             // 08-16 (user): stream a readable receipt to the client — the exact
             // command / file / output, not a bare "🔧 toolname" — so anyone
@@ -1690,6 +1935,9 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             // receipt: its text was already delivered to the client above.
             const followUp =
                 (call.toolName === 'send_message' ? '' : formatToolResultView(call, maybeCompactResult(call, result), config.modelToolResultCap, { forModel: true }) + '\n\n') +
+                // The receipt formatter shows the diff, not extra result fields, so a
+                // placeholder warning is appended explicitly or the model never sees it.
+                (result && result.warning ? `⚠️ ${result.warning}\n\n` : '') +
                 (config.allowPlainText
                     ? 'Task is NOT complete until every part is done AND verified. Send ONE 💬 line, then your ' +
                       'next fenced tool call. Verify with run_bash (syntax checks, imports, the project tests); ' +
@@ -1754,11 +2002,11 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
                 continue;
             }
             if (verdict.action === 'stop') {
-                return exhaustedMarker(
+                throw new HarnessIncomplete('malformed', exhaustedMarker(
                     `[⚠️ STOPPED — the model sent malformed JSON ${malformedRounds} times in a row ${verdict.why}. ` +
                     `Last failure: ${reason}. Wake it again to continue.] `,
                     response
-                );
+                ));
             }
             response = await countedSend(malformedCorrectionMsg(reason, malformedRounds, config.maxMalformedRounds), toolDefs);
             continue;
@@ -1794,12 +2042,12 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
         // reply after context overflow can be a multi-KB echo of its own
         // prompt (08-12: ~30KB dumped into the exhausted marker) — never
         // ship that to the client.
-        return exhaustedMarker('[⚠️ webchat model kept replying without tool-call JSON] ', response);
+        throw new HarnessIncomplete('no_tool_json', exhaustedMarker('[⚠️ webchat model kept replying without tool-call JSON] ', response));
     }
 
     // Round budget exhausted without a submit_answer. Cap what the client sees
     // (08-12: the degraded model echoed the entire system prompt here).
-    return exhaustedMarker('[⚠️ webchat model did not submit a final answer within the round budget] ', response);
+    throw new HarnessIncomplete('round_budget', exhaustedMarker('[⚠️ webchat model did not submit a final answer within the round budget] ', response));
 }
 
 // The Anthropic SSE sequence a FAILED stream must end with.
@@ -1811,7 +2059,7 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
 // A client that already has an open block only learns the turn is over from
 // message_stop; without it Claude Code reports "Server error mid-response" and the
 // session cannot continue cleanly.
-function streamFailureEvents({ partial = '', openBlock = -1, message = '' } = {}) {
+function streamFailureEvents({ partial = '', openBlock = -1, message = '', errorType = 'api_error' } = {}) {
     const out = [];
     const emit = (event, data) => out.push({ event, data });
 
@@ -1829,14 +2077,25 @@ function streamFailureEvents({ partial = '', openBlock = -1, message = '' } = {}
         emit('content_block_stop', { type: 'content_block_stop', index: openBlock });
     }
 
-    emit('error', { type: 'error', error: { type: 'api_error', message: String(message) } });
+    emit('error', { type: 'error', error: { type: errorType, message: String(message) } });
     emit('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'error', stop_sequence: null },
-        usage: { output_tokens: String(partial).length },
+        usage: { output_tokens: Math.ceil(String(partial).length / 4) },
     });
     emit('message_stop', { type: 'message_stop' });
     return out;
+}
+
+// How each API shape reports a HarnessIncomplete before any byte was sent. 502:
+// the gateway could not get a usable answer from its upstream (the webchat).
+function sendIncomplete(res, error, shape) {
+    res.set('X-Harness-Outcome', error.outcome);
+    res.set('X-Harness-Usage-Estimated', 'chars/4');
+    if (shape === 'openai') {
+        return res.status(502).json({ error: { message: error.message, type: 'harness_incomplete', code: error.outcome }, usage: openaiUsage(error.usage) });
+    }
+    return res.status(502).json({ type: 'error', error: { type: 'harness_incomplete', outcome: error.outcome, message: error.message }, usage: anthropicUsage(error.usage) });
 }
 
 // The exhausted-path markers must never carry a raw broken JSON envelope
@@ -1857,9 +2116,10 @@ function finalAnswerFor(text) {
     // lanes forever. Pass the caller's answer through untouched.
     if (config.passthroughFormat) return text;
     if (looksLikeBrokenToolJson(text)) {
-        return '[⚠️ webchat model kept sending malformed tool calls — please retry the request]';
+        throw new HarnessIncomplete('malformed', 'webchat model kept sending malformed tool calls — please retry the request');
     }
-    return text || '[webchat model gave no reply]';
+    if (!text) throw new HarnessIncomplete('empty', 'webchat model gave no reply');
+    return text;
 }
 
 // Did this reply LOOK like a tool-call attempt that failed to parse? (a
@@ -2567,7 +2827,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     try {
         const { messages, tools, model, stream } = req.body || {};
         if (!isWebchatModel(req.body)) {
-            return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', req.body);
+            if (refuseUnlistedUpstreamModel(req.body, res)) return;
+            return proxyTo(req, res, UPSTREAM_OPENAI.base, '/chat/completions', req.body, { token: UPSTREAM_OPENAI.token });
         }
         await applyModelSelection(req.body);
         if (stream) console.log('⚠️  stream requested — responding non-streamed');
@@ -2636,9 +2897,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         await ensureMcpDiscovered();
         const toolDefs = buildExecutableToolDefs();
 
+        const turnOpts = { history: historyTranscript(messages) };
         const text = await enqueue(() =>
-            handleRequest(systemText, prompt, toolDefs)
+            handleRequest(systemText, prompt, toolDefs, undefined, undefined, turnOpts)
         );
+        if (turnOpts.threadReset) res.set('X-Harness-Thread-Reset', '1');
+        res.set('X-Harness-Usage-Estimated', 'chars/4');
 
         // 09-13: the webchat can answer the throttle notice as its REPLY (a 200
         // with the text). Detect it, start the cooldown, and surface a 429 so the
@@ -2680,11 +2944,12 @@ app.post('/v1/chat/completions', async (req, res) => {
             for (let i = 0; i < text.length; i += 512) {
                 res.write(`data: ${JSON.stringify(chunk({ content: text.slice(i, i + 512) }))}\n\n`);
             }
-            res.write(`data: ${JSON.stringify(chunk({}, 'stop'))}\n\n`);
+            res.write(`data: ${JSON.stringify({ ...chunk({}, 'stop'), usage: openaiUsage(turnOpts.usage) })}\n\n`);
             res.write('data: [DONE]\n\n');
             return res.end();
         }
 
+        res.set('X-Harness-Outcome', 'ok');
         res.json({
             id: 'chatcmpl_' + Math.random().toString(36).slice(2, 12),
             object: 'chat.completion',
@@ -2697,9 +2962,14 @@ app.post('/v1/chat/completions', async (req, res) => {
                     finish_reason: 'stop',
                 },
             ],
-            usage: { prompt_tokens: 0, completion_tokens: text.length, total_tokens: text.length },
+            usage: openaiUsage(turnOpts.usage),
         });
     } catch (error) {
+        if (error instanceof HarnessIncomplete) {
+            console.log(`⛔ request incomplete (${error.outcome}) — returned as an API error, not an answer`);
+            if (!res.headersSent && !res.writableEnded && !res.destroyed) return sendIncomplete(res, error, 'openai');
+            return;
+        }
         console.error('❌ Error:', error);
         // 09-13: the throttle does NOT always arrive as reply TEXT. DeepSeek throws
         // it as a stream error ("DeepSeek stream error: Messages too frequent …
@@ -2785,7 +3055,8 @@ app.post('/v1/messages', async (req, res) => {
             );
         }
         if (!isWebchatModel(routedBody)) {
-            return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody);
+            if (refuseUnlistedUpstreamModel(routedBody, res)) return;
+            return proxyTo(req, res, UPSTREAM_ANTHROPIC.base, '/v1/messages', routedBody, { token: UPSTREAM_ANTHROPIC.token });
         }
         await applyModelSelection(routedBody);
 
@@ -2832,7 +3103,11 @@ app.post('/v1/messages', async (req, res) => {
         const modelName = model || config.modelName;
 
         if (!stream) {
-            const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs));
+            const turnOpts = { history: historyTranscript(messages) };
+            const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, undefined, undefined, turnOpts));
+            if (turnOpts.threadReset) res.set('X-Harness-Thread-Reset', '1');
+            res.set('X-Harness-Usage-Estimated', 'chars/4');
+            res.set('X-Harness-Outcome', 'ok');
             return res.json({
                 id: 'msg_' + Math.random().toString(36).slice(2, 12),
                 type: 'message',
@@ -2840,7 +3115,7 @@ app.post('/v1/messages', async (req, res) => {
                 model: modelName,
                 content: [{ type: 'text', text }],
                 stop_reason: 'end_turn',
-                usage: { input_tokens: 0, output_tokens: text.length },
+                usage: anthropicUsage(turnOpts.usage),
             });
         }
 
@@ -2936,7 +3211,10 @@ app.post('/v1/messages', async (req, res) => {
         let aborted = false;
         res.on('close', () => { aborted = true; });
 
-        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted));
+        // Headers are already sent on a stream, so a reset is announced only in the
+        // server log here; the history is replayed all the same.
+        const turnOpts = { history: historyTranscript(messages) };
+        const text = await enqueue(() => handleRequest(systemText, prompt, toolDefs, onProgress, () => aborted, turnOpts));
         if (text === null) { if (heartbeat) clearInterval(heartbeat); return; } // aborted — nothing more to write
 
 
@@ -2960,7 +3238,7 @@ app.post('/v1/messages', async (req, res) => {
         ev('message_delta', {
             type: 'message_delta',
             delta: { stop_reason: 'end_turn', stop_sequence: null },
-            usage: { output_tokens: text.length },
+            usage: anthropicUsage(turnOpts.usage),
         });
         ev('message_stop', { type: 'message_stop' });
         if (heartbeat) clearInterval(heartbeat);
@@ -2991,16 +3269,26 @@ app.post('/v1/messages', async (req, res) => {
         // ERR_HTTP_HEADERS_SENT → whole process crashed → "connection refused"
         // for every client. Guard headersSent too; on the stream, end with an
         // SSE error event instead of a 500.
+        const incomplete = error instanceof HarnessIncomplete;
         if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+            if (incomplete) return sendIncomplete(res, error, 'anthropic');
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: error.message } });
         } else if (!res.writableEnded && !res.destroyed) {
             try {
                 const message = String(error && error.message ? error.message : error);
-                for (const frame of streamFailureEvents({ partial, openBlock, message })) {
-                    ev(frame.event, frame.data);
+                const errorType = incomplete ? 'harness_incomplete' : 'api_error';
+                // Written directly: `ev` is a const inside the try block and is NOT in
+                // scope here. Calling it threw a ReferenceError that the bare catch
+                // below swallowed, so res.end() never ran and EVERY failed stream left
+                // the client hanging on an open connection until its own timeout.
+                for (const frame of streamFailureEvents({ partial, openBlock, message, errorType })) {
+                    res.write(`event: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`);
                 }
                 res.end();
-            } catch (e) { /* client already gone */ }
+            } catch (e) {
+                console.warn('⚠️ could not terminate the failed stream:', e.message);
+                try { res.end(); } catch { /* socket gone */ }
+            }
         }
     }
 });
@@ -3194,6 +3482,10 @@ module.exports = {
     NEW_CHAT_EVERY_SENDS,
     needsSingleThread,
     __test: {
+        HarnessIncomplete,
+        // The express app itself, so a test can drive the real HTTP surface
+        // (status codes, stop reasons) on an ephemeral port — no browser.
+        app,
         streamFailureEvents,
         setRequestInFlight: (v) => { requestInFlight = !!v; },
         getRequestInFlight: () => requestInFlight,
@@ -3204,6 +3496,10 @@ module.exports = {
         // passing after the real one changed.
         markUnverifiedSubmit,
         claimsWorkDone,
+        claimsTestsPass,
+        SLOP,
+    historyTranscript,
+        TEST_COMMAND_RE,
         UNVERIFIED_MARKER,
         // Malformed-JSON reporting. Exported so the test drives the SHIPPED reason
         // detector and correction text — a re-implementation would keep passing after

@@ -136,6 +136,9 @@ function defaultRoots(workspaceRoot) {
 // That narrow rule is what keeps it maintainable: it is not trying to be a security
 // boundary (the path fence in sandbox.js is), only a guard against an accidental
 // catastrophe that no amount of care afterwards can repair.
+// On Linux this list is documentation of intent: run_bash enforces it on argv in
+// src/tools/bash_guard.js, because substring matching both missed `rm -r -f` and refused
+// `grep -r halting`. The Windows list below is still matched as text.
 const DANGER_LINUX = [
     'pkill -f', 'node -e', 'node -p', 'rm -rf',
     // Disk and filesystem destruction — a single invocation loses the machine's data.
