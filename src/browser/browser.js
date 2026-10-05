@@ -51,6 +51,12 @@ function quirk(name, dflt) {
 // 150K chars into a box that will drop most of them.
 const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS || '28000', 10);
 
+// What the composer was MEASURED to keep, live on the Gemini lane: a 150,682-char
+// prompt came back with 30,717 in the box and the send proceeded "unverified".
+// Every cap here must stay under it, and the refusal has to name it so an operator
+// knows what to shrink.
+const COMPOSER_MEASURED_LIMIT = 30717;
+
 let browser = null;
 
 // puppeteer 25 removed Browser#isConnected(); it is now the `connected` getter.
@@ -1104,8 +1110,27 @@ async function sendPrompt(prompt, toolDefinitions) {
     // prompt 6,197,724 chars — the tab choked and the gateway wedged on
     // "Waiting for response..." for hours. Never send anything this absurd:
     // fail loudly to the client instead of silently wedging.
+    //
+    // MEASURE THE STRING THE COMPOSER RECEIVES. buildFullPrompt() prepends the whole
+    // tool-contract section and appends the REMINDER, so it is strictly longer than the
+    // caller's message whenever tools are advertised (~6,800 chars with the shipped
+    // 17-tool set). Checking `prompt` alone therefore let a prompt AT the cap compose
+    // to 34,803 chars — above the measured composer ceiling of 30,717, so the site
+    // truncated it and the model answered a prompt with its middle missing. The refusal
+    // also arrived three insertVerified attempts late, after ~104K chars of CDP
+    // Input.insertText, naming a length that was never typed.
+    //
+    // Safe to hoist: buildFullPrompt reads config only (passthroughFormat,
+    // toolContextWindow) and touches no browser state.
+    const fullPrompt = buildFullPrompt(prompt, toolDefinitions);
     if (prompt.length > MAX_PROMPT_CHARS) {
         throw new Error(`prompt too large (${prompt.length} chars > ${MAX_PROMPT_CHARS}) — refusing to send; a tool result or context build ran away. Check the caller.`);
+    }
+    if (fullPrompt.length > MAX_PROMPT_CHARS) {
+        throw new Error(`prompt too large — refusing to send. The caller's message is ${prompt.length} chars, `
+            + `but the tool contract composes it to ${fullPrompt.length} chars, over the ${MAX_PROMPT_CHARS}-char `
+            + `limit (the composer keeps only ~${COMPOSER_MEASURED_LIMIT} and truncates the rest silently). `
+            + `Shrink the request, drop toolDefinitions, or raise the cap deliberately.`);
     }
 
     // Refresh the CDP session per request — long-lived sessions intermittently
@@ -1156,8 +1181,6 @@ async function sendPrompt(prompt, toolDefinitions) {
             throw new Error('webchat tab still generating from a previous request — retry after it finishes');
         }
     }
-
-    const fullPrompt = buildFullPrompt(prompt, toolDefinitions);
 
     let input;
     try {
@@ -3356,7 +3379,14 @@ async function waitForResponse(before, typedText) {
             // arriving — and because sends are serialized, that blocked the lane
             // for 8 minutes at a time (observed outstandingMs 429-474s, repeatedly,
             // while the engine's own lane budget is 280s). Track progress instead.
-            const busyNow = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+            // `last` — NOT `state`. `state` is declared with `let` inside the main poll
+            // loop above, so it is out of scope here; the bare name resolved as a global
+            // lookup, threw ReferenceError, and the `catch` below swallowed it. Every
+            // rescue iteration therefore died on this line: the DOM rescue, the
+            // "still generating, extend" path and the "stuck send" break were all
+            // unreachable, and the loop only ever spun to the hard cap and threw
+            // "Timed out" with a complete answer sitting on the tab.
+            const busyNow = last.mode === 'vl' ? await isGenerating() : await isForeignBusy();
             if (quirk('autoContinueButton', true) && await clickContinueIfPresent()) {
                 await sleep(1500);
                 continue;
