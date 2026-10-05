@@ -100,3 +100,7 @@ credentials.json
 cookies.json
 .git-credentials
 # ---------------------------------------------------------------------------
+
+# local dependency links (2026-10-05)
+node_modules
+node_modules/
