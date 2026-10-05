@@ -65,6 +65,25 @@ function lex(cmd) {
     return out;
 }
 
+// Shell KEYWORDS are structural, not commands. `lex()` does not know them, so
+// `if true; then git push origin main; fi` split into ['if','true'], ['then','git',
+// 'push','origin','main'], ['fi'] - and every guard downstream tests argv[0], so the
+// real command was hidden behind `then`. MEASURED 2026-10-05: pushDenial returned
+// nothing for that string while returning a denial for the bare `git push origin main`.
+//
+// Dropping a LEADING keyword restores the real argv[0] without touching the deny
+// lists. `..` style prefixes are not touched; only these words, and only at the front.
+const SHELL_KEYWORDS = new Set([
+    'if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until', 'do', 'done',
+    'case', 'esac', 'select', 'function', 'coproc', 'time', 'in', '!', '{', '}',
+]);
+
+function stripKeywords(argv) {
+    let i = 0;
+    while (i < argv.length - 1 && SHELL_KEYWORDS.has(argv[i])) i++;
+    return argv.slice(i);
+}
+
 // The simple commands in `cmd`, each an argv array. Redirections are dropped.
 function commands(cmd) {
     const list = [];
@@ -74,7 +93,12 @@ function commands(cmd) {
         cur.push(t.w);
     }
     if (cur.length) list.push(cur);
-    return list.map((argv) => argv.filter((w, i) => !isRedirect(w, argv[i - 1])));
+    // Strip a leading structural keyword BEFORE the redirect filter, so the command
+    // after `then`/`do`/`else` becomes argv[0] again.
+    return list
+        .map((argv) => stripKeywords(argv))
+        .map((argv) => argv.filter((w, i) => !isRedirect(w, argv[i - 1])))
+        .filter((argv) => argv.length);
 }
 
 function isRedirect(w, prev) {
