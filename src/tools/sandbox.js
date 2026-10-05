@@ -118,6 +118,16 @@ function realpathAllowingMissing(abs) {
     for (let hop = 0; hop < MAX_HOPS; hop++) {
         while (queue.length && queue[0] === '.') queue.shift(); // `./` in a link target
         if (!queue.length) return path.sep + out.join(path.sep);
+        // `..` must be CONSUMED, not pushed into `out`. Measured 2026-10-05: without
+        // this, a link target of `../outside/secret.txt` left the walk holding
+        // `.../root/../outside/secret.txt`, which still STARTS WITH the root string, so
+        // isInside() said the path was inside and the guard waved it through. Popping
+        // `out` collapses the traversal to where the write actually lands.
+        if (queue[0] === '..') {
+            queue.shift();
+            if (out.length) out.pop();   // a `..` above the filesystem root is a no-op
+            continue;
+        }
         const next = path.sep + out.concat(queue[0]).join(path.sep);
         let st = null;
         try {
