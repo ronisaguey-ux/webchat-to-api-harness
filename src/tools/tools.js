@@ -272,16 +272,26 @@ const TOOL_DEFINITIONS = [
             required: ['path'],
         },
         handler: async (args) => {
-            const sb = sandbox.denyResult(sandbox.checkPath(args.path));
+            const _chk = sandbox.checkPath(args.path);
+            const sb = sandbox.denyResult(_chk);
             if (sb) return sb;
-            const content = fs.readFileSync(args.path, 'utf-8');
-            const start = Number.isInteger(args.offset) ? Math.max(0, args.offset) : (lastChunkEnd.get(args.path) || 0);
+            // 10-05: READ THE PATH THE SANDBOX RESOLVED, not the raw argument.
+            // checkPath returns `{ok:true, path: <absolute>}`, and this handler used to throw
+            // that away and call readFileSync(args.path) with whatever the CALLER typed. The
+            // engine writes REPO-RELATIVE paths, so a relative path was read against the
+            // GATEWAY's cwd instead of the sandbox root: measured 16 see_next_chunk calls in
+            // 30 minutes all returning 153-176 chars of the wrong file, 15 of 16 useless. The
+            // lane asked for the next chunk of a 60KB source file and got a sliver of some
+            // file in webchat-api/, so it kept asking and burned whole fetch budgets on nothing.
+            const _file = (_chk && _chk.path) || args.path;
+            const content = fs.readFileSync(_file, 'utf-8');
+            const start = Number.isInteger(args.offset) ? Math.max(0, args.offset) : (lastChunkEnd.get(_file) || 0);
             const len = Math.min(args.length || CHUNK_CHARS, MAX_READ_FILE_CHARS);
             if (start >= content.length) {
                 return { success: true, truncated: false, content: '', message: `End of ${args.path} (${content.length} chars). Nothing left to read.` };
             }
             const end = Math.min(content.length, start + len);
-            lastChunkEnd.set(args.path, end);
+            lastChunkEnd.set(_file, end);
             const more = end < content.length;
             return {
                 success: true,
