@@ -1620,6 +1620,24 @@ async function handleRequestInner(systemText, userPrompt, toolDefs, onProgress, 
             const _payload = JSON.stringify(_res);
             console.log(`📎 passthrough fetch ${_i + 1}/${_fetchRounds}: ${_fetch.toolName} -> ${_payload.length} chars`);
             if (_payload.length <= 200) return _text;
+            // 10-05: A TOOL THAT FOUND NOTHING MUST NOT BUY ANOTHER SEND.
+            // see_next_chunk answers an exhausted file with
+            //   {success:true, truncated:false, content:"", message:"End of X ... Nothing left to read."}
+            // which stringifies to ~160 chars - over the 200-char bail above, so the loop
+            // treated "there is nothing more" as content worth re-prompting with. Measured:
+            // 15 of 16 see_next_chunk results in 30 minutes were 153-176 chars, i.e. the lane
+            // had already reached EOF and every one of them still cost a full re-send, each
+            // behind the DS send gate (20-40s per account). Three dead rounds per request is
+            // ~2 minutes of gate waiting spent reading a message that says "stop asking".
+            // If the result carries no content, hand the ORIGINAL reply back untouched.
+            const _noContent = _res && typeof _res === 'object'
+                && !String(_res.content || '').trim()
+                && !String(_res.error || '').trim()
+                && !String(_res.output || '').trim();
+            if (_noContent) {
+                console.log(`📎 passthrough fetch ${_i + 1}/${_fetchRounds}: ${_fetch.toolName} returned no content — answering with what we have`);
+                return _text;
+            }
             // Never slice the JSON STRING: a byte cut lands mid-token and hands the
             // lane invalid JSON it cannot parse. Measured: read_file on
             // rust/execution/tests/matching_engine.rs (552240 chars) returns a

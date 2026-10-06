@@ -170,8 +170,29 @@ function checkPath(p) {
     if (typeof p !== 'string' || !p.trim()) {
         return { ok: false, error: 'sandbox: empty path', roots: ROOTS };
     }
-    const abs = path.resolve(p);
-    const real = realpathAllowingMissing(abs);
+    let abs = path.resolve(p);
+    let real = realpathAllowingMissing(abs);
+    // 10-05: A RELATIVE PATH BELONGS TO A ROOT, NOT TO THE GATEWAY'S CWD.
+    // path.resolve() anchors a relative path at process.cwd(), which for every gateway is
+    // .../webchat-api - so `oculus/config/features.py`, the exact shape the ENGINE sends
+    // (it writes repo-relative targets), resolved to
+    // /home/roni/Roni_workspace/webchat-api/oculus/config/features.py and was DENIED as
+    // "outside the allowed roots". Measured live: 15 of 16 see_next_chunk calls in 30
+    // minutes returned 153-176 chars of the wrong file, because the lane kept asking and
+    // the read never reached the file it named.
+    // When the cwd-anchored form is outside every root, try each root in turn. The FIRST
+    // root that contains the named file wins; if none does, the ORIGINAL denial stands
+    // (this only ever rescues a path that really does exist under an allowed root, so it
+    // cannot turn a rejected path into an allowed one by itself).
+    if (!ROOTS.some((root) => isInside(real, root)) && !path.isAbsolute(p)) {
+        for (const root of ROOTS) {
+            const cand = path.resolve(root, p);
+            const candReal = realpathAllowingMissing(cand);
+            if (ROOTS.some((r) => isInside(candReal, r)) && fs.existsSync(cand)) {
+                return { ok: true, path: cand, resolvedFromRoot: root };
+            }
+        }
+    }
     if (ROOTS.some((root) => isInside(real, root))) return { ok: true, path: abs };
     logDenial('path', p, `resolves to ${real}, outside ${JSON.stringify(ROOTS)}`);
     return {
