@@ -89,6 +89,17 @@ function stateDir() {
     return d;
 }
 
+// The daemon (cli/daemon.js) writes every runtime file — gateway logs, pids and the
+// Chrome profile — under ITS state dir, and that is not the same place as stateDir()
+// above: it is <repo>/.webchat unless WEBCHAT_STATE_DIR overrides it. Mirror the rule
+// here, or a log reader looks in a directory nothing writes to and reports a stale
+// file as though it were live.
+function runtimeStateDir() {
+    return process.env.WEBCHAT_STATE_DIR
+        ? path.resolve(process.env.WEBCHAT_STATE_DIR)
+        : path.join(REPO, '.webchat');
+}
+
 // The aggregate fronts every lane and supplies each one's auth — the same reason the
 // subagent worker posts through it rather than at a lane gateway directly.
 function aggregateBase() {
@@ -225,12 +236,23 @@ const TOOLS = [
             if (!file) {
                 const gate = activeGate(a.gate);
                 const port = (gate && gate.gatewayPort) || 8081;
+                const runtime = runtimeStateDir();
                 const candidates = [
+                    // where the daemon actually writes today
+                    path.join(runtime, 'gateway-' + port + '.log'),
+                    path.join(runtime, 'gateway-' + port + '.err.log'),
+                    path.join(runtime, 'gateway.log'),
+                    // places older checkouts wrote to
                     '/tmp/opencode/gw_' + port + '.log',
                     path.join(stateDir(), 'gateway-' + port + '.log'),
                     path.join(stateDir(), 'gateway.log'),
-                ];
-                file = candidates.find((f) => fs.existsSync(f)) || candidates[0];
+                ].filter((f) => { try { return fs.existsSync(f); } catch { return false; } });
+                // Prefer the file the daemon is writing NOW. A stale log that merely
+                // exists is worse than no log: it reads as a real, recent failure.
+                file = candidates.sort((x, y) => {
+                    try { return fs.statSync(y).mtimeMs - fs.statSync(x).mtimeMs; } catch { return 0; }
+                })[0];
+                if (!file) return asError('no gateway log found (looked in ' + runtime + ' and ' + stateDir() + ')');
             }
             if (!fs.existsSync(file)) return asError('no log at ' + file);
             const n = Math.min(Math.max(Number(a.lines) || 80, 1), 2000);
@@ -402,9 +424,13 @@ const TOOLS = [
                 out.envFile = settingsMod.envFilePath();
             }
             out.stateDir = stateDir();
+            out.runtimeStateDir = runtimeStateDir();
             const mem = safeRequire('../runtime/memory');
             if (mem) out.memoryFile = mem.memoryFile();
-            out.chromeProfile = process.env.CHROME_PROFILE || null;
+            // The daemon puts the profile under its own state dir, so reporting only the
+            // env var reads as "null" on a box whose profile clearly exists.
+            const profile = process.env.CHROME_PROFILE || path.join(runtimeStateDir(), 'chrome-profile');
+            out.chromeProfile = fs.existsSync(profile) ? profile : null;
             out.repo = REPO;
             return asText(out);
         }),
