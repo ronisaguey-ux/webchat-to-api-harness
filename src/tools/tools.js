@@ -5,6 +5,20 @@ const os = require('os');
 const { spawn } = require('child_process');
 const config = require('../core/config');
 const sandbox = require('./sandbox');
+
+// 10-06: ONE resolver for every file tool. `sandbox.checkPath` already resolves a
+// repo-relative path against the allowed roots (10-05), but four handlers went on to READ
+// `args.path` - the raw caller string - so read_file(oculus/api.py) called
+// fs.readFileSync('oculus/api.py') against the GATEWAY's cwd and died ENOENT, while
+// see_next_chunk on the same path worked fine. Measured live: read_file -> ENOENT 83 chars,
+// see_next_chunk -> 20775 chars of the real file. The engine writes repo-relative paths, so
+// every lane was unable to open the file it was asked to fix - which is exactly why they
+// kept quoting old_strings for regions they had never been shown.
+const _resolved = (p) => {
+    try { const c = sandbox.checkPath(p); return (c && c.ok && c.path) ? c.path : p; }
+    catch { return p; }
+};
+
 const bashGuard = require('./bash_guard');
 const SPEND = require('../runtime/spend_ledger');
 const platform = require('../core/platform');
@@ -231,7 +245,7 @@ const TOOL_DEFINITIONS = [
         handler: async (args) => {
             const sb = sandbox.denyResult(sandbox.checkPath(args.path));
             if (sb) return sb;
-            const content = fs.readFileSync(args.path, 'utf-8');
+            const content = fs.readFileSync(_resolved(args.path), 'utf-8');
             // 08-14 WEDGE ROOT-CAUSE: read_file without maxLength returned the
             // FULL file (5.86MB cross_eval_state.json) into the tool-result
             // message → next prompt = 6,197,724 chars → the webchat tab choked
@@ -321,7 +335,7 @@ const TOOL_DEFINITIONS = [
             if (sb) return sb;
             let oldContent = null;
             try {
-                oldContent = fs.readFileSync(args.path, 'utf-8');
+                oldContent = fs.readFileSync(_resolved(args.path), 'utf-8');
             } catch (e) {
                 oldContent = null; // new file — no diff against anything
             }
@@ -373,7 +387,7 @@ const TOOL_DEFINITIONS = [
             if (sb) return sb;
             let content;
             try {
-                content = fs.readFileSync(args.path, 'utf-8');
+                content = fs.readFileSync(_resolved(args.path), 'utf-8');
             } catch (e) {
                 return { success: false, error: `Could not read ${args.path}: ${e.message}`, content_is_error: true };
             }
@@ -553,7 +567,7 @@ const TOOL_DEFINITIONS = [
         handler: async (args) => {
             const sb = sandbox.denyResult(sandbox.checkPath(args.path));
             if (sb) return sb;
-            const files = fs.readdirSync(args.path);
+            const files = fs.readdirSync(_resolved(args.path));
             return { success: true, files };
         },
     },
