@@ -50,20 +50,15 @@ function fail(message) {
 // A gate with no aggregate alias still falls back to its own gateway, so a newly added
 // webchat keeps working without a code change.
 const AGGREGATE = process.env.HARNESS_AGGREGATE_URL || 'http://127.0.0.1:8090';
-const GATE_ALIAS = { deepseek: 'ds', gemini: 'gm', chatgpt: 'cg' };
-const alias = GATE_ALIAS[job.gate];
 
-let useAggregate = Boolean(alias);
+let useAggregate = true;
 let port = null;
 let model = 'webchat/' + job.gate;
 
-if (useAggregate) {
-    try {
-        const u = new URL(AGGREGATE);
-        port = parseInt(u.port || '80', 10);
-        model = alias;
-    } catch { useAggregate = false; }
-}
+try {
+    const u = new URL(AGGREGATE);
+    port = parseInt(u.port || '80', 10);
+} catch { useAggregate = false; }
 if (!useAggregate) {
     // Resolve the gate's gateway port at RUN time, not from the job record: the port is a
     // property of the webchat, and a stale copy in the job file would send the request to

@@ -78,8 +78,12 @@ function relay(target, reqPath, body, cb) {
         port: url.port,
         path: url.pathname + url.search,
         method: 'POST',
-        // Time to establish the connection.
-        timeout: RELAY_CONNECT_MS,
+        // A socket-inactivity ceiling, and it has to cover the RESPONSE, not just the
+        // connect. The lane gateway does not stream: it sends headers only once the
+        // webchat has finished thinking, which is minutes, so a connect-sized timeout
+        // fires first and every call dies as "did not answer within 10000ms" while the
+        // lane is working perfectly. RELAY_RESPONSE_MS is that same ceiling.
+        timeout: RELAY_RESPONSE_MS,
         headers: {
             'content-type': 'application/json',
             ...(payload ? { 'content-length': payload.length } : {}),
@@ -189,11 +193,18 @@ function createHub(opts) {
                 // Relay verbatim, including the stream. Buffering breaks SSE, and
                 // rewriting the body would mean the hub has an opinion about the
                 // protocol.
-                res.writeHead(upstream.statusCode || 502, {
-                    ...upstream.headers,
-                    // The upstream sets its own length; chunked is safer once we pipe.
-                    'transfer-encoding': upstream.headers['transfer-encoding'] || 'chunked',
-                });
+                //
+                // Drop the hop-by-hop framing headers first. The upstream reply already
+                // carries its own content-length, and forcing a transfer-encoding on top
+                // produced a reply with BOTH — which a strict client rejects as "Parse
+                // Error: Transfer-Encoding can't be present with Content-Length" before it
+                // ever reads the answer. Node frames the piped body itself.
+                const headers = { ...upstream.headers };
+                delete headers['transfer-encoding'];
+                delete headers['content-length'];
+                delete headers.connection;
+                delete headers['keep-alive'];
+                res.writeHead(upstream.statusCode || 502, headers);
                 upstream.pipe(res);
             });
         });

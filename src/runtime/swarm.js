@@ -19,7 +19,9 @@ function safeRequire(p) {
 }
 const gatesMod = safeRequire('../../cli/gates');
 
-const GATE_ALIAS = { deepseek: 'ds', gemini: 'gm', chatgpt: 'cg' };
+// The aggregate resolves model ids through its registry; the short ids (ds/gm/cg) are not
+// in it. Use the qualified webchat/<gate> form, which parses on the hub and on a lane.
+
 const AGGREGATE = () => process.env.HARNESS_AGGREGATE_URL || 'http://127.0.0.1:8090';
 
 function post(url, body, timeoutMs, signal) {
@@ -75,12 +77,12 @@ async function reachableLanes(explicit) {
             req.on('error', () => resolve(null));
             req.end();
         });
-        if (h && h.browserAlive) usable.push({ id: g.id, alias: GATE_ALIAS[g.id] || g.id, gatewayPort: g.gatewayPort });
+        if (h && h.browserAlive) usable.push({ id: g.id, alias: 'webchat/' + g.id, gatewayPort: g.gatewayPort });
     }
     // If nothing reports a live browser, fall back to every configured lane rather than
     // refusing: the health flag can lag an attach, and a swarm that refuses to start is
     // less useful than one that reports per-task errors.
-    return usable.length ? usable : wanted.map((g) => ({ id: g.id, alias: GATE_ALIAS[g.id] || g.id, gatewayPort: g.gatewayPort }));
+    return usable.length ? usable : wanted.map((g) => ({ id: g.id, alias: 'webchat/' + g.id, gatewayPort: g.gatewayPort }));
 }
 
 async function oneTask(lane, prompt, timeoutMs, signal) {

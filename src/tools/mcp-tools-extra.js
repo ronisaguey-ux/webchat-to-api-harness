@@ -106,7 +106,9 @@ function aggregateBase() {
     return process.env.HARNESS_AGGREGATE_URL || 'http://127.0.0.1:8090';
 }
 // Lane alias per webchat, so a caller can name a lane the aggregate understands.
-const GATE_ALIAS = { deepseek: 'ds', gemini: 'gm', chatgpt: 'cg' };
+// The aggregate resolves model ids through its registry; the short ids (ds/gm/cg) are not
+// in it. Use the qualified webchat/<gate> form, which parses on the hub and on a lane.
+
 
 const TOOLS = [
 
@@ -266,7 +268,7 @@ const TOOLS = [
         async (a) => {
             const gate = activeGate(a.gate);
             if (!gate) return asError('no webchat configured');
-            const alias = GATE_ALIAS[gate.id] || gate.id;
+            const alias = 'webchat/' + gate.id;
             const t0 = Date.now();
             const r = await httpJson('POST', aggregateBase() + '/v1/chat/completions', {
                 model: alias,
