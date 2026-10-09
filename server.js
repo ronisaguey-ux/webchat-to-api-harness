@@ -41,6 +41,7 @@ const mcpPool = new McpPool(config.mcpServers);
 // telegram responder skips "to"-tagged items (they are gateway-routed).
 const PATHS = require('./src/core/paths');
 const ANTI_SPIRAL = require('./src/runtime/anti_spiral');
+const LANE_VERDICT = require('./src/runtime/lane_verdict');
 const RATE_LIMIT = require('./src/runtime/rate_limit');
 const WEBCHAT_MODELS = require('./src/models/webchat-models');
 const MAIN_REPLY_FILE = PATHS.mainReplyFile();
@@ -688,9 +689,19 @@ async function countedSend(msg, defs) {
         // at the source — this pattern exists only for a site that throws it untagged.
         // A throttle is excluded here on purpose: it is handled as a cooldown below,
         // and resending it would deepen the limit.
-          const _retryable = !!e.retryable
-              || (/Timed out|stalled: no new output|Requesting main frame too early|server busy|generation_timeout/i.test(String(e.message))
-                  && !RATE_LIMIT.isRateLimitText(String(e.message)));
+          // 10-09: the decision moved to a CLASS, not a sentence. This gate used to
+          // test a regex on the message, and a stall's own wording ("no new output")
+          // did not contain "Timed out", so the retry was unreachable for the exact
+          // failure it exists for. LANE_VERDICT answers "what kind of failure is
+          // this" once, in one place: only a transient fault is resent; a throttle,
+          // a sign-out, a bot wall or a too-large prompt is not, because resending
+          // reaches the same wall and spends the account's patience to get there.
+          const _laneClass = LANE_VERDICT.classifyError(e);
+          const _retryable = LANE_VERDICT.isRetryable(_laneClass)
+              && !RATE_LIMIT.isRateLimitText(String(e.message));
+          if (_laneClass !== 'transient') {
+              console.log(`[lane] verdict ${LANE_VERDICT.describe(_laneClass, e)} — not resending`);
+          }
         if (sendRetriesLeft > 0 && _retryable) {
             sendRetriesLeft--;
             console.log(`⏱ send timed out${e.partialAnswerChars != null ? ` (partial answer was ${e.partialAnswerChars} chars)` : ''} — resending with a RETRY banner`);
