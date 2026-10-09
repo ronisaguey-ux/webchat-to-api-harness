@@ -354,6 +354,35 @@ attached MCP servers. The model is offered only the **executable** set — a too
 whose requirement is unmet (no `DEEPSEEK_API_KEY`, bash gate off, memory
 disabled) is never advertised, so it cannot be tried and looped on.
 
+## Lane verdicts — one class, one place (2026-10-09)
+
+A failed send is judged by what it **means**, not by its wording. `src/runtime/lane_verdict.js`
+returns one of:
+
+| class | meaning | resent? | cools the lane? |
+|---|---|---|---|
+| `transient` | the wire dropped it — the request was fine | yes | no |
+| `rate` | the account is throttled | no | **yes** |
+| `auth` | signed out | no | no |
+| `blocked` | a bot wall (Cloudflare, "verify you are human") | no | no |
+| `input` | the request itself is wrong (prompt too large) | no | no |
+| `context` | the thread is too long for the tab | no | no |
+| `empty` | the reply arrived with nothing usable in it | no | no |
+| `error` | unknown | no | no |
+
+Why it exists. The retry gate used to test `/Timed out/` on the error string. A stall throws
+`Webchat stalled: no new output for 120s`, which contains no `Timed out` — so the retry was
+unreachable for the exact failure it was written for, for weeks. A sentence is not a contract;
+a class is. When a site rephrases its error only the patterns in that one file need touching.
+
+Only a `transient` fault is resent, and only a `rate` reply cools the account. A lane that is
+merely **busy** is neither: treating a busy lane as a failure once parked a healthy one for
+36 minutes.
+
+`browser.js` tags its own errors with `retryable`, and that tag wins — it saw the failure
+happen, while this module only sees the sentence `browser.js` wrote. Tests:
+`harness_tests/lane_verdict.test.js`.
+
 ## Capabilities added 2026-09-24
 
 **A top-level platform selector (Linux / Windows).** `platform` — `linux` or
