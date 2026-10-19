@@ -1278,3 +1278,323 @@ async function installStreamTee() {
         // RE-ARM it — stale entries belong to dead requests anyway.
         // 08-13 PARSER-REFRESH: __wsParseSse is assigned BEFORE the guard —
         // gateway restarts must reach already-armed pages, or code fixes to
+        // the parser never apply (the page keeps the old function forever and
+        // the "restart to fix it" cycle silently does nothing). The buffer and
+        // XHR/fetch interceptors below stay guarded — they are stateful and
+        // must not double-install.
+        window.__wsParseSse = function (body) {
+            // 08-15 DRIFT: `think` carries the model's PRIVATE THINKING (the
+            // DeepThink reasoning streamed BEFORE the RESPONSE fragment is
+            // declared, plus THINK fragment content) — readStreamedAnswer
+            // accumulates it into window.__wsThinkBuf for the drift detector.
+            const out = { text: '', think: '', done: false, error: '' };
+            // 08-13 DeepThink gate: with thinking_enabled the think block
+            // streams FIRST as bare {"v":...} chunks + -1/content APPENDs,
+            // while the v-response frame declares fragments[last].type as
+            // THINK. Only after a RESPONSE fragment is declared do those
+            // chunks belong to the answer (probed live 08-13: fragment id 2
+            // THINK → id 3 RESPONSE). Without the gate the extracted text is
+            // reasoning + JSON — the 08-12 DOM-path poison, now on the tee.
+            let streamingResponse = false;
+            const blocks = String(body || '').split('\n\n');
+            for (const block of blocks) {
+                if (/^event:\s*(done|finished)/im.test(block)) out.done = true;
+                // 08-13 RATE-LIMIT FIX: burst traffic gets
+                //   event: hint
+                //   data: {"type":"error","content":"Messages too frequent. Try
+                //     again later.","finish_reason":"rate_limit_reached"}
+                // then `event: close` and NOTHING else — status never SETs
+                // FINISHED, so without this the wait loop polls to the full
+                // timeout, the client retries, and each retry re-hammers the
+                // same limit (the 08-13 "stops mid task" doom loop). Treat it
+                // as terminal and surface the error text.
+                if (/^event:\s*hint/im.test(block)) {
+                    for (const line of block.split('\n')) {
+                        if (!line.startsWith('data:')) continue;
+                        try {
+                            const j = JSON.parse(line.slice(5).trim());
+                            if (j && j.type === 'error') {
+                                out.done = true;
+                                out.error = String(j.content || 'deepseek stream error');
+                                if (j.finish_reason) out.error += ' (finish_reason: ' + j.finish_reason + ')';
+                            }
+                        } catch { /* not JSON */ }
+                    }
+                }
+                for (const line of block.split('\n')) {
+                    if (!line.startsWith('data:')) continue;
+                    const raw = line.slice(5).trim();
+                    if (!raw) continue;
+                    let j;
+                    try { j = JSON.parse(raw); } catch { continue; }
+                    if (j && typeof j.finish_reason === 'string' &&
+                        /rate_limit_reached|error|content_filter/i.test(j.finish_reason)) {
+                        out.done = true;
+                        out.error = out.error || ('stream finished with finish_reason: ' + j.finish_reason);
+                    }
+                    // OLD format: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"..."}],"status":"WIP"}}}
+                    const resp = j && j.v && j.v.response;
+                    if (resp) {
+                        const st = resp.status || '';
+                        if (st === 'DONE' || st === 'FINISHED' || st === 'ERROR' || st === 'STOPPED') out.done = true;
+                        if (Array.isArray(resp.fragments)) {
+                            const lastFrag = resp.fragments[resp.fragments.length - 1];
+                            if (lastFrag && lastFrag.type === 'RESPONSE') streamingResponse = true;
+                            else if (lastFrag && lastFrag.type === 'THINK') streamingResponse = false;
+                            for (const f of resp.fragments) {
+                                if (f && typeof f.content === 'string') {
+                                    if (f.type === 'RESPONSE') out.text += f.content;
+                                    else if (f.type === 'THINK') out.think += f.content;
+                                }
+                            }
+                        }
+                    }
+                    // NEW 2.3.0 format (probed 08-13 — the old format is gone
+                    // from live streams): content arrives as APPEND patches on
+                    // response/fragments/-1/content, or as BARE {"v":"<string>"}
+                    // chunks, and completion is signalled by
+                    // {"p":"response/status","o":"SET","v":"FINISHED"} (or a
+                    // BATCH with quasi_status) plus `event: close`. Gated on
+                    // streamingResponse so DeepThink reasoning never mixes in.
+                    //
+                    // The RESPONSE fragment is declared mid-stream as a PATCH:
+                    // {"p":"response/fragments","o":"APPEND","v":[{"id":3,
+                    // "type":"RESPONSE","content":"```",...}]} — the answer
+                    // chunk after it also arrives WITHOUT "o" on -1/content
+                    // (frame "json" above) — accept any -1/content patch, and
+                    // treat the fragments APPEND patch as the gate switch.
+                    if (j && j.p === 'response/fragments' && j.o === 'APPEND' && Array.isArray(j.v) && j.v.length) {
+                        const lastFrag = j.v[j.v.length - 1];
+                        if (lastFrag && lastFrag.type === 'RESPONSE') {
+                            streamingResponse = true;
+                            if (typeof lastFrag.content === 'string') out.text += lastFrag.content;
+                        } else if (lastFrag && lastFrag.type === 'THINK') {
+                            streamingResponse = false;
+                            if (typeof lastFrag.content === 'string') out.think += lastFrag.content;
+                        }
+                    }
+                    if (j && typeof j.v === 'string' && j.p && /content/.test(j.p)) {
+                        if (streamingResponse) out.text += j.v;
+                        else out.think += j.v; // pre-RESPONSE bare chunks = reasoning
+                    } else if (j && typeof j.v === 'string' && !j.p) {
+                        if (streamingResponse) out.text += j.v;
+                        else out.think += j.v; // pre-RESPONSE bare chunks = reasoning
+                    }
+                    if (j && j.p === 'response/status' && typeof j.v === 'string') {
+                        if (j.v === 'FINISHED' || j.v === 'DONE' || j.v === 'ERROR' || j.v === 'STOPPED') out.done = true;
+                    }
+                    if (j && j.p === 'response/quasi_status' && typeof j.v === 'string') {
+                        if (j.v === 'FINISHED' || j.v === 'DONE') out.done = true;
+                    }
+                    if (j && j.p === 'response' && j.o === 'BATCH' && Array.isArray(j.v)) {
+                        for (const sub of j.v) {
+                            if (sub && sub.p === 'quasi_status' && (sub.v === 'FINISHED' || sub.v === 'DONE')) out.done = true;
+                        }
+                    }
+                    if (j && typeof j.biz_code === 'number' && j.biz_code !== 0) out.done = true;
+                }
+            }
+            return out;
+        };
+        // 08-17 GEMINI 1096 SURFACING: when gemini's backend REJECTS a send,
+        // the composer stays populated and verifySendCleared misreports it as
+        // "React out of sync". The rejection is a StreamGenerate XHR whose
+        // body carries `BardErrorInfo [<code>]` (1095/1096 = rate-limit /
+        // abuse block — wait it out; hammering extends it). Record the last
+        // code so the send-failure path can report the real cause. Flag-guarded
+        // and placed BEFORE the v2 guard so gateway restarts arm it on the
+        // long-lived page without a reload (__wsUrl is set by the open-wrapper
+        // below before send ever runs).
+        if (!window.__wsBardErrArmed) {
+            window.__wsBardErrArmed = true;
+            const _gsSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function (...args) {
+                const x = this;
+                if (x.__wsUrl && x.__wsUrl.includes('StreamGenerate')) {
+                    x.addEventListener('loadend', () => {
+                        try {
+                            const t = String(x.responseText || '');
+                            const m = t.match(/BardErrorInfo[^]]*\[(\d+)\]/);
+                            if (m) window.__wsLastBardError = m[1];
+                        } catch { /* non-fatal */ }
+                    });
+                }
+                return _gsSend.apply(this, args);
+            };
+        }
+        // 08-13 VERSIONED RE-ARM: the guard below must NOT skip an upgrade —
+        // a long-lived page keeps the interceptor closure it got at install,
+        // so code fixes (the 08-13 request-body capture) never reached pages
+        // armed by an older build and the handoff pre-check read 0 forever.
+        // New installs wrap the old wrapper (chain: new → old → real send);
+        // push dedupes consecutive identical bodies so an upgrade never
+        // doubles entries. The buffer/seq survive the upgrade — the reader
+        // takes a seq snapshot at entry and skips everything older.
+        if (window.__wsTeeV === 2) return;
+        if (!window.__wsTee || typeof window.__wsTeeSeq !== 'number') {
+            window.__wsTee = [];
+            window.__wsTeeSeq = 0;
+        }
+        window.__wsTeeV = 2;
+        // XHR/fetch interceptors (buffer pushes — the parser above is the
+        // only per-install part; re-wrapping is safe thanks to the dedupe).
+        const push = (body) => {
+            const s = String(body || '');
+            const prev = window.__wsTee[window.__wsTee.length - 1];
+            if (prev && prev.body === s) return; // upgrade double-wrap dedupe
+            // seq is monotonic and survives the 32-entry eviction — the
+            // reader matches on seq, not array position (see the CAP BUG
+            // comment in readStreamedAnswer).
+            window.__wsTee.push({ body: s, at: Date.now(), seq: ++window.__wsTeeSeq });
+            // 08-13 WEDGE FIX: 8 entries was evicting long tool-loop streams
+            // (compaction/tool runs push many completion XHRs); 32 keeps the
+            // window safe for any serialized burst.
+            if (window.__wsTee.length > 32) window.__wsTee.shift();
+        };
+        const origOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (m, u, ...rest) {
+            this.__wsUrl = String(u || '');
+            return origOpen.call(this, m, u, ...rest);
+        };
+        const origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function (...args) {
+            const x = this;
+            if (x.__wsUrl && x.__wsUrl.includes('/api/v0/chat/completion')) {
+                // 08-13 CONTEXT-HANDOFF: capture the REQUEST body size at send
+                // time — DeepSeek's cap is per-request (history + system +
+                // tools + message, observed failing at ~135k chars / ~32k
+                // tokens), so this length is the true context measure. Set on
+                // send (not loadend) so a request that FAILS with
+                // context_length_exceeded still records how big it was.
+                window.__wsTeeReqBodyChars = String(args[0] || '').length;
+                x.addEventListener('loadend', () => { if (x.status === 200) push(x.responseText); });
+            }
+            return origSend.apply(this, args);
+        };
+        const origFetch = window.fetch;
+        window.fetch = function (u, o) {
+            const p = origFetch.apply(this, arguments);
+            if (String(u || '').includes('/api/v0/chat/completion')) {
+                const body = (o && o.body) ? String(o.body) : '';
+                if (body.length) window.__wsTeeReqBodyChars = body.length;
+                p.then((r) => r.clone().text()).then(push).catch(() => {});
+            }
+            return p;
+        };
+    });
+}
+
+// Read the last completion REQUEST body size (chars) recorded by the tee.
+// 0 = nothing captured yet (fresh thread / tee just reset) — callers treat
+// that as "no history, never hand off".
+async function getReqBodyChars() {
+    try { return await page.evaluate(() => window.__wsTeeReqBodyChars || 0); } catch { return 0; }
+}
+
+// 08-15 DRIFT: read + reset the page's accumulated THINK (reasoning) text —
+// the drift detector's input for the exchange that just finished.
+async function getAndClearThinkBuf() {
+    try {
+        return await page.evaluate(() => {
+            const t = window.__wsThinkBuf || '';
+            window.__wsThinkBuf = '';
+            return t;
+        });
+    } catch { return ''; }
+}
+
+// After a context-handoff thread swap the page's counters describe the OLD
+// thread — a stale ~threshold-sized body would immediately re-trigger a
+// handoff on the fresh chat. Clear the request-size record and the stream
+// buffer (its entries belong to the old thread's requests; the reader takes
+// a seq snapshot at entry, so zeroing the seq is safe between requests).
+async function resetTeeForHandoff() {
+    try {
+        await page.evaluate(() => {
+            window.__wsTeeReqBodyChars = 0;
+            window.__wsTee = [];
+            window.__wsTeeSeq = 0;
+        });
+    } catch { /* page busy — the next send re-arms/overwrites anyway */ }
+}
+
+// 08-13 WEDGE FIX: a DOM answer that "stopped growing" mid-stream is NOT a
+// complete answer — the webchat can pause between chunks while `busy` reads
+// false, and accepting the fragment burned rounds until the client gave up
+// ("API error · Retrying"). Called on the DOM-accept path only; the stream
+// tee is always preferred and holds the complete body at loadend.
+function looksLikeTruncatedAnswer(text) {
+    if (!text) return true;
+    const fences = (text.match(/```/g) || []).length;
+    if (fences % 2 !== 0) return true;                 // unclosed fence
+    const open = text.lastIndexOf('```');
+    if (open !== -1) {
+        // Unclosed fence is already caught by parity above; here the fence is
+        // closed — parse its block as JSON. A tool-call answer that fails to
+        // parse is mid-stream (or broken) → keep polling. Note: a complete
+        // fenced answer legitimately ENDS right after the closing fence, so
+        // an empty tail here is normal, not a signal.
+        const m = text.match(/```(?:json)?\n([\s\S]*?)\n```/);
+        if (m) { try { JSON.parse(m[1]); } catch { return true; } }
+    }
+    // Dangling tool-JSON tails (fenceless replies / partial render):
+    if (/("tool"\s*:\s*"[^"]*"\s*,\s*"params"\s*:\s*\{)[^{}]*$/.test(text)) return true;
+    if (/"params"\s*:\s*\{\s*$/.test(text)) return true;
+    return false;
+}
+
+// Read the newest tee entry at or after `startIndex` (the tee length at
+// waitForResponse entry — excludes entries belonging to earlier requests;
+// the send queue is serialized so anything newer is THIS request). Entries
+// are pushed at loadend, so the body is complete whenever found=true.
+async function readStreamedAnswer(startIndex) {
+    try {
+        return await page.evaluate((start) => {
+            const tee = window.__wsTee || [];
+            if (typeof window.__wsParseSse !== 'function') return { found: false, text: '', done: false, error: '' };
+            let found = false, text = '', done = false, error = '';
+            // 08-13 CAP BUG: past 32 entries the tee evicts its oldest, so a
+            // new push leaves length EXACTLY at 32 — an index-based read from
+            // `start` (= length at waitForResponse entry) never ran again and
+            // every answer after the tee saturated timed out. Entries carry a
+            // monotonic seq; match on it (legacy seq-less entries fall back
+            // to position).
+            for (let i = 0; i < tee.length; i++) {
+                const e = tee[i];
+                const isNew = (e.seq !== undefined) ? e.seq > start : i >= start;
+                if (!isNew) continue;
+                found = true;
+                const p = window.__wsParseSse(e.body);
+                text = p.text;
+                done = p.done;
+                error = p.error || error; // last error wins; empty stays empty
+                if (p.think) {
+                    // 08-15 DRIFT: the model's PRIVATE THINKING accumulates
+                    // here (capped — scoring needs a window, not the whole
+                    // session); the gateway reads + clears it via
+                    // getAndClearThinkBuf at the end of each exchange.
+                    window.__wsThinkBuf = ((window.__wsThinkBuf || '') + p.think).slice(-40000);
+                }
+            }
+            return { found, text, done, error };
+        }, startIndex);
+    } catch { return { found: false, text: '', done: false, error: '' }; }
+}
+
+// ── Wait until a NEW message appears and its text stops changing
+//    across two polls (streaming models keep growing it) ──
+// `before` is the snapshotChat() taken just before sending; `typedText`
+// is the exact prompt we typed — the user message rendering it must NOT
+// be accepted as the response (DeepSeek cogitates for seconds before its
+// answer replaces it as the last item).
+function isGeminiWebchat() {
+    return /gemini/i.test(config.webchatUrl) || /gemini/i.test(config.modelName || '');
+}
+async function waitForResponse(before, typedText) {
+    // 08-13 SSE-TEE: the completion XHR's streamed body is now the primary
+    // answer source (the DOM stopped rendering responses in this env). Tee
+    // entries are pushed at loadend — anything at/after this index appeared
+    // while WE poll, so it belongs to this request (the queue is serialized).
+    // 08-13 CAP BUG FIX: track the tee by seq — length-based starts break once
+    // eviction keeps length pinned at 32 (new entries were invisible forever).
+    // 08-17 TEE-START RACE FIX: prefer the pre-send snapshot from sendMessage;
