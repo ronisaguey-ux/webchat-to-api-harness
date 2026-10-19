@@ -1918,3 +1918,229 @@ async function waitForResponse(before, typedText) {
             const ans = (last.answer || '').trim();
             if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans) && !/^You have access to the tools below/.test(ans)) {
                 console.log('⏱ timeout — rescuing the answer already on the tab');
+                return last.answer;
+            }
+            break; // idle and no answer — give up below
+        } catch {
+            await sleep(1500);
+        }
+    }
+    throw new Error(`Timed out after ${config.timeout}ms waiting for a response`);
+}
+
+// ──────────────────────────────────────────────────────
+// 4b. CONTEXT HANDOFF (08-13): fresh chat + seed message
+// ──────────────────────────────────────────────────────
+// The thread's context window is exhausted → the gateway asks the webchat
+// model for a handoff document, then navigates THIS tab to a brand-new chat
+// (threads are server-side: the old conversation survives untouched) and
+// sends the document as the first message. Typing on the new-chat page is
+// what CREATES the thread; the tab's URL then carries the new /s/ id, which
+// server.js captures and pins for every respawn path.
+async function openNewChat() {
+    // Fresh CDP session like every send (stale-session refresh).
+    await initBrowser({ reconnect: true });
+    // Re-pick the pinned tab (the old thread's tab gets navigated away — the
+    // conversation stays safe server-side).
+    if (!page && config.cdpWsUrl) {
+        const pages = await browser.pages();
+        if (config.tabUrlSubstring) {
+            page = pages.find((p) => p.url().includes(config.tabUrlSubstring));
+        } else {
+            // 08-30 same fix as connectToWebchat: never navigate an OLD
+            // /a/chat/s/ thread tab away for a new chat when a root tab exists;
+            // the old thread stays pinned for reopenThread.
+            const origin = new URL(config.webchatUrl).origin;
+            const isThreadTab = (p) => /\/a\/chat\/s\//.test(p.url());
+            page =
+                pages.find((p) => !isThreadTab(p) && p.url().startsWith(origin)) ||
+                pages.find((p) => p.url().startsWith(origin));
+        }
+        if (!page) {
+            page = await browser.newPage();
+            await page.goto(config.webchatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        }
+    }
+    if (!page) page = await browser.newPage();
+    console.log('🆕 Opening a NEW chat');
+    // 08-13 MULTI-SITE: deepseek's "new chat" is the /a/chat root; other
+    // webchats (qwen/kimi/gemini) don't have that — their root IS a new chat.
+    // 08-15 (OWNER CORRECTION): the Instant/Expert/Vision mode tabs (radiogroup
+    // b0db7355) render ONLY on /a/chat/new — the /a/chat LIST page has just the
+    // DeepThink/Search toggles, so selectInstantMode found no tabs there and
+    // every swap created the wrong mode → perpetual swap churn. Navigate to
+    // /a/chat/new instead.
+    const newChatUrl = new URL(config.webchatUrl).host.includes('deepseek')
+        ? 'https://chat.deepseek.com/a/chat/new'
+        : config.webchatUrl;
+    await page.goto(newChatUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitForChatInput();
+    await sleep(2500); // let the SPA settle the composer
+    generationErrHealed = false; // fresh chat = clean slate; re-arm banner heal (08-24)
+    // 08-17 (user rule): mode is locked at thread creation — select INSTANT
+    // on the fresh new-chat composer BEFORE the first message creates the
+    // thread (expert threads can never become instant afterwards).
+    if (new URL(config.webchatUrl).host.includes('deepseek')) {
+        await selectInstantMode();
+        await sleep(500);
+    }
+    return page;
+}
+
+// Send the handoff document as the FIRST message of the fresh chat — plain
+// text, NO tool-format preamble: the new thread must start with the document.
+async function sendFirstMessage(text) {
+    await typePrompt(text);
+    const before = await snapshotChat();
+    await sendMessage(null, text);
+    console.log('⏳ Waiting for the new chat to acknowledge the handoff...');
+    let reply = '';
+    try {
+        reply = await waitForResponse(before, text);
+    } catch (e) {
+        // The thread exists the moment the message lands; a timed-out first
+        // reply (long cogitation) must not abort the swap.
+        console.log('⚠️ new-chat first reply timed out:', String(e.message).slice(0, 80));
+    }
+    const url = page.url();
+    if (!/\/a\/chat\/s\//.test(url)) {
+        throw new Error(`New chat did not get a thread URL (still: ${url})`);
+    }
+    console.log(`🆕 New thread created: ${url}`);
+    await saveCookies();
+    return { url, reply };
+}
+
+async function openNewChatAndSeed(text) {
+    await openNewChat();
+    return sendFirstMessage(text);
+}
+
+// ──────────────────────────────────────────────────────
+// 4c. THREAD REOPEN (08-24, user): resume a captured chat thread
+// ──────────────────────────────────────────────────────
+// openNewChat navigates the pinned tab AWAY from the thread it was on — and
+// lanes serve MANY personas, so the persona's prior thread is never the tab's
+// thread on return. The conversation survives server-side; resuming it is an
+// explicit goto to the saved thread URL (origin + /s/<uuid> for deepseek,
+// /app/<id> for gemini). Same tab-pick prologue as openNewChat.
+async function reopenThread(threadUrl) {
+    await initBrowser({ reconnect: true });
+    if (!page && config.cdpWsUrl) {
+        const pages = await browser.pages();
+        page = config.tabUrlSubstring
+            ? pages.find((p) => p.url().includes(config.tabUrlSubstring))
+            : pages.find((p) => p.url().startsWith(new URL(config.webchatUrl).origin));
+        if (!page) page = await browser.newPage();
+    }
+    if (!page) page = await browser.newPage();
+    console.log(`🔁 Reopening thread: ${threadUrl}`);
+    await page.goto(threadUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitForChatInput();
+    await sleep(2500); // let the SPA settle the thread's composer
+    console.log(`🟢 Thread reopened: ${page.url()}`);
+    return page;
+}
+
+// ──────────────────────────────────────────────────────
+// 5. BUILD PROMPT WITH TOOLS
+//    Tool definitions section is capped at TOOL_CONTEXT_WINDOW
+//    chars so huge tool schemas don't eat the chat's context.
+// ──────────────────────────────────────────────────────
+function buildFullPrompt(userPrompt, toolDefinitions) {
+    let fullPrompt = '';
+
+    // 08-19 (user idea): the USER REQUEST leads — the model locks onto the
+    // real task before it sees any tool/protocol text. The format rules follow
+    // (tools section + the REMINDER below stays in the strongest last slot).
+    fullPrompt += `### USER REQUEST\n\n${userPrompt}\n\n`;
+
+    if (toolDefinitions && toolDefinitions.length > 0) {
+        let section =
+            'You have access to the tools below. ALWAYS respond with exactly one JSON object ' +
+            '{"tool":"<name>","params":{...}} — never plain text, never prose (user rule 08-12). ' +
+            'ALWAYS wrap it in a markdown code fence (```json ... ```) so this chat cannot corrupt your backticks. ' +
+            'ONE tool call at a time. Use a real tool to perform work when the task needs it — you judge whether it ' +
+            'does. When the task is complete (or it was a simple question needing no tools), submit your final ' +
+            'plain-text answer via the submit_answer tool: {"tool":"submit_answer","params":{"text":"..."}}.\n\n';
+
+        const toolsByCategory = {};
+        for (const tool of toolDefinitions) {
+            const cat = tool.category || 'general';
+            if (!toolsByCategory[cat]) toolsByCategory[cat] = [];
+            toolsByCategory[cat].push(tool);
+        }
+
+        for (const [category, tools] of Object.entries(toolsByCategory)) {
+            section += `## ${category.toUpperCase()} TOOLS\n\n`;
+            for (const tool of tools) {
+                section += `- **${tool.name}**: ${tool.description}\n`;
+                section += `  Params: ${JSON.stringify(tool.parameters)}\n\n`;
+                if (section.length > config.toolContextWindow) {
+                    section = section.slice(0, config.toolContextWindow) + '\n…(tool list truncated)\n';
+                    break;
+                }
+            }
+        }
+
+        fullPrompt += section;
+    }
+
+    // Absolute final slot, after everything: this is the strongest instruction
+    // position, and it must reinforce the format for EVERY round (first message
+    // AND follow-ups) — DeepSeek's chat behavior is to pause after tool work
+    // and write a progress report, which the middle-of-prompt rules don't kill.
+    fullPrompt += 'REMINDER: your reply must be a fenced tool-call JSON (```json {"tool":"<name>","params":{...}} ```) ' +
+        'or a fenced submit_answer (```json {"tool":"submit_answer","params":{"text":"..."}} ```). ' +
+        'Plain text — including progress reports, summaries of what you did, and lists of "next steps" — is NEVER accepted.\n';
+    return fullPrompt;
+}
+
+// ──────────────────────────────────────────────────────
+// 6. CLEANUP
+// ──────────────────────────────────────────────────────
+async function closeBrowser() {
+    if (browser) {
+        await saveCookies();
+        if (config.cdpWsUrl) {
+            // CDP-attached: the browser belongs to the user — detach, never
+            // shut it down. (browser.close() would kill their whole Chrome.)
+            await browser.disconnect();
+            console.log('🔌 Detached from CDP browser (left running).');
+        } else {
+            await browser.close();
+            console.log('🔴 Browser closed.');
+        }
+        browser = null;
+        page = null;
+    }
+}
+
+// ──────────────────────────────────────────────────────
+// 7. HELPERS + EXPORTS
+// ──────────────────────────────────────────────────────
+async function firstMatch(selectors) {
+    for (const sel of selectors) {
+        const el = await page.$(sel);
+        if (el) return el;
+    }
+    return null;
+}
+
+module.exports = {
+    initBrowser,
+    connectToWebchat,
+    sendPrompt,
+    closeBrowser,
+    getPage: () => page,
+    probePage,
+    buildFullPrompt,
+    openNewChat,
+    sendFirstMessage,
+    openNewChatAndSeed,
+    reopenThread,
+    getReqBodyChars,
+    getAndClearThinkBuf,
+    resetTeeForHandoff,
+    takeThreadSwap,
+};
