@@ -111,7 +111,7 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
   | model              | route                                        |
   |--------------------|----------------------------------------------|
   | `anymodel`         | the open webchat tab (whatever is logged in) |
-  | `deepseek-v4-flash` (or anything else) | proxied verbatim to the upstream API |
+  | `deepseek-flash` (or anything else) | proxied verbatim to the upstream API |
 
   Upstream credentials live in `.env` (`UPSTREAM_ANTHROPIC_BASE_URL`,
   `UPSTREAM_ANTHROPIC_AUTH_TOKEN`, `UPSTREAM_OPENAI_BASE_URL`). Streaming
@@ -143,7 +143,7 @@ Built-in tools: `read_file`, `write_file`, `list_dir`, `run_bash`, `search_web`
 | `WEBCHAT_URL_OVERRIDE` | `false` | `true` makes `WEBCHAT_URL` beat the `chat.js` URL |
 | `TAB_URL_SUBSTRING` | *(none)* | attach to the open tab whose URL contains this substring (multi-site instances) |
 | `CDP_WS_URL` | *(from `chat.js`)* | attach to an already-running browser via its DevTools ws URL; wins over `chat.js` `cdpWsUrl` |
-| `MODEL_NAME` | `deepseek webchat` | model id advertised by `/v1/models`; gateway routes accept `deepseek-v4-pro` / `deepseek-v4-flash` |
+| `MODEL_NAME` | `deepseek webchat` | model id advertised by `/v1/models`; gateway routes accept `deepseek-flash` |
 | `HEADLESS` | `false` | visible browser for login |
 | `CLOAKBROWSER` | *(off)* | `1` swaps puppeteer for CloakBrowser (stealth Chromium v146, github.com/CloakHQ/CloakBrowser) — source-level fingerprints pass Google's session-rotation challenge that vanilla puppeteer trips (fake UA + ephemeral profile + saved cookies). Used by the gemini lane (08-21, VERIFIED PONG). Requires `cloakbrowser` + `playwright-core` npm deps; env-gated, all other lanes unaffected. |
 | `TIMEOUT` | `60000` | max wait for a response (ms) |
