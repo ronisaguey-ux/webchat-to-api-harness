@@ -1598,3 +1598,323 @@ async function waitForResponse(before, typedText) {
     // 08-13 CAP BUG FIX: track the tee by seq — length-based starts break once
     // eviction keeps length pinned at 32 (new entries were invisible forever).
     // 08-17 TEE-START RACE FIX: prefer the pre-send snapshot from sendMessage;
+    // the entry-time capture here is too late for fast deepseek replies.
+    const teeStart = requestTeeStart !== null
+        ? requestTeeStart
+        : await page.evaluate(() => (window.__wsTeeSeq || 0)).catch(() => 0);
+    requestTeeStart = null; // consume the one-shot snapshot
+    let deadline = Date.now() + config.timeout;
+    // Absolute cap so a pathological never-ending stream can't hang the client
+    // forever — activity may extend the deadline, but not past this.
+    const hardCap = deadline + config.timeout; // 08-24 (latency audit): was timeout×5 — a 15-min timeout bought 90 min of phantom polling; one extra timeout is the sane ceiling
+    let lastLen = -1; // forces at least two polls before accepting
+    let lastAnswerLen = -1; // same for the think-stripped answer text (08-12)
+    let lastText = null; // previous poll's thread text, for activity detection
+    let emptySince = 0; // how long the newest message element has been empty
+    // 08-23 WEDGE FIX (investigator report): phantom-stop detector state.
+    let busySilentSince = 0;      // busy-without-progress start, ms since epoch (0=armed)
+    let lastProgressLen = 0;      // text+answer length at last poll (progress baseline)
+    let lastSpinLog = 0;          // last [still waiting] spin-log timestamp
+    let phantomRecovered = false; // fresh-chat recovery already fired for this request
+    while (Date.now() < deadline) {
+        // 08-13: stream tee FIRST — the DOM may never render the answer in
+        // this environment. found=true means loadend fired, so the body is
+        // complete; return it without waiting on the UI.
+        try {
+            const tee = await readStreamedAnswer(teeStart);
+            if (tee.found) {
+                // 08-13 RATE-LIMIT FIX: the stream can end with a hint-error
+                // (e.g. "Messages too frequent") — nothing else ever arrives.
+                // Fail fast with the error text; a hung client retries, and
+                // each retry re-hammers the same account limit.
+                if (tee.error) throw new Error('DeepSeek stream error: ' + tee.error + ' — wait ~30s and retry');
+                if (tee.text.trim().length > 0) return tee.text;
+                if (tee.done) throw new Error('Webchat stream ended without content (error status in stream)');
+            }
+        } catch (e) {
+            if (e.message && /stream ended without content|stream error/.test(e.message)) throw e;
+            // otherwise (page busy / evaluate race) fall through to the DOM poll
+        }
+        let state;
+        try {
+            state = await snapshotChat();
+        } catch (e) {
+            // If the BROWSER died (Chrome crash — observed 08-12), polling to
+            // the deadline just hangs the client for the full timeout. Fail
+            // fast with a clear error instead; the supervisor's chrome_cdp
+            // ensure relaunches Chrome and the next request auto-resolves the
+            // new ws id.
+            if (!browser || !browser.isConnected() || page.isClosed()) {
+                throw new Error('Webchat browser connection lost (Chrome crashed?) — please resend');
+            }
+            // Page busy (long cogitation / heavy render) — an evaluate can throw
+            // ProtocolError mid-thought. That means "still generating", not failure:
+            // keep polling until the deadline.
+            console.log('⏳ poll evaluate failed (page busy?), retrying:', String(e.message).slice(0, 70));
+            await sleep(1500);
+            continue;
+        }
+        // 08-16 GEMINI API-ERROR BAIL: gemini renders a transient inline error
+        // banner ("● API Error — The response stopped arriving", "Something
+        // went wrong with this response") when a generation dies mid-stream.
+        // The phantom-stop keeps busy=true, so without this the loop ground to
+        // the hard cap (timeout×5, 25 min on the 300s gemini timeout) for a
+        // reply that never arrives. Fail fast with a clear marker instead —
+        // the client retries and the tab stays usable.
+        // 08-24 USER-ROW GUARD (hoisted above the banner scan): until the model
+        // answers, the newest rendered row IS our own prompt — and audit
+        // digests routinely contain literal strings like "API Error" /
+        // "Something went wrong", so the banner regex below self-matched the
+        // just-typed 60k chunk → spurious heal reload (destroying the typed
+        // prompt) + "generation stopped" 500 within seconds of every big send.
+        const USER_ROW_CLS = '_9663006';
+        // 08-13: newer rows hash to _81e7b5e (probed live) — the hash-only
+        // check missed them, and the last row after a send is often the
+        // gateway's own tool-preamble USER row, which the DOM path could
+        // accept as the answer. Guard on hash OR the preamble prefix.
+        // 08-24 echo probe: rendered markdown strips "###"/fences, so match a
+        // long prose line from OUR OWN typed text verbatim — survives any
+        // renderer transform and is site-agnostic.
+        const echoProbe = (() => {
+            for (const l of String(typedText || '').split('\n')) {
+                if (l.trim().length > 60) return l.trim().slice(0, 120);
+            }
+            return null;
+        })();
+        const rowText = (state.answer || '') + ' ' + (state.text || '');
+        const userRow = (state.lastCls || '').split(/\s+/).includes(USER_ROW_CLS)
+            || (state.lastCls || '').split(/\s+/).includes('_81e7b5e')
+            || /^You have access to the tools below/.test(state.answer || '')
+            || (!!echoProbe && rowText.includes(echoProbe));
+        if (isGeminiWebchat() && !generationErrHealed && !userRow && /API Error|response stopped arriving|went wrong with this response|response was not generated|wasn'?t generated|Something went wrong/i.test(rowText)) {
+            generationErrHealed = true;
+            console.log('🔄 gemini generation-error banner seen (newest assistant row) — reloading tab once, then throw so the client retries clean');
+            try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch {}
+            await sleep(2000);
+            throw new Error('Gemini API error detected in tab (generation stopped) — resend the prompt');
+        }
+        // User-row guard (08-12): the typedText contains-check is NOT enough —
+        // DeepSeek's renderer consumes ```json fence markers into code-block
+        // borders, so a rendered user row (which contains the whole gateway
+        // prompt) does NOT contain the typed text verbatim. waitForResponse
+        // then accepted the just-sent PROMPT as the response, parsed its own
+        // format examples as a fake submit_answer, and the client got garbage
+        // ("resume"/"hello??" → "✻ Churned for 3s", nothing delivered, while
+        // the real answer sat undelivered in the tab). Rows are role-hashed:
+        // user rows = class _9663006, assistant rows = _4f9bf79 (probed 08-12,
+        // stable across builds). Never accept a user-class row.
+        // userRow/USER_ROW_CLS hoisted above the gemini banner scan (08-24).
+        // Growth via ROW COUNT (08-13): the text-inequality check alone never
+        // trips when the new answer renders IDENTICAL to the previous one —
+        // every response on the personal thread (6187afed) then burned the
+        // full timeout and was only rescued at deadline. Count growth covers
+        // that; text comparison stays as a fallback for virtual-list
+        // recycling that fluctuates the count.
+        const grew = state.mode === 'vl'
+            ? !userRow && (state.count !== before.count || (state.text !== before.text && state.text !== typedText && !state.text.includes(typedText)))
+            : state.count > before.count;
+        // Accept on the THINK-STRIPPED answer text going stable (08-12): the
+        // raw text is reasoning-only during cogitation, and accepting raw-text
+        // stability could return just the thinking block (which then failed
+        // the tool-call parse → the double-rejections before every tool call).
+        // `answer` is empty while the model cogitates, so this never accepts
+        // a reasoning-only pause. Fallback (count mode / older builds): the
+        // raw-text check.
+        const busy = state.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+        if (state.mode === 'vl') {
+            // Skip a "..."-only answer: it can be a streaming placeholder that
+            // froze while the model cogitates — accepting it returns garbage.
+            const answerText = (state.answer || '').trim();
+            // Accept on generation END (08-13): the send button reverts from
+            // STOP to the send glyph when DeepSeek finishes (it flips to STOP
+            // before the first token, so idle ⇒ the row is complete). Text
+            // stability alone was unreliable here — the 21:21 PONG only
+            // arrived via the deadline rescue — so accept as soon as a
+            // non-empty answer exists AND the button is idle.
+            // 08-13 WEDGE FIX: require (a) length stable across TWO polls
+            // (lastAnswerLen === this length), (b) button idle, (c) the text
+            // not visibly truncated. The old `|| !busy` accepted a mid-stream
+            // fragment the moment `busy` read false between chunks — that
+            // 36-char truncation is what wedged the session at 95% context.
+            // The stream tee (complete at loadend) is re-checked first and
+            // wins whenever it has the body.
+            if (grew && answerText.length > 0 && answerText !== '…' && !/^\.{2,4}$/.test(answerText) && answerText.length === lastAnswerLen && !busy) {
+                const teeNow = await readStreamedAnswer(teeStart);
+                if (teeNow.found && teeNow.text.trim().length > 0) return teeNow.text;
+                if (!looksLikeTruncatedAnswer(answerText)) return state.answer;
+                // else: mid-stream fragment — do NOT accept; keep polling
+            }
+        } else if ((grew || state.text !== before.text) && state.text.length > 0 && state.text.length === lastLen) {
+            // 08-13 MULTI-SITE: same '…'/dots placeholder guard as the vl path
+            // — gemini's composer renders a "…" row while cogitating and the
+            // count-mode accept returned it as the final answer. The !busy
+            // requirement (08-13) defers acceptance until the stop control
+            // clears — streaming rows grow in count AND text, and accepting
+            // them mid-stream returned fragments and stale rescues.
+            // 08-16 GEMINI PHANTOM-STOP FIX (scoped to gemini ONLY, user
+            // 08-16): gemini keeps its "Stop response" control in the DOM
+            // after the answer commits (unclickable, persists for minutes),
+            // so isForeignBusy() stays true and the !busy gate never fired —
+            // every gemini request burned the full timeout + rescue. A STABLE
+            // answer carrying a complete tool JSON (gemini's reply format:
+            // `JSON\n{"tool":"submit_answer","params":{...}}`) is the finished
+            // reply — accept it even while the phantom stop is up. Other
+            // sites' stop controls are trusted, so they keep the strict gate.
+            const ctext = state.text.trim();
+            if (ctext === '…' || /^\.{2,4}$/.test(ctext)) { await sleep(1500); continue; }
+            if (busy) {
+                const isGemini = new URL(config.webchatUrl).host.includes('gemini');
+                const toolDone = isGemini
+                    && /"tool"\s*:\s*"/.test(ctext)
+                    && (/\{\s*"tool"/.test(ctext) || /submit_answer|"params"/.test(ctext))
+                    && /\}\s*$/.test(ctext);
+                if (!toolDone) {
+                    // 08-24 (investigator 1, transport audit): plain-text gemini
+                    // replies hit the SAME phantom-stop trap the toolDone branch
+                    // was built for — the SPA commits the answer to the DOM but
+                    // leaves an unclickable "Stop response" control up for
+                    // minutes, so isForeignBusy() stays true and the gate only
+                    // opens when the ghost finally clears. Observed as the 1348s
+                    // (161 chars) and 594s (4849 chars) gemini stalls in the
+                    // 08-24 audit log — a committed answer burned the whole
+                    // deadline (+progress extensions) instead of ~10s. A
+                    // non-truncated row unchanged across 6 consecutive polls
+                    // (~9s) is a committed reply, not a mid-stream fragment
+                    // (streaming grows the row every poll); accept it while
+                    // busy. Gemini only — other sites' stop controls are
+                    // trusted.
+                    if (
+                        isGemini && geminiStablePolls >= 6 &&
+                        ctext.length > 0 && !looksLikeTruncatedAnswer(ctext)
+                    ) {
+                        console.log(`🤖 gemini answer stable ${geminiStablePolls} polls while stop control up — accepting committed reply`);
+                        return ctext;
+                    }
+                    await sleep(1500);
+                    continue;
+                }
+            }
+            return state.text;
+        }
+        if (grew && state.text.length === 0) {
+            // a new message element exists but has no text yet — if the chat
+            // reports the response was stopped, that's a hard failure
+            emptySince += 1500;
+            if (state.body.includes('You stopped this response')) {
+                throw new Error('Webchat response was stopped (Stop button pressed while generating)');
+            }
+            if (emptySince > 12000) {
+                throw new Error('Webchat response is empty after 12s — stopped or aborted by the UI');
+            }
+        } else {
+            emptySince = 0;
+        }
+        // 08-23 WEDGE FIX (investigator report #1+#3): deadline extension now
+        // requires REAL progress (text/answer movement). The old bare-busy
+        // extension let a phantom STOP (SSE dead with the stop button up)
+        // extend the wait to the 6x hard cap with zero output — the silent
+        // wedge. Genuine generation is still covered: DeepThink streams
+        // reasoning text (progress ticks), and silent-but-real cogitations are
+        // given an 8-min grace before recovery below.
+        const progressLen = (state.text ? state.text.length : 0) + (state.answer ? state.answer.length : 0);
+        const progressedNow = (state.mode === 'vl' && lastText !== null && state.text !== lastText)
+            || progressLen !== lastProgressLen;
+        if (progressedNow) {
+            busySilentSince = 0;
+            deadline = Math.min(hardCap, Math.max(deadline, Date.now() + config.timeout));
+        } else if (busy) {
+            // Phantom-stop detector (08-23): busy with zero progress. Stream a
+            // [still waiting] spin line every 60s; after 8 min, open a FRESH
+            // chat once (a server-side pending generation on the dead thread
+            // is what keeps the account's one-in-flight rule locked — a new
+            // thread escapes it); 60s after that, fail fast so the caller can
+            // retry instead of spinning to the 6x hard cap.
+            if (busySilentSince === 0) busySilentSince = Date.now();
+            if (Date.now() - lastSpinLog > 60000) {
+                lastSpinLog = Date.now();
+                console.log(`[still waiting] busy text-len=${progressLen} silent=${Math.round((Date.now() - busySilentSince) / 1000)}s`);
+            }
+            if (!phantomRecovered && Date.now() - busySilentSince > 8 * 60000) {
+                console.log('phantom STOP: busy without progress for 8 min — opening a fresh chat');
+                phantomRecovered = true;
+                busySilentSince = Date.now();
+                try {
+                    await openNewChat();
+                } catch (e) {
+                    console.log('fresh-chat recovery failed, falling back to reload:', String(e.message).slice(0, 60));
+                    try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch (e2) { console.log('reload failed:', String(e2.message).slice(0, 60)); }
+                }
+            } else if (phantomRecovered && Date.now() - busySilentSince > 60000) {
+                throw new Error('Webchat tab still generating without progress after fresh-chat recovery — retry after it finishes');
+            }
+        }
+        // 08-24 (investigator 1): gemini phantom-stop stability counter —
+        // consecutive polls where the newest row's text is unchanged, reset on
+        // any movement so a streaming row never trips the stable-accept above.
+        if (isGeminiWebchat()) {
+            geminiStablePolls = (state.text && state.text === lastText) ? geminiStablePolls + 1 : 0;
+        }
+        lastProgressLen = progressLen;
+        lastText = state.text;
+        lastLen = state.text.length;
+        if (state.mode === 'vl') lastAnswerLen = state.answer ? state.answer.length : -1;
+        await sleep(1500);
+    }
+    // Rescue (08-12): the deadline expired but a complete answer is sitting on
+    // the tab (the model finished just after the last poll). Deliver it
+    // instead of failing the request — the answer is real model output and
+    // the round logic (tool parse / format check) handles it normally.
+    // 08-13 WEDGE FIX: while the model is STILL GENERATING past the deadline
+    // (long cogitations on big tasks), keep waiting — bounded by the hard cap —
+    // instead of throwing. A throw here is exactly what made webchat tasks
+    // "stop mid task": the client saw an error while the tab was mid-thought.
+    // 08-24 (investigator 1): gemini phantom-stop stability also tracked here
+    // (the main loop's counter is shared) — see the busyNow branch below.
+    let geminiRescuePrev = '';
+    while (Date.now() < hardCap) {
+        try {
+            const tee = await readStreamedAnswer(teeStart);
+            if (tee.found && tee.text.trim().length > 0) {
+                console.log('⏱ timeout — rescuing the answer from the stream tee');
+                return tee.text;
+            }
+            const last = await snapshotChat();
+            // 08-13: never rescue while a generation is still running — the
+            // newest row may be a stale previous answer or a stream fragment
+            // (observed: the 20197-char gemini request rescued a 22-char row).
+            // 08-24 (transport audit): was `state.mode` — `state` is
+            // block-scoped to the poll loop above, so this threw a silent
+            // ReferenceError (swallowed by the catch below) on EVERY rescue
+            // iteration: the DOM timeout-rescue never ran and every deadline
+            // expiry burned the whole hardCap before the "Timed out" throw.
+            // Use the FRESH snapshot (`last`), which is also more correct.
+            const busyNow = last.mode === 'vl' ? await isGenerating() : await isForeignBusy();
+            if (busyNow) {
+                console.log('⏱ still generating past the deadline — extending (bounded by hard cap)');
+                // 08-24 (investigator 1): gemini phantom-stop rescue. The
+                // ghost "Stop response" control keeps busyNow true past the
+                // deadline even though the reply is committed in the DOM —
+                // the old code spun to the hard cap and THREW for an answer
+                // already there (the 1348s "OK" burned then rescued only
+                // when the ghost finally cleared). Same 6-poll stability
+                // rule as the main loop: a non-truncated answer unchanged
+                // across ~9s of rescue polls is committed — deliver it.
+                const ansNow = (last.answer || '').trim();
+                if (isGeminiWebchat() && ansNow.length > 0 && ansNow === geminiRescuePrev
+                    && geminiStablePolls >= 6 && !looksLikeTruncatedAnswer(ansNow)
+                    && !/^You have access to the tools below/.test(ansNow)) {
+                    console.log('⏱ gemini phantom stop — rescuing the committed answer from the DOM');
+                    return last.answer;
+                }
+                if (ansNow !== geminiRescuePrev) {
+                    geminiStablePolls = 0;
+                    geminiRescuePrev = ansNow;
+                } else {
+                    geminiStablePolls++;
+                }
+                await sleep(1500);
+                continue;
+            }
+            const ans = (last.answer || '').trim();
+            if (ans.length > 0 && ans !== '…' && !/^\.{2,4}$/.test(ans) && !/^You have access to the tools below/.test(ans)) {
+                console.log('⏱ timeout — rescuing the answer already on the tab');
