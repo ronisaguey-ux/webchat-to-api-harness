@@ -638,3 +638,323 @@ const TOOL_DEFINITIONS = [
             let text = String((args && args.text) || '').trim();
             if (!text) return { success: false, error: 'empty text' };
             if (!/^webchat: /i.test(text)) text = 'webchat: ' + text;
+            let out = [];
+            try { out = JSON.parse(fs.readFileSync(OUTBOX, 'utf-8')); } catch { out = []; }
+            if (!Array.isArray(out)) out = [];
+            out.push({ ts: new Date().toISOString(), from: 'claude', text });
+            const tmp = OUTBOX + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf-8');
+            fs.renameSync(tmp, OUTBOX);
+            return { success: true, message: 'queued for Telegram delivery' };
+        },
+    },
+    {
+        // 2026-08-14 (user): the webchat's tool channel to the MAIN session.
+        // Appends to the same inbox the responder's FORWARD_TO_MAIN writes;
+        // a monitor wakes the main session. MAIN replies into
+        // claude_webchat_outbox.json with "to": <thread URL> and the gateway
+        // injects them into the thread's next message.
+        name: 'send_message_to_main',
+        category: 'oculus',
+        description:
+            'Send a message to the MAIN Claude session (backup operator/fixer). Use when you need ' +
+            'something beyond your tools: real file access, system decisions, or escalation. ' +
+            'The main session wakes immediately and its reply is shown to you in your next message.',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'The message to main (what you need, what you found)' },
+            },
+            required: ['text'],
+        },
+        handler: async (args, ctx) => {
+            const INBOX = '/home/roni/Roni_Workspace/audits_plans/claude_webchat_inbox.json';
+            const text = String((args && args.text) || '').trim();
+            if (!text) return { success: false, error: 'empty text' };
+            let out = [];
+            try { out = JSON.parse(fs.readFileSync(INBOX, 'utf-8')); } catch { out = []; }
+            if (!Array.isArray(out)) out = [];
+            const item = { ts: new Date().toISOString(), from: 'webchat', text };
+            if (ctx && ctx.threadId) item.thread = ctx.threadId;
+            out.push(item);
+            const tmp = INBOX + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf-8');
+            fs.renameSync(tmp, INBOX);
+            return { success: true, message: 'Message sent to main; its reply will appear in your next message.' };
+        },
+    },
+    {
+        // 2026-08-25 (owner, NUCLEAR sweep): call_main — the brain's open
+        // channel to the MAIN Claude operator. Anything goes in the message;
+        // attach can carry paths (screenshots, logs, files) that main will
+        // read. Wakes main instantly (same inbox the wake chain watches);
+        // main's reply arrives in the thread's next message via
+        // claude_webchat_outbox.json injection.
+        name: 'call_main',
+        category: 'oculus',
+        description:
+            'Call the MAIN operator (the Claude session running the sweep). Use it to ask anything, ' +
+            'report blockers, or request interpretations of screenshots/files. Attach any paths — ' +
+            'main will read and reply through this thread.',
+        parameters: {
+            type: 'object',
+            properties: {
+                message: { type: 'string', description: 'The message to main — anything you need: status, question, issue, confirmation.' },
+                attach: {
+                    type: 'array', items: { type: 'string' },
+                    description: 'Optional absolute file paths (screenshots, logs) for main to read and interpret.',
+                },
+            },
+            required: ['message'],
+        },
+        handler: async (args, ctx) => {
+            const INBOX = '/home/roni/Roni_Workspace/audits_plans/claude_webchat_inbox.json';
+            const MAIN_INBOX = '/home/roni/Roni_Workspace/audits_plans/claude_main_inbox.json';
+            const text = String((args && args.message) || '').trim();
+            if (!text) return { success: false, error: 'empty message' };
+            const attach = Array.isArray(args?.attach) ? args.attach.filter(Boolean) : [];
+            const full = text + (attach.length ? '\n\nATTACH: ' + attach.join(', ') : '');
+            const item = { ts: new Date().toISOString(), from: 'brain', text: full };
+            if (ctx && ctx.threadId) item.thread = ctx.threadId;
+            const push = async (path) => {
+                let out = [];
+                try { out = JSON.parse(fs.readFileSync(path, 'utf-8')); } catch { out = []; }
+                if (!Array.isArray(out)) out = [];
+                out.push(item);
+                const tmp = path + '.tmp';
+                fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf-8');
+                fs.renameSync(tmp, path);
+            };
+            await push(INBOX);
+            await push(MAIN_INBOX); // the verified wake-chain inbox
+            return { success: true, message: 'Main notified; its reply will appear in your next message.' };
+        },
+    },
+    {
+        name: 'send_message_to_antigravity',
+        category: 'interagent',
+        description:
+            'Send a structured message or task to Antigravity (AGY). ' +
+            'Wakes the Antigravity core immediately.',
+        parameters: {
+            type: 'object',
+            properties: {
+                subject: { type: 'string', description: 'Subject of the message' },
+                content: { type: 'string', description: 'Body text / instructions for Antigravity' },
+                priority: { type: 'string', enum: ['normal', 'high', 'urgent'], description: 'Message priority' },
+            },
+            required: ['content'],
+        },
+        handler: async (args) => {
+            const INBOX = `${os.homedir()}/.claude/inbox/messages.jsonl`;
+            const content = String(args?.content || '').trim();
+            if (!content) return { success: false, error: 'empty content' };
+            const entry = {
+                id: `msg_${Math.floor(Date.now() / 1000)}_${Math.random().toString(16).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                from: 'webchat',
+                to: 'antigravity',
+                subject: String(args.subject || 'Webchat Directive'),
+                priority: String(args.priority || 'normal'),
+                content,
+                status: 'unread',
+                reply_to: null,
+            };
+            try {
+                fs.mkdirSync(`${os.homedir()}/.claude/inbox`, { recursive: true });
+                fs.appendFileSync(INBOX, JSON.stringify(entry) + '\n', 'utf-8');
+                return { success: true, message: 'Message sent to Antigravity inbox.' };
+            } catch (e) {
+                return { success: false, error: e.message };
+            }
+        },
+    },
+    {
+        name: 'send_telegram_message',
+        category: 'chat',
+        description: 'Send a message directly to the user on Telegram.',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'Text message to send to Telegram user' },
+            },
+            required: ['text'],
+        },
+        handler: async (args) => {
+            let text = String(args?.text || '').trim();
+            if (!text) return { success: false, error: 'empty text' };
+            if (!text.toLowerCase().startsWith('webchat:')) {
+                text = `webchat: ${text}`;
+            }
+            // 08-20: corrected telegram_monitor dir (audit SEC-03 surface — the
+            // tool silently returned "failed" with the old hyphen path).
+            const sendScript = '/home/roni/Roni_workspace/oculus/scripts/telegram_monitor/telegram-monitor/bin/send-telegram.sh';
+            const envFile = `${os.homedir()}/.config/oculus/orchestrator.env`;
+            const cmd = `set -a; [ -f "${envFile}" ] && source "${envFile}"; set +a; bash "${sendScript}" "${text.replace(/"/g, '\\"')}"`;
+            return new Promise((resolve) => {
+                const child = spawn('/bin/bash', ['-c', cmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+                child.on('close', (code) => {
+                    resolve({ success: code === 0, message: code === 0 ? 'Sent to Telegram.' : 'Failed sending to Telegram.' });
+                });
+            });
+        },
+    },
+];
+
+// ──────────────────────────────────────────────────────
+// SHANNON DELIVERABLE TOOLS (09-04 lane fix #5)
+//    The worker's pi agents run their analysis tools in-process (todo_write,
+//    set_findings_summary, set_strategic_intelligence, set_safe_vectors,
+//    set_blind_spots, submit_exploitation_queue) and so never expose them in
+//    the HTTP tools array — the lane model then believed they didn't exist
+//    and ended each vuln agent with plain text → the worker's output
+//    validation failed ("<class>_exploitation_queue.json missing").
+//    These are the SAME tools registered as REAL gateway tools: the model
+//    sees them in its executable list, calls them natively like read_file,
+//    and the host-side executors write the deliverable files directly into
+//    the scan workspace's .shannon/deliverables (RW-bind = exactly the
+//    container path the worker validates: /repos/<repo>/.shannon/deliverables).
+//    Class routing: setShannonClass() is called by the /v1/responses handler
+//    (from the request prompt's role line "... Analysis Specialist") INSIDE
+//    the serialized mutex window, so the stash always belongs to the request
+//    being processed. submit_exploitation_queue additionally infers the
+//    class from its entry IDs (INJ-/XSS-/AUTH-/AUTHZ-/SSRF- namespaces) when
+//    the stashed class disagrees.
+// ──────────────────────────────────────────────────────
+let shannonTaskClass = '';
+let shannonTaskCalls = [];
+function setShannonClass(cls) {
+    const c = String(cls || '').trim().toLowerCase();
+    shannonTaskClass = ['injection', 'xss', 'auth', 'authz', 'ssrf'].includes(c) ? c : '';
+    shannonTaskCalls = [];
+}
+function getShannonCalls() {
+    return shannonTaskCalls.slice();
+}
+function shannonClassFromIds(entries) {
+    if (!Array.isArray(entries)) return '';
+    for (const e of entries) {
+        const id = String((e && (e.ID ?? e.id)) || '');
+        if (/^AUTHZ-/i.test(id)) return 'authz';
+        if (/^AUTH-/i.test(id)) return 'auth';
+        if (/^INJ/i.test(id)) return 'injection';
+        if (/^XSS/i.test(id)) return 'xss';
+        if (/^SSRF/i.test(id)) return 'ssrf';
+    }
+    return '';
+}
+function shannonWriteJson(relPath, obj) {
+    if (!WS_SHANNON_DIR) throw new Error('WS_SHANNON_DIR not set — shannon deliverable tool disabled');
+    const abs = path.join(WS_SHANNON_DIR, relPath);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const tmp = abs + '.tmp-' + process.pid + '-' + Date.now();
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf-8');
+    fs.renameSync(tmp, abs);
+    return abs;
+}
+function shannonCapture(name, args) {
+    shannonTaskCalls.push({ name, args });
+    if (!shannonTaskClass) throw new Error('Shannon class unknown for this request — cannot route the deliverable');
+    const abs = shannonWriteJson(path.join('deliverables', '.captures', shannonTaskClass + '-' + name + '.json'), args || {});
+    console.log(`✅ [shannon] ${name} → ${abs}`);
+    return { success: true, message: `${name} captured (${shannonTaskClass}).` };
+}
+const SHANNON_DELIVERABLE_TOOLS = [
+    {
+        name: 'todo_write',
+        category: 'shannon',
+        description: 'Create/manage your analysis task list; one todo per source/endpoint to analyze. The harness records them in the workspace scratchpad.',
+        parameters: { type: 'object', properties: { todos: { type: 'array', items: { type: 'object' } } } },
+        handler: async (args) => {
+            shannonTaskCalls.push({ name: 'todo_write', args });
+            const todos = Array.isArray(args?.todos) ? args.todos : [];
+            if (!WS_SHANNON_DIR) return { success: true, message: `Todo list noted (${todos.length} todos) — scratchpad disabled.` };
+            const abs = path.join(WS_SHANNON_DIR, 'scratchpad', (shannonTaskClass || 'scan') + '-todos.jsonl');
+            fs.mkdirSync(path.dirname(abs), { recursive: true });
+            fs.appendFileSync(abs, JSON.stringify({ ts: new Date().toISOString(), todos }) + '\n', 'utf-8');
+            console.log(`✅ [shannon] todo_write → ${abs} (${todos.length} todos)`);
+            return { success: true, message: `Todo list recorded (${todos.length} todos).` };
+        },
+    },
+    {
+        name: 'set_findings_summary',
+        category: 'shannon',
+        description: 'Submit the findings summary (deliverable Sections 1-2): key outcome + dominant patterns for this vulnerability class.',
+        parameters: { type: 'object', properties: { key_outcome: { type: 'string' }, patterns: { type: 'array', items: { type: 'object' } } }, required: ['key_outcome'] },
+        handler: async (args) => shannonCapture('set_findings_summary', args),
+    },
+    {
+        name: 'set_strategic_intelligence',
+        category: 'shannon',
+        description: 'Submit strategic/domain intelligence (deliverable Section 3): class-specific fields (WAF, DB tech, auth method, CSP, http client — see the task text).',
+        parameters: { type: 'object' },
+        handler: async (args) => shannonCapture('set_strategic_intelligence', args),
+    },
+    {
+        name: 'set_safe_vectors',
+        category: 'shannon',
+        description: 'Submit vectors analyzed and confirmed secure (deliverable Section 4): the ones you tested and found safe, not unexamined ones.',
+        parameters: { type: 'object', properties: { vectors: { type: 'array', items: { type: 'object' } } } },
+        handler: async (args) => shannonCapture('set_safe_vectors', args),
+    },
+    {
+        name: 'set_blind_spots',
+        category: 'shannon',
+        description: 'Submit analysis constraints / coverage gaps (deliverable Section 5): what you could not verify and why.',
+        parameters: { type: 'object', properties: { items: { type: 'array', items: { type: 'object' } } } },
+        handler: async (args) => shannonCapture('set_blind_spots', args),
+    },
+    {
+        name: 'submit_exploitation_queue',
+        category: 'shannon',
+        description: 'Submit the final structured list of analyzed vulnerabilities for this class. Call EXACTLY once when analysis is complete. vulnerabilities = array of {ID, vulnerability_type, externally_exploitable, confidence, ...class-specific fields} as specified in the task text.',
+        parameters: { type: 'object', properties: { vulnerabilities: { type: 'array', items: { type: 'object' } } }, required: ['vulnerabilities'] },
+        handler: async (args) => {
+            const entries = Array.isArray(args?.vulnerabilities) ? args.vulnerabilities : [];
+            shannonTaskCalls.push({ name: 'submit_exploitation_queue', args });
+            if (!entries.length) {
+                console.warn('⚠️ [shannon] submit_exploitation_queue with empty vulnerabilities');
+                return { success: false, error: 'vulnerabilities must be a non-empty array of analyzed vulns (each with an ID in your class namespace, e.g. INJ-VULN-01).' };
+            }
+            const cls = shannonClassFromIds(entries) || shannonTaskClass;
+            if (!cls) throw new Error('Cannot determine the vulnerability class for the queue submission');
+            const queue = { ...(args || {}), vulnerabilities: entries };
+            const abs = shannonWriteJson(path.join('deliverables', cls + '_exploitation_queue.json'), queue);
+            console.log(`✅ [shannon] submit_exploitation_queue → ${abs} (${entries.length} vulns, class=${cls})`);
+            return { success: true, message: `Exploitation queue submitted (${entries.length} vulns).` };
+        },
+    },
+];
+for (const d of SHANNON_DELIVERABLE_TOOLS) {
+    if (!TOOL_DEFINITIONS.some((t) => t.name === d.name)) TOOL_DEFINITIONS.push(d);
+}
+
+// ──────────────────────────────────────────────────────
+// TOOL EXECUTOR
+// ──────────────────────────────────────────────────────
+function getToolDefinitions() {
+    // Expose only the schema (name/category/description/parameters), never the handler
+    return TOOL_DEFINITIONS
+        .filter((t) => !(USER_MODE && t.category === 'oculus'))
+        .map(({ handler, ...rest }) => rest);
+}
+
+async function executeTool(toolName, args, ctx) {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === toolName);
+    if (!tool) {
+        return {
+            success: false,
+            error: `Tool "${toolName}" not found. Available: ${TOOL_DEFINITIONS.map((t) => t.name).join(', ')}`,
+        };
+    }
+    console.log(`🔧 Executing: ${toolName}(${JSON.stringify(args)})`);
+    try {
+        const result = await tool.handler(args || {}, ctx || {});
+        console.log(`✅ Tool ${toolName} executed.`);
+        return result;
+    } catch (e) {
+        console.warn(`⚠️  Tool ${toolName} failed:`, e.message);
+        return { success: false, error: e.message };
+    }
+}
+
