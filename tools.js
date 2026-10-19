@@ -958,3 +958,148 @@ async function executeTool(toolName, args, ctx) {
     }
 }
 
+// ──────────────────────────────────────────────────────
+// TOOL-CALL PARSER
+//    Accepts bare JSON, ```json fences, and prose-wrapped JSON.
+//    Extracts EVERY {"tool": "...", "params": {...}} block in order, plus the
+//    plain-text prose that precedes the first one (harness protocol 08-13:
+//    the model may send a "what I'm about to do" message before its tool call,
+//    and the gateway delivers that message before executing the call).
+//    Repairs two known DeepSeek renderer/model defects:
+//      - a MISSING FINAL BRACE (the renderer truncates the last "}" of a
+//        fenced JSON reply — user report 08-13: the raw `jsonCopyDownload
+//        {...}` leak),
+//      - RAW TRIPLE-QUOTED STRINGS inside the JSON ("content":"""..."""),
+//        which the chat model writes for file content instead of JSON escapes.
+// ──────────────────────────────────────────────────────
+function tryParse(s) {
+    try { return JSON.parse(s); } catch { return null; }
+}
+
+// Strip the renderer's code-block chrome ("json" label, Copy/Download button
+// labels) from text that precedes the JSON envelope. The labels sit BETWEEN
+// the intent message and the JSON ("I'll do X. json Copy Download {"tool":..."),
+// so they must go from the tail of the prose, not just its head.
+function cleanProse(s) {
+    if (typeof s !== 'string') return '';
+    const chrome = /(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)/i;
+    return s
+        .replace(/Gemini said\s*/gi, '')
+        .replace(/^JSON\s*/i, '')
+        .replace(/```(?:json)?/gi, '')
+        .replace(new RegExp('^\\s*' + chrome.source, 'i'), '')
+        .replace(new RegExp(chrome.source + '\\s*$', 'i'), '')
+        .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*$/i, '')
+        .trim();
+}
+
+function parseToolCalls(response) {
+    const result = { prose: '', toolCalls: [] };
+    if (typeof response !== 'string') return result;
+
+    // 08-12: scan EVERY balanced {...} block, not just the first. The old code
+    // pinned `start` at the FIRST '{' — if any prose before the JSON contained
+    // a brace ("added {x: 1} to the code"), the candidate spanned prose+JSON,
+    // JSON.parse failed, and the scan NEVER advanced: valid tool-call replies
+    // were rejected as yaps (the 2-rejections-before-every-call pattern in the
+    // 2nd session; the DeepThink reasoning block that used to ride along in the
+    // extracted text was exactly such brace-poisoned prose). Cap attempts so a
+    // pathological prose-y reply can't turn this into an O(n^2) grind.
+    const text = response.replace(/```(?:json)?/gi, '').trim();
+    let start = text.indexOf('{');
+    let attempts = 0;
+    let firstCallStart = -1;
+    while (start !== -1 && attempts++ < 16) {
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+        let end = -1;
+        for (let i = start; i < text.length; i++) {
+            const c = text[i];
+            if (inString) {
+                if (escaped) escaped = false;
+                else if (c === '\\') escaped = true;
+                else if (c === '"') inString = false;
+                continue;
+            }
+            if (c === '"') inString = true;
+            else if (c === '{') depth++;
+            else if (c === '}') {
+                depth--;
+                if (depth === 0) { end = i; break; }
+            }
+        }
+        let candidate;
+        if (end === -1) {
+            // 08-13: scan ran off the end of the reply with braces still open
+            // — the renderer truncates the LAST brace of a fenced JSON reply
+            // ("...work on it."} missing the final }). Repair: close the open
+            // string if the cut landed inside one, close the open braces, and
+            // attempt a parse. A repaired candidate that still isn't a tool
+            // call just fails the parse below; nothing more to try after it.
+            let repaired = text.slice(start);
+            if (inString) repaired += '"';
+            repaired += '}'.repeat(Math.min(depth, 20));
+            candidate = repaired;
+        } else {
+            candidate = text.slice(start, end + 1);
+        }
+        let obj = tryParse(candidate);
+        if (!obj) {
+            // 08-13: the chat model writes file content as a RAW triple-quoted
+            // string inside the JSON ("content":"""...""") — invalid JSON that
+            // used to leak the whole reply to the client. Escape triple-quoted
+            // regions (JSON.stringify handles the real newlines/quotes) and
+            // re-parse; complex cases the regex can't fix hit the gateway's
+            // MALFORMED correction and the model resends properly.
+            const esc = candidate.replace(/"([A-Za-z_]\w*)"\s*:\s*"""([\s\S]*?)"""/g, (m, key, val) => `"${key}":${JSON.stringify(val)}`);
+            if (esc !== candidate) obj = tryParse(esc);
+        }
+        // 08-19 (degradation fix): accept FLAT args in addition to the taught
+        // {"tool","params"} wrapper. Gemini follows each tool's JSON schema
+        // (parameters.properties.*) over the format example and emits
+        // {"tool":"send_message","text":"..."} — the old `&& obj.params` gate
+        // rejected that as malformed, sent a correction, and the model
+        // re-emitted the SAME schema-driven shape forever (correction loop up
+        // to the 3-round bail; it was round 16 before the bail existed). A
+        // bare {"tool":"x"} with no args at all stays rejected (ambiguous).
+        if (obj && typeof obj === 'object' && typeof obj.tool === 'string') {
+            const flatArgs = { ...obj };
+            delete flatArgs.tool;
+            delete flatArgs.params;
+            const args = obj.params ?? flatArgs;
+            if (Object.keys(args).length > 0 || obj.params) {
+                if (firstCallStart === -1) firstCallStart = start;
+                result.toolCalls.push({ toolName: obj.tool, args });
+            }
+        }
+        if (end === -1) break; // consumed the whole tail
+        start = text.indexOf('{', start + 1);
+    }
+    if (firstCallStart !== -1) result.prose = cleanProse(text.slice(0, firstCallStart));
+    return result;
+}
+
+// Single-call view for the existing callers (server.js tool loop pre-08-13).
+function parseToolCall(response) {
+    const r = parseToolCalls(response);
+    if (r.toolCalls.length) {
+        const c = r.toolCalls[0];
+        return { isToolCall: true, toolName: c.toolName, args: c.args };
+    }
+    return { isToolCall: false, content: response };
+}
+
+// ──────────────────────────────────────────────────────
+// EXPORTS
+// ──────────────────────────────────────────────────────
+module.exports = {
+    TOOL_DEFINITIONS,
+    getToolDefinitions,
+    executeTool,
+    parseToolCall,
+    parseToolCalls,
+    cleanProse,
+    setShannonClass,
+    getShannonCalls,
+};
