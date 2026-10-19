@@ -638,3 +638,323 @@ async function ensureToggles() {
             return flipped;
         }, expertDeepThink);
         if (clicked && clicked.length) console.log('🧠 toggles enabled: ' + clicked.join(', '));
+    } catch (e) {
+        console.log('⚠ toggle ensure failed:', String(e.message).slice(0, 60));
+    }
+}
+
+// 08-14 (user rule): instant mode = Search chip present, expert = DeepThink
+// only. The chip set is the reliable mode detector — the mode itself is
+// locked at thread creation and cannot be read from the URL.
+async function isInstantThread() {
+    try {
+        return await page.evaluate(() =>
+            [...document.querySelectorAll('.ds-toggle-button')].some(
+                (el) => (el.textContent || '').trim() === 'Search'));
+    } catch {
+        return false; // fail-open: a DOM hiccup must never block a send
+    }
+}
+
+// 08-17 (user rule): select INSTANT mode on a fresh new-chat page. Mode is
+// locked at thread creation, so this works ONLY on the new-chat composer.
+// 08-15 (USER CORRECTION): the Instant/Expert/Vision tabs were NEVER removed —
+// they are a radiogroup (div.b0db7355, role="radio" options; dfb78875 = the
+// unselected option's inner div, aa40b5de + _31a22b0 on the selected radio).
+// My earlier probe missed them because they are NOT <button>s. The instant
+// check per owner rule: an instant composer HAS a Search option — "if u see a
+// search option that means its not expert". So select = click the Instant
+// radio at creation, then VERIFY Search IS present (else it's expert).
+// Never throws — a UI change just logs and continues rather than stalling.
+async function selectInstantMode() {
+    try {
+        const flipped = await page.evaluate(() => {
+            const out = [];
+            const radios = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')];
+            const instant = radios.find((r) => /instant/i.test(r.textContent || ''));
+            if (!instant) {
+                out.push('NO_MODE_TABS');
+            } else {
+                const isSel = instant.getAttribute('aria-checked') === 'true'
+                    || (instant.className || '').includes('_31a22b0');
+                if (!isSel) { instant.click(); out.push('Instant tab'); }
+            }
+            for (const el of document.querySelectorAll('.ds-toggle-button')) {
+                const label = (el.textContent || '').trim();
+                if (label === 'DeepThink' && el.getAttribute('aria-pressed') === 'true') { el.click(); out.push('DeepThink OFF'); }
+                if (label === 'Search' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('Search ON'); }
+            }
+            return out;
+        });
+        await sleep(900); // composer re-renders for the selected mode
+        const searchPresent = await page.evaluate(() =>
+            [...document.querySelectorAll('.ds-toggle-button')].some(
+                (el) => (el.textContent || '').trim() === 'Search'));
+        if (!searchPresent) {
+            console.log('⚠ instant select FAILED — Search option absent (thread is EXPERT, not instant)');
+        } else {
+            console.log(flipped && flipped.length
+                ? '🧠 new chat set to INSTANT mode (' + flipped.join(', ') + ') — Search present, verified'
+                : '🧠 already instant (Search option present, DeepThink on)');
+        }
+    } catch (e) {
+        console.log('⚠ selectInstantMode failed:', String(e.message).slice(0, 60));
+    }
+}
+
+// 08-25 (owner, NUCLEAR): mirror of selectInstantMode — click the EXPERT mode
+// radio on the fresh-chat composer and DeepThink ON (expert has no Search
+// chip). Mode is locked at thread creation, so this only works on a new chat.
+async function selectExpertMode() {
+    try {
+        if (await isInstantThread()) {
+            console.log('⚠ expert select: composer still shows a Search chip (mode tabs missed?)');
+        }
+        const flipped = await page.evaluate(() => {
+            const out = [];
+            const radios = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')];
+            const expert = radios.find((r) => /expert/i.test(r.textContent || ''));
+            if (!expert) {
+                out.push('NO_MODE_TABS');
+            } else {
+                const isSel = expert.getAttribute('aria-checked') === 'true'
+                    || (expert.className || '').includes('_31a22b0');
+                if (!isSel) { expert.click(); out.push('Expert tab'); }
+            }
+            for (const el of document.querySelectorAll('.ds-toggle-button')) {
+                const label = (el.textContent || '').trim();
+                if (label === 'DeepThink' && el.getAttribute('aria-pressed') !== 'true') { el.click(); out.push('DeepThink ON'); }
+            }
+            return out;
+        });
+        await sleep(900);
+        const searchPresent = await page.evaluate(() =>
+            [...document.querySelectorAll('.ds-toggle-button')].some(
+                (el) => (el.textContent || '').trim() === 'Search'));
+        if (searchPresent) {
+            console.log('⚠ expert select FAILED — Search chip still present (thread is INSTANT, not expert)');
+        } else {
+            console.log(flipped && flipped.length
+                ? '🧠 new chat set to EXPERT mode (' + flipped.join(', ') + ') — Search absent, verified'
+                : '🧠 already expert (no Search chip)');
+        }
+    } catch (e) {
+        console.log('⚠ selectExpertMode failed:', String(e.message).slice(0, 60));
+    }
+}
+
+// ── Type into the chat input ──
+// Prefer the React-safe native-setter path (fast, works on textareas);
+// contenteditable editors (Gemini, …) fall back to the hybrid path below.
+// ⚠️ keyboard.type() translates "\n" into Enter keypresses (partial send),
+// so newlines are never typed — they ride insertText instead.
+async function typePrompt(text) {
+    // 08-12 23:30 handle-free (see sendMessage): query the LIVE element inside
+    // the evaluate — no JSHandle args, nothing to detach when the SPA remounts
+    // the composer on the input event.
+    const set = await page.evaluate((sels, t) => {
+        for (const sel of sels) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+            if (desc && desc.set) {
+                // 08-13 MULTI-SITE: focus BEFORE setting — the value-set path
+                // never focused the input, so the later Enter press went to
+                // whatever had focus last (qwen: a nav element → Enter
+                // ACTIVATED it and navigated the tab to qwen.ai/home).
+                el.focus();
+                desc.set.call(el, t);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                return true;
+            }
+            return false; // found an element but it's not a value-setter input
+        }
+        return false;
+    }, config.selectors.input, text);
+
+    // 08-17 DEEPSEEK REACT-SYNC: the native-setter path populates the textarea
+    // DOM but deepseek's React model can desync from it — sends then carry a
+    // STALE value (verified 08-17: composer showed the typed text, the thread
+    // recorded an old string; the completion XHR carried the old prompt). Real
+    // key events wake the React model (probed live: keyboard-typed prompts hit
+    // the completion body verbatim). Force the hybrid path for deepseek too;
+    // other sites keep the fast native-setter path.
+    const deepseek = new URL(config.webchatUrl).host.includes('deepseek');
+    if (set && !deepseek) return;
+
+    // contenteditable (gemini Quill/Angular) + deepseek (React-sync): HYBRID
+    // input.
+    // 08-16: bulk Input.insertText alone NEVER arms the editor — text lands in
+    // the DOM but the app's model stays empty, so Enter/send no-op ("stranded in
+    // composer"; observed on both 9224 and the GUI tab). REAL key events wake
+    // the editor and build the model; the tail then rides a fast insertText.
+    // Newlines through keyboard.type would be Enter keypresses (partial send),
+    // so they always go through insertText. Arm + clear FIRST so the Ctrl+A
+    // Backspace actually clears stale stranded text (it no-ops on a cold editor).
+    await page.evaluate((sels) => {
+        for (const sel of sels) {
+            const el = document.querySelector(sel);
+            if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return; }
+        }
+    }, config.selectors.input);
+    await sleep(400);
+    await page.keyboard.type(' ');
+    await sleep(150);
+    await page.keyboard.down('Control');
+    await page.keyboard.press('KeyA');
+    await page.keyboard.up('Control');
+    await page.keyboard.press('Backspace');
+    const cdp = await page.createCDPSession();
+    const WAKE = 120;
+    // 08-17: batch insertText into large chunks instead of one round-trip per
+    // line. A huge prompt (helpotron ~224k chars / thousands of lines) was
+    // burning one CDP Input.insertText per line → ~thousands of round-trips →
+    // blew the 300s gateway timeout mid-insert, so the prompt never submitted.
+    const CHUNK = 8192;  // chars per insertText; flush only between lines so
+                         // segments/surrogate pairs are never split mid-string
+    const parts = text.split('\n');
+    let typed = 0;
+    let buf = '';
+    const flush = async () => { if (buf) { await cdp.send('Input.insertText', { text: buf }); buf = ''; } };
+    for (let i = 0; i < parts.length; i++) {
+        const seg = parts[i];
+        if (seg) {
+            if (typed < WAKE) {
+                const take = Math.min(seg.length, WAKE - typed);
+                await page.keyboard.type(seg.slice(0, take));
+                typed += take;
+                if (take < seg.length) buf += seg.slice(take);
+            } else {
+                buf += seg;
+            }
+        }
+        if (i < parts.length - 1) buf += '\n';
+        if (buf.length >= CHUNK) await flush();
+    }
+    await flush();
+    await cdp.detach();
+}
+
+// ── Send: Enter on the focused input, click-fallback if it stays full. ──
+// Enter-first avoids the mousedown-morph hazard on UIs where the send button
+// turns into "Stop" while generating. DeepSeek's current build (08-12) treats
+// Enter as newline — the input stays full, so we fall back to clicking
+// div[role="button"].ds-button--primary, which fires send on mousedown
+// (verified: textarea clears, message lands). The still-full check means the
+// click path only ever runs when Enter genuinely didn't send.
+//
+// Retry on STALE handles: the SPA can re-render the composer between lookup
+// and click (virtual-list recycle / hydration — observed 08-12 right after a
+// fresh CDP attach: "Node is either not clickable or not an Element"). A page
+// RELOAD wipes the typed text entirely, so each retry re-checks the box and
+// re-types if it came back empty.
+async function sendMessage(input, text) {
+    // 08-12 23:30 HANDLE-FREE REWRITE: JSHandle-argument evaluates
+    // (page.evaluate(fn, elementHandle)) HANG on this DeepSeek build — the
+    // composer's input event remounts the textarea, the handle goes detached,
+    // and Chromium's callFunctionOn on a detached objectId times out at the
+    // 120s protocolTimeout instead of erroring (observed: every request dying
+    // on "Runtime.callFunctionOn timed out" while handle-free probes answered
+    // in milliseconds — the typed prompt sat in the composer unsent). This
+    // version uses page-level evaluates (querySelector inside, serializable
+    // args only), CDP Input for the Enter press, and page.mouse.click by
+    // fresh coordinates for the send button — no JSHandles, nothing to detach.
+    // 08-13: arm the in-page stream tee before any send — the answer is
+    // read from the completion XHR body, not the DOM (which stopped
+    // rendering responses in this environment). Idempotent; re-arms itself
+    // after navigations / context handoffs.
+    await installStreamTee().catch((e) => console.log('⚠ stream tee install failed:', String(e.message).slice(0, 60)));
+    // 08-17 TEE-START RACE FIX: snapshot the tee seq AFTER the install (which
+    // may init the buffer on a fresh page) but BEFORE any send — the fast-reply
+    // race otherwise hides the completion (see requestTeeStart above).
+    requestTeeStart = await page.evaluate(() => (window.__wsTeeSeq || 0)).catch(() => 0);
+    for (let attempt = 0; ; attempt++) {
+        try {
+            // Headless tabs restore a deep scroll position (thread URL reload)
+            // — the composer can be OFF-VIEWPORT (boundingBox y negative), and
+            // clicks on it throw "Node is either not clickable or not an
+            // Element". Scroll the LIVE composer into view and focus it.
+            await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return true; }
+                }
+                return false;
+            }, config.selectors.input);
+            await sleep(400);
+            // 08-14 GEMINI FIX: programmatic el.focus() does not activate
+            // gemini's editor — Enter is then ignored and the send-button
+            // fallback can misfire (it once opened the model picker instead
+            // of sending). A trusted mouse click on the composer activates
+            // it; Enter then sends (verified 08-14 on the 9224 driver).
+            // DeepSeek's composer handles focus() fine — keep its proven path.
+            if (!new URL(config.webchatUrl).host.includes('deepseek')) {
+                const cRect = await page.evaluate((sels) => {
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                    }
+                    return null;
+                }, config.selectors.input);
+                if (cRect) {
+                    await page.mouse.click(cRect.x, cRect.y);
+                    await sleep(300);
+                }
+            }
+            // 08-13 NEVER-SEND-EMPTY guard: if typing silently failed (composer
+            // remounted mid-request, stale element), Enter would fire with an
+            // empty box — DeepSeek shows "Message is empty" and the wait hangs
+            // (observed on the 08-13 f05a02e4 tab). Verify the text landed;
+            // retype once; only then send.
+            let landed = await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (!el) continue;
+                    const v = el.value !== undefined ? el.value : el.innerText || '';
+                    if (v.trim().length > 0) return true;
+                }
+                return false;
+            }, config.selectors.input);
+            if (!landed) {
+                console.log('⚠️ composer empty after typing — retyping once');
+                await typePrompt(text);
+                landed = await page.evaluate((sels) => {
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const v = el.value !== undefined ? el.value : el.innerText || '';
+                        if (v.trim().length > 0) return true;
+                    }
+                    return false;
+                }, config.selectors.input);
+                if (!landed) throw new Error('composer stayed empty after typing — send aborted (no empty sends)');
+            }
+            await page.keyboard.press('Enter');
+            await sleep(1500);
+            // If the text is still in the box, Enter didn't send — click the button.
+            const stillFull = await page.evaluate((sels) => {
+                for (const sel of sels) {
+                    const el = document.querySelector(sel);
+                    if (!el) continue;
+                    const v = el.value !== undefined ? el.value : el.innerText || '';
+                    if (v.trim().length > 0) return true;
+                }
+                return false;
+            }, config.selectors.input);
+            if (stillFull) {
+                const btnInfo = await page.evaluate((sels) => {
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        return { x: r.x + r.width / 2, y: r.y + r.height / 2, glyph: d.slice(0, 8) };
+                    }
+                    return null;
+                }, config.selectors.send);
+                if (btnInfo) {
+                    // scroll the button into view before clicking (off-viewport
+                    // clicks land nowhere)
