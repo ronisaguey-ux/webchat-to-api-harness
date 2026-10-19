@@ -318,3 +318,323 @@ const TOOL_DEFINITIONS = [
                 ];
                 let denied = null;
                 for (const s of DANGER) {
+                    if (cmd.includes(s)) { denied = s; break; }
+                }
+                if (denied) {
+                    return resolve({
+                        success: false,
+                        error: "run_bash DENIED: command matches dangerous pattern: " + denied,
+                    });
+                }
+                // 08-20 (audit BUG-03/CRIT-02): per-segment binary whitelist —
+                // the deny-list above alone was bypassable. See assertCommandSafe.
+                const segErr = assertCommandSafe(cmd);
+                if (segErr) {
+                    return resolve({
+                        success: false,
+                        error: "run_bash DENIED: " + segErr,
+                    });
+                }
+                const toks = cmd.split(" ").filter(Boolean);
+                const gi = toks.indexOf("git");
+                const pi = toks.indexOf("push");
+                if (gi !== -1 && pi !== -1 && pi > gi) {
+                    const rest = toks.slice(pi + 1);
+                    const branch = rest.filter((t) => t[0] !== "-" && t !== "origin" && t !== "upstream").pop();
+                    if (!branch || branch === "master" || branch === "main") {
+                        return resolve({
+                            success: false,
+                            error: "run_bash DENIED: git push requires an explicit feature branch (master/main forbidden)",
+                        });
+                    }
+                }
+                // Log EVERY executed command (denied ones are NOT executed).
+                try {
+                    fs.appendFileSync(
+                        "/home/roni/Roni_Workspace/webchat-api/bash_tool_log.jsonl",
+                        JSON.stringify({ ts: new Date().toISOString(), cmd: redactSecrets(origCmd), executed: redactSecrets(cmd), gitRoot: GIT_ROOT }) + os.EOL
+                    );
+                } catch (e) { /* logging must never block execution */ }
+// spawn + stdio→temp files instead of execFile + pipes: execFile
+                // waits for the pipes to CLOSE, so `cmd &` (backgrounded servers)
+                // blocked until the timeout — the model's "uvicorn ... &" hung
+                // every request a full 60s (2nd session 08-12). bash -c exits
+                // immediately after backgrounding; 'exit' fires, we resolve, and
+                // the background child survives (detached) writing to the files.
+                // On timeout, kill(-pid) takes the whole process group — the old
+                // code killed only bash and orphaned the foreground child.
+                const outFile = `${os.tmpdir()}/webchat_exec_${process.pid}_${Date.now()}.out`;
+                const errFile = outFile.replace(/\.out$/, '.err');
+                const outFd = fs.openSync(outFile, 'w');
+                const errFd = fs.openSync(errFile, 'w');
+                // 08-13 EVENING: stdin instead of `-c` — `bash -c "<cmd>"` puts
+                // the command text in the wrapper's own cmdline, so a pkill -f
+                // inside the command (e.g. "pkill -f uvicorn") matched the
+                // wrapper itself and SIGTERM'd it → "exit code null" tool
+                // failures. With `bash -s` the wrapper cmdline is just "bash",
+                // so pkill only matches the real target processes.
+                const child = spawn('/bin/bash', ['-s'], {
+                    detached: true,
+                    stdio: ['pipe', outFd, errFd],
+                    ...(GIT_ROOT ? { cwd: GIT_ROOT } : USER_MODE ? { cwd: USER_WORKSPACE } : {}),
+                });
+                child.stdin.write(cmd);
+                child.stdin.end();
+                let settled = false;
+                const finish = (extra) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    try { fs.closeSync(outFd); } catch (e) { /* already closed */ }
+                    try { fs.closeSync(errFd); } catch (e) { /* already closed */ }
+                    let stdout = '';
+                    let stderr = '';
+                    try { stdout = fs.readFileSync(outFile, 'utf8'); } catch (e) { /* gone */ }
+                    try { stderr = fs.readFileSync(errFile, 'utf8'); } catch (e) { /* gone */ }
+                    // Orphans may keep appending — read the tail, then unlink so
+                    // the files can't grow unbounded.
+                    if (stdout.length > config.execMaxBuffer) stdout = stdout.slice(-config.execMaxBuffer);
+                    if (stderr.length > config.execMaxBuffer) stderr = stderr.slice(-config.execMaxBuffer);
+                    try { fs.unlinkSync(outFile); } catch (e) { /* already gone */ }
+                    try { fs.unlinkSync(errFile); } catch (e) { /* already gone */ }
+                    // 08-20 (audit SEC-05): strip secrets before the model sees output.
+                    stdout = redactSecrets(stdout);
+                    stderr = redactSecrets(stderr);
+                    resolve({ success: true, ...extra, stdout, stderr: stderr || '' });
+                };
+                child.on('error', (err) => finish({ success: false, error: err.message }));
+                child.on('exit', (code) =>
+                    finish(code === 0 ? {} : { success: false, error: `exit code ${code}` }));
+                const timer = setTimeout(() => {
+                    try { process.kill(-child.pid, 'SIGKILL'); } catch (e) { /* already gone */ }
+                    finish({ success: false, error: `timed out after ${Math.round(config.execTimeoutMs / 1000)}s` });
+                }, config.execTimeoutMs);
+            }),
+    },
+    {
+        name: 'list_dir',
+        category: 'file',
+        description: 'List contents of a directory.',
+        parameters: {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: 'Directory path' },
+            },
+            required: ['path'],
+        },
+        handler: async (args) => {
+            const files = fs.readdirSync(resolvePath(args.path));
+            return { success: true, files };
+        },
+    },
+    {
+        // 2026-08-13: replaced the simulated placeholder with REAL search —
+        // DeepSeek's Anthropic-compatible endpoint (api.deepseek.com/v1/messages,
+        // x-api-key auth) with the native web_search_20250305 tool, which does
+        // server-side search + decryption and returns result entries + an AI
+        // answer with sources. Requires DEEPSEEK_API_KEY in the gateway .env
+        // (same key the websearch-deepseek MCP uses — v4 flash only, never
+        // deepseek-chat).
+        name: 'search_web',
+        category: 'web',
+        description: 'Search the web; returns result entries plus an AI-written answer with source URLs.',
+        parameters: {
+            type: 'object',
+            properties: {
+                query: { type: 'string', description: 'Search query' },
+            },
+            required: ['query'],
+        },
+        handler: async (args) => {
+            const key = process.env.DEEPSEEK_API_KEY;
+            if (!key) {
+                return { success: false, error: 'search disabled: DEEPSEEK_API_KEY not set in the gateway .env' };
+            }
+            const body = {
+                model: 'deepseek-flash',
+                max_tokens: 1000,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'Search the web for the query, then give a final answer in the same language the user used, with source URLs. Use the web_search tool exactly once.',
+                    },
+                    { role: 'user', content: String(args.query || '') },
+                ],
+                tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+                tool_choice: { type: 'auto' },
+            };
+            try {
+                const resp = await fetch('https://api.deepseek.com/anthropic/v1/messages', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', 'x-api-key': key },
+                    body: JSON.stringify(body),
+                    signal: AbortSignal.timeout(45000),
+                });
+                if (!resp.ok) {
+                    const t = await resp.text().catch(() => '');
+                    return { success: false, error: `search API ${resp.status}: ${t.slice(0, 200)}` };
+                }
+                const data = await resp.json();
+                const results = [];
+                const textParts = [];
+                for (const block of (data.content || [])) {
+                    if (block.type === 'web_search_tool_result' && block.content) {
+                        for (const item of block.content) {
+                            results.push({
+                                title: item.title || '',
+                                url: item.url || '',
+                                text: (item.text || '').slice(0, 300),
+                            });
+                        }
+                    } else if (block.type === 'text' && block.text) {
+                        textParts.push(block.text);
+                    }
+                }
+                return {
+                    success: true,
+                    answer: textParts.join('\n').slice(0, 3000),
+                    results: results.slice(0, 8),
+                    resultCount: results.length,
+                };
+            } catch (e) {
+                return { success: false, error: String((e && e.message) || e) };
+            }
+        },
+    },
+    {
+        // 2026-08-13: a real clock — the webchat must never guess the date
+        // (the stale-date mistake class). Always use this for "what time is it".
+        name: 'get_time',
+        category: 'system',
+        description: 'Get the current date and time. NEVER guess the current date from memory — call this.',
+        parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+        },
+        handler: async () => {
+            const now = new Date();
+            return {
+                success: true,
+                iso: now.toISOString(),
+                local: now.toString(),
+                epochMs: now.getTime(),
+            };
+        },
+    },
+    {
+        // 08-13 EVENING (user rule): the ONLY way to talk to the user in
+        // JSON-only mode. server.js special-cases this name before executeTool
+        // and delivers the text to the client as a 'text' progress event
+        // (rendered "💬 <text>"). This handler is the fallback shape for
+        // paths that don't special-case it (runHandoff).
+        name: 'send_message',
+        category: 'chat',
+        description:
+            'Send a plain-text message to the user (delivered verbatim, rendered as "💬 <text>"). ' +
+            'Use this to acknowledge the user\'s message, narrate what you are about to do before ' +
+            'every other tool call, and to send your final summary. This is the ONLY way to ' +
+            'communicate in plain text.',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'The message text (one short line — what you are thinking and about to do)' },
+            },
+            required: ['text'],
+        },
+        handler: async (args) => {
+            const text = String(args?.text ?? '');
+            if (!text) return { success: false, error: 'empty message' };
+            return { success: true, delivered: true, text };
+        },
+    },
+    {
+        // 2026-08-13: the webchat can answer "how's the pipeline / when does
+        // the audit finish" itself — same data the main session reads.
+        name: 'audit_status',
+        category: 'oculus',
+        description: 'Get the Oculus pipeline status: cycle, phase, running/paused, and audit pass/batch progress.',
+        parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+        },
+        handler: async () => {
+            const read = (p) => {
+                try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch { return null; }
+            };
+            const wf = read('/home/roni/Roni_Workspace/audits_plans/workflow_state.json');
+            const ad = read('/home/roni/Roni_Workspace/audits_plans/audit_state.json');
+            return {
+                success: true,
+                cycle: (wf && wf.cycle) ?? null,
+                phase: (wf && wf.phase) ?? null,
+                running: (wf && wf.running) ?? null,
+                paused: (wf && wf.paused) ?? null,
+                audit: ad ? {
+                    pass: ad.current_pass,
+                    numPasses: ad.num_passes ?? null,
+                    batchesDone: (ad.current_pass_completed_batches || []).length,
+                    totalBatches: ad.total_batches ?? null,
+                    completedPasses: ad.completed_passes || [],
+                    // 08-14: the runner's final state write bumps current_pass to
+                    // num_passes+1 (by design) — flag completion so readouts stop
+                    // showing a scary "pass 6/5, 0 batches".
+                    allPassesComplete: (ad.completed_passes || []).length >= (ad.num_passes || 0),
+                } : null,
+            };
+        },
+    },
+    {
+        // 2026-08-13: read-only repo state for the workspace repos.
+        name: 'git_status',
+        category: 'git',
+        description: 'Read-only git status (branch, short status, last 3 commits) of a workspace repo.',
+        parameters: {
+            type: 'object',
+            properties: {
+                repo: {
+                    type: 'string',
+                    description: `Repo: ${DEFAULT_GIT_REPO} (default), webchat-api, or ${DEFAULT_GIT_REPO === 'oculus' ? 'helpotron' : 'oculus'}`,
+                },
+            },
+            required: [],
+        },
+        handler: async (args) => {
+            const repos = {
+                oculus: '/home/roni/Roni_Workspace/oculus',
+                'webchat-api': '/home/roni/Roni_Workspace/webchat-api',
+                helpotron: '/home/roni/Roni_Workspace/helpotron',
+            };
+            const dir = repos[String((args && args.repo) || DEFAULT_GIT_REPO)];
+            if (!dir) {
+                return { success: false, error: `unknown repo; use one of: ${Object.keys(repos).join(', ')}` };
+            }
+            const st = await runCmd(['git', '-C', dir, 'status', '--short', '--branch']);
+            const lg = await runCmd(['git', '-C', dir, 'log', '--oneline', '-3']);
+            return {
+                success: st.success,
+                branchStatus: st.stdout,
+                recentCommits: lg.stdout,
+            };
+        },
+    },
+    {
+        // 2026-08-13: the webchat can message the owner directly — appends to
+        // the same outbox the orchestrator relay delivers. "webchat: " prefix
+        // enforced per the user's 08-13 contract.
+        name: 'telegram_send',
+        category: 'telegram',
+        description: 'Send a Telegram message to the owner (delivered via the outbox relay; "webchat: " prefix auto-added).',
+        parameters: {
+            type: 'object',
+            properties: {
+                text: { type: 'string', description: 'Message text' },
+            },
+            required: ['text'],
+        },
+        handler: async (args) => {
+            const OUTBOX = '/home/roni/Roni_Workspace/audits_plans/claude_outbox.json';
+            let text = String((args && args.text) || '').trim();
+            if (!text) return { success: false, error: 'empty text' };
+            if (!/^webchat: /i.test(text)) text = 'webchat: ' + text;
