@@ -958,3 +958,323 @@ async function sendMessage(input, text) {
                 if (btnInfo) {
                     // scroll the button into view before clicking (off-viewport
                     // clicks land nowhere)
+                    await page.evaluate((sels) => {
+                        for (const sel of sels) {
+                            const el = document.querySelector(sel);
+                            if (el) { el.scrollIntoView({ block: 'center' }); return; }
+                        }
+                    }, config.selectors.send);
+                    await sleep(300);
+                    // ⚠️ STOP-MORPH GUARD (08-12): while a generation is running
+                    // the primary button morphs into STOP (same element, square
+                    // glyph). Clicking it then KILLS the live answer — observed
+                    // when a retried send landed mid-generation ("Stopped" toast,
+                    // the in-flight reply destroyed, the retry's prompt stranded).
+                    // A generation outliving its request happens when a client
+                    // disconnects mid-reply: the abort stops the gateway loop but
+                    // never stops the tab, so the next send's click is the first
+                    // thing to touch the running generation. Only click once the
+                    // button is back in SEND state (arrow glyph, d starts
+                    // M8.3125; any other glyph = busy/stop, wait for it).
+                    // 08-13 MULTI-SITE: the M8.3125 send-glyph check is
+                    // DeepSeek-UI-specific — on qwen/kimi/gemini the send
+                    // button's icon differs and would read as perpetual STOP
+                    // (observed: gemini's probe blocked by a false-STOP wait).
+                    // The server-level busy guard already serializes requests,
+                    // so no live generation can be running here: click
+                    // directly on foreign sites.
+                    const isDeepseek = new URL(config.webchatUrl).host.includes('deepseek');
+                    let ready = !isDeepseek || btnInfo.glyph.startsWith('M8.3125');
+                    if (!ready) {
+                        console.log('🛑 send button in STOP state — waiting for generation to finish');
+                        for (let w = 0; w < 120; w++) {
+                            await sleep(1000);
+                            ready = await page.evaluate((sels) => {
+                                for (const sel of sels) {
+                                    const el = document.querySelector(sel);
+                                    if (!el) continue;
+                                    const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                                    return d.startsWith('M8.3125');
+                                }
+                                return false;
+                            }, config.selectors.send);
+                            if (ready) break;
+                        }
+                        // 08-12 23:15 NEVER click a still-STOP button: the click
+                        // would STOP the live generation ("Stopped" toast, reply
+                        // destroyed) and wedge the next retry — the exact chain
+                        // that ate the 2nd session's requests after a mid-flight
+                        // kill. Fail fast instead; the generation keeps running,
+                        // the client's retry finds a clean SEND button.
+                        if (!ready) {
+                            throw new Error('webchat tab still generating from a previous request — retry after it finishes');
+                        }
+                    }
+                    // Re-read fresh coordinates right before the click (the SPA
+                    // may have re-laid-out since the first read).
+                    const pos = await page.evaluate((sels) => {
+                        for (const sel of sels) {
+                            const el = document.querySelector(sel);
+                            if (!el) continue;
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                        }
+                        return null;
+                    }, config.selectors.send);
+                    if (!pos) throw new Error('send button vanished before click');
+                    await page.mouse.click(pos.x, pos.y);
+                    if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text.length);
+                }
+                await page.keyboard.press('Enter');
+            }
+            if (process.env.SKIP_CLEAR_VERIFY !== '1') return verifySendCleared(text.length);
+        } catch (e) {
+            const stale = /not clickable|not an Element|detached|context destroyed/i.test(e.message);
+            if (!stale || attempt >= 2) throw e;
+            console.log(`🔄 send flow hit a stale handle — re-typing (attempt ${attempt + 2})`);
+            await sleep(1500);
+            input = await typePrompt(text);
+        }
+    }
+}
+
+// 08-16 SEND-VERIFY: an Enter press or send-button click can silently no-op
+// when React's composer state is out of sync with the DOM (stranded text —
+// the DOM shows the prompt, React thinks the composer is empty; observed on
+// gemini after a CDP session reconnect, 7678-char prompt). Before, sendMessage
+// returned straight into waitForResponse, which can't tell "still generating"
+// from "never sent", and ground to the hard cap (25 min) for a message that
+// isn't coming. Poll for the composer to clear; fail fast with a clear error
+// if it doesn't — the client retries and the tab stays usable.
+async function verifySendCleared(promptLen = 0) {
+    // 08-24 (transport audit): patience scales with prompt size. Bulk
+    // insertText of a 60k-char chunk takes the SPA measurably longer to
+    // commit; a premature "stranded" verdict fires the heal reload, which
+    // DESTROYS an in-flight submission — observed downstream as the gemini
+    // "generation stopped" banner on the client's retry. Small prompts keep
+    // the proven fast-fail (genuine React desyncs need the reload anyway).
+    // 08-24 (investigator 1): 30 polls was tight for the audit engine's
+    // 60k-char chunk sends on a busy renderer — a premature "stranded"
+    // verdict fires the heal reload, which destroys an in-flight submission
+    // (seen downstream as the gemini "generation stopped" banner). 45 keeps
+    // the fail-fast spirit with margin for a slow React commit.
+    const polls = promptLen > 20000 ? 45 : 10;
+    for (let i = 0; i < polls; i++) {
+        await sleep(1000);
+        const empty = await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const v = el.value !== undefined ? el.value : el.innerText || '';
+                if (v.trim().length > 0) return false;
+            }
+            return true;
+        }, config.selectors.input);
+        if (empty) return;
+    }
+    // 08-17: surface the REAL cause when gemini's backend rejected the send —
+    // the composer stays full because the request never committed (BardErrorInfo
+    // 1095/1096 = rate-limit/abuse block, NOT a React-state bug; reloading
+    // doesn't help, waiting out the cooldown does). Fall back to the old
+    // message when no backend code was recorded.
+    let bard = '';
+    try { bard = await page.evaluate(() => window.__wsLastBardError || ''); } catch { /* ignore */ }
+    if (bard) {
+        throw new Error(`webchat send failed — gemini backend rejected the send (BardErrorInfo ${bard} = rate-limit/abuse block). Wait out the cooldown; do NOT reload-hammer it.`);
+    }
+    // 08-23: auto-heal instead of only instructing — the tab's React state is
+    // gone, so reload it INLINE; the client's retry (attempt 2/2) then lands on
+    // a fresh tab instead of a second guaranteed failure. Bard-backend
+    // rejections (BardErrorInfo branch above) still bypass this deliberately —
+    // waiting out the cooldown is the fix there, not a reload.
+    console.log('🧹 stranded composer detected — reloading tab for inline self-heal');
+    try {
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await sleep(3000); // let the UI settle after reload
+        const inputAvail = await page.evaluate((sels) => {
+            for (const sel of sels) {
+                if (document.querySelector(sel)) return true;
+            }
+            return false;
+        }, config.selectors.input);
+        console.log(inputAvail
+            ? '🧹 tab reloaded — composer input present, ready for client retry'
+            : '🧹 tab reloaded but composer input not found — client retry may still fail');
+    } catch (e) {
+        console.log('🧹 inline reload failed:', String(e.message).slice(0, 60));
+    }
+    throw new Error('webchat send failed — prompt stranded in composer (React out of sync). Tab reloaded; retry the send.');
+}
+
+// ── Chat snapshot (build-agnostic) ─────────────────────────────
+// DeepSeek's current build renders the thread in a VIRTUALIZED list
+// (.ds-virtual-list, hashed CSS-module classes) — the old fixed selectors
+// (.ds-markdown, .message, …) match nothing and count-based detection
+// breaks (items are recycled, the count never grows). Instead: track the
+// LAST RENDERED message's text — a new response replaces it, and streaming
+// = it keeps growing until stable. Falls back to count-mode on older
+// builds where the fixed selectors still exist.
+async function snapshotChat() {
+    return page.evaluate((sels) => {
+        const vl = document.querySelector('.ds-virtual-list');
+        if (vl) {
+            // Virtual list renders only what's in view — the newest message is
+            // only in the DOM at the bottom. Scroll first (React renders
+            // synchronously on the scroll event, so the children below are
+            // the CURRENT tail of the thread).
+            vl.scrollTop = vl.scrollHeight;
+            // 08-12: the list's DIRECT children are [spacer, items, spacer,
+            // FOOTER] — the footer ("DeepThink | Search | AI-generated…") is
+            // the last child with text but is NOT a message; reading it froze
+            // detection forever. The messages live one level deeper: the
+            // .ds-virtual-list-visible-items wrapper's children are discrete
+            // message rows (user = _9663006-ish, assistant = _4f9bf79…).
+            // Take the LAST non-empty child THERE.
+            // ⚠️ querySelector with a comma-list returns the FIRST match in
+            // document order — .ds-virtual-list-items (the PARENT) wins and
+            // its single child is the whole block. Query visible-items
+            // FIRST, separately (observed 08-12: parent-child ordering made
+            // the comma-selector return the parent → 1789-char mega-row).
+            const box = vl.querySelector('.ds-virtual-list-visible-items')
+                || vl.querySelector('.ds-virtual-list-items')
+                || vl;
+            const scope = box || vl;
+            const items = [...scope.children].filter((c) => (c.innerText || '').trim().length > 2);
+            const last = items[items.length - 1];
+            // 08-12: DeepSeek renders the model's REASONING inside the answer
+            // row ("Thought for N seconds" header + .ds-think-content body).
+            // The reasoning is first-person prose that plans the tool call in
+            // code fragments full of { braces — concatenated into innerText it
+            // poisoned parseToolCall (which scans from the FIRST '{' and never
+            // advanced), so every valid tool-call reply was rejected as a yap:
+            // the 2-rejections-before-every-call pattern. `text` stays RAW for
+            // waitForResponse's growth/activity detection (the reasoning
+            // streams and keeps the poll alive); `answer` is the row with the
+            // think blocks REMOVED — that is the model's actual reply.
+            const clone = last ? last.cloneNode(true) : null;
+            if (clone) {
+                clone.querySelectorAll('.ds-think-content').forEach((n) => n.remove());
+                for (const h of [...clone.querySelectorAll('div, span')]) {
+                    if (/^\s*Thought for \d+ seconds/.test(h.textContent || '')) h.remove();
+                }
+            }
+            return {
+                mode: 'vl',
+                text: last ? last.innerText || '' : '',
+                answer: clone ? clone.innerText || '' : '',
+                lastCls: last ? (last.className || '').toString() : '',
+                body: document.body ? document.body.innerText || '' : '',
+                count: items.length, // message-row count (08-13: growth check)
+            };
+        }
+        // 08-13 MULTI-SITE: foreign webchats (qwen/kimi/gemini) render replies
+        // in normal DOM — count mode must also carry the NEWEST text-bearing
+        // matched row, or waitForResponse can never accept their answers
+        // (deepseek's virtual list uses 'vl' mode above). Selectors are
+        // iterated in order; matches are in document order, so the last
+        // text-bearing one is the newest message (sidebar rows come earlier).
+        let n = 0;
+        let lastEl = null;
+        const seen = new Set();
+        for (const s of sels) {
+            for (const el of document.querySelectorAll(s)) {
+                // If el is contained inside an already seen container, skip nested duplicate
+                let isNested = false;
+                for (const prev of seen) {
+                    if (prev.contains(el)) { isNested = true; break; }
+                }
+                if (isNested) continue;
+
+                const t = (el.innerText || '').trim();
+                const isUserRow = el.tagName === 'USER-QUERY'
+                    || (el.getAttribute && el.getAttribute('data-message-author-role') === 'user')
+                    || /^You have access to the tools below/.test(t)
+                    || /### SYSTEM INSTRUCTION|### USER MESSAGE/.test(t);
+                if (isUserRow) continue;
+
+                n++;
+                seen.add(el);
+                lastEl = el;
+            }
+        }
+        let rawTxt = lastEl ? (lastEl.innerText || '').slice(0, 100000) : '';
+        let txt = rawTxt
+            .replace(/^\s*Gemini said\s*\n*/gi, '')
+            .replace(/\bGemini said\b\s*/gi, '')
+            .replace(/^\s*JSON\s*\n+/gi, '')
+            .replace(/^\s*(?:json|txt|text|python|bash|shell)\s*(?:Copy\s*)?(?:Download\s*)?\n+/gi, '')
+            .trim();
+        return { mode: 'count', count: n, text: txt, answer: txt, lastCls: lastEl ? (lastEl.className || '').toString() : '', body: document.body ? document.body.innerText || '' : '' };
+    }, config.selectors.message);
+}
+
+// STOP-glyph check (08-13, hoisted out of the wait loop): DeepSeek shows the
+// STOP icon on the send button while a generation runs and reverts to the
+// send glyph when done. Handle-free — queries the live element in-page.
+async function isGenerating() {
+    try {
+        return await page.evaluate((sels) => {
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const d = ((el.querySelector('svg path') || { getAttribute: () => '' }).getAttribute('d') || '');
+                return d.length > 0 && !d.startsWith('M8.3125');
+            }
+            return false;
+        }, config.selectors.send);
+    } catch { return false; }
+}
+
+// Count-mode generation detector (08-13): foreign webchats (qwen/kimi/
+// gemini) don't share DeepSeek's M8.3125 STOP glyph, so isGenerating()
+// can't read them. While a generation runs they show a stop control
+// (element whose aria-label or button text is exactly stop-ish; Chinese
+// labels included — qwen/kimi are zh UIs). Its presence ⇒ the newest row
+// is still streaming — never accept or rescue it, never type into it.
+async function isForeignBusy() {
+    try {
+        return await page.evaluate(() => {
+            const stopish = (s) => {
+                s = (s || '').trim().toLowerCase();
+                return s === 'stop' || s === 'stop response' || s === 'stop generating'
+                    || s === 'stop generation' || s === 'stop stream'
+                    || s === '停止' || s === '停止生成' || s === '停止响应';
+            };
+            const isVisible = (el) => {
+                if (!el) return false;
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') !== null) return false;
+                if (el.getAttribute('aria-hidden') === 'true') return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) return false;
+                return el.offsetParent !== null || el.getClientRects().length > 0;
+            };
+            for (const el of document.querySelectorAll('[aria-label]')) {
+                if (stopish(el.getAttribute('aria-label')) && isVisible(el)) return true;
+            }
+            for (const b of document.querySelectorAll('button')) {
+                if (stopish(b.innerText) && isVisible(b)) return true;
+            }
+            return false;
+        });
+    } catch { return false; }
+}
+
+// ── SSE STREAM TEE (08-13) ──────────────────────────────────
+// DeepSeek 2.3.0's frontend stopped committing streamed responses to the
+// DOM in this headless environment — the completion XHR streams real tokens
+// (probed 08-13: `data: {"v":{"response":{...,"fragments":[{"type":
+// "RESPONSE","content":"P"}],"status":"WIP"}}}` on a 200 text/event-stream),
+// but the virtual list never renders them, so DOM polling times out on
+// every request. Fix: tee the completion response in-page and read the
+// answer from the stream body directly. The app's http client uses
+// XMLHttpRequest (proven by the 08-13 tee capture); fetch is hooked too as
+// a transport fallback. Idempotent per page load — call from sendMessage
+// before every send so a navigation or context-handoff re-arms it on the
+// fresh document.
+async function installStreamTee() {
+    await page.evaluate(() => {
+        // 08-13 CAP BUG FIX: seq-tagged entries (see push()/readStreamedAnswer).
+        // If an older build armed a seq-less tee on this long-lived page,
+        // RE-ARM it — stale entries belong to dead requests anyway.
+        // 08-13 PARSER-REFRESH: __wsParseSse is assigned BEFORE the guard —
+        // gateway restarts must reach already-armed pages, or code fixes to
