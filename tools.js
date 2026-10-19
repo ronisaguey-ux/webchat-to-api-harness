@@ -36,11 +36,42 @@ const SENSITIVE_ABS_PREFIXES = [
     '/etc/', '/root/', '/home/roni/.ssh', '/home/roni/.claude/',
     '/proc/', '/sys/', '/dev/', '/boot/', '/run/', '/var/lib/', '/var/cache/',
 ];
+// 09-04 LANE FIX: shannon's pi agents run in a container where the scan
+// target is /repos/<repo> and the scan workspace's .shannon dir is overlaid
+// there (/repos/<repo>/.shannon = the workspace .shannon). The lane harness
+// executes tools on the HOST, so translate those container paths:
+//   GIT_ROOT        = host repo root (also the tools' default root)
+//   WS_SHANNON_DIR  = host path of the workspace .shannon (the overlay target)
+const WS_SHANNON_DIR = process.env.WS_SHANNON_DIR || '';
+function translatePath(abs) {
+    if (!GIT_ROOT) return null;
+    const prefix = '/repos/' + path.basename(GIT_ROOT);
+    if (!abs.startsWith(prefix)) return null;
+    const rest = abs.slice(prefix.length);
+    if (WS_SHANNON_DIR && (rest === '/.shannon' || rest.startsWith('/.shannon/'))) {
+        return path.join(WS_SHANNON_DIR, rest.slice('/.shannon/'.length));
+    }
+    return abs === prefix ? GIT_ROOT : path.join(GIT_ROOT, rest);
+}
 function resolvePath(p) {
     if (typeof p !== 'string' || p === '') return p;
     const root = path.resolve(USER_MODE ? USER_WORKSPACE : (GIT_ROOT || process.cwd()));
-    const abs = path.isAbsolute(p) ? p : path.resolve(root, p);
-    if (!path.isAbsolute(p)) {
+    let abs = path.isAbsolute(p) ? p : path.resolve(root, p);
+    // 09-04: track remaps; a path translated into WS_SHANNON_DIR (the scan
+    // workspace overlay) is trusted — the escape check below must NOT re-measure
+    // it against GIT_ROOT, which would reject every `.shannon/...` read.
+    let remapped = false;
+    if (path.isAbsolute(p)) {
+        const t = translatePath(abs);
+        if (t) { abs = t; remapped = true; }
+    } else if (WS_SHANNON_DIR) {
+        const rel = path.relative(root, abs);
+        if (rel === '.shannon' || rel.startsWith('.shannon/')) {
+            abs = path.join(WS_SHANNON_DIR, rel === '.shannon' ? '' : rel.slice('.shannon/'.length));
+            remapped = true;
+        }
+    }
+    if (!remapped && !path.isAbsolute(p)) {
         const rel = path.relative(root, abs);
         if (rel.startsWith('..') || path.isAbsolute(rel)) {
             throw new Error(`Access Denied: path escapes the workspace root: ${p}`);
@@ -420,7 +451,7 @@ const TOOL_DEFINITIONS = [
                 return { success: false, error: 'search disabled: DEEPSEEK_API_KEY not set in the gateway .env' };
             }
             const body = {
-                model: 'deepseek-v4-flash',
+                model: 'deepseek-flash',
                 max_tokens: 1000,
                 messages: [
                     {
@@ -771,6 +802,134 @@ const TOOL_DEFINITIONS = [
 ];
 
 // ──────────────────────────────────────────────────────
+// SHANNON DELIVERABLE TOOLS (09-04 lane fix #5)
+//    The worker's pi agents run their analysis tools in-process (todo_write,
+//    set_findings_summary, set_strategic_intelligence, set_safe_vectors,
+//    set_blind_spots, submit_exploitation_queue) and so never expose them in
+//    the HTTP tools array — the lane model then believed they didn't exist
+//    and ended each vuln agent with plain text → the worker's output
+//    validation failed ("<class>_exploitation_queue.json missing").
+//    These are the SAME tools registered as REAL gateway tools: the model
+//    sees them in its executable list, calls them natively like read_file,
+//    and the host-side executors write the deliverable files directly into
+//    the scan workspace's .shannon/deliverables (RW-bind = exactly the
+//    container path the worker validates: /repos/<repo>/.shannon/deliverables).
+//    Class routing: setShannonClass() is called by the /v1/responses handler
+//    (from the request prompt's role line "... Analysis Specialist") INSIDE
+//    the serialized mutex window, so the stash always belongs to the request
+//    being processed. submit_exploitation_queue additionally infers the
+//    class from its entry IDs (INJ-/XSS-/AUTH-/AUTHZ-/SSRF- namespaces) when
+//    the stashed class disagrees.
+// ──────────────────────────────────────────────────────
+let shannonTaskClass = '';
+let shannonTaskCalls = [];
+function setShannonClass(cls) {
+    const c = String(cls || '').trim().toLowerCase();
+    shannonTaskClass = ['injection', 'xss', 'auth', 'authz', 'ssrf'].includes(c) ? c : '';
+    shannonTaskCalls = [];
+}
+function getShannonCalls() {
+    return shannonTaskCalls.slice();
+}
+function shannonClassFromIds(entries) {
+    if (!Array.isArray(entries)) return '';
+    for (const e of entries) {
+        const id = String((e && (e.ID ?? e.id)) || '');
+        if (/^AUTHZ-/i.test(id)) return 'authz';
+        if (/^AUTH-/i.test(id)) return 'auth';
+        if (/^INJ/i.test(id)) return 'injection';
+        if (/^XSS/i.test(id)) return 'xss';
+        if (/^SSRF/i.test(id)) return 'ssrf';
+    }
+    return '';
+}
+function shannonWriteJson(relPath, obj) {
+    if (!WS_SHANNON_DIR) throw new Error('WS_SHANNON_DIR not set — shannon deliverable tool disabled');
+    const abs = path.join(WS_SHANNON_DIR, relPath);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const tmp = abs + '.tmp-' + process.pid + '-' + Date.now();
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf-8');
+    fs.renameSync(tmp, abs);
+    return abs;
+}
+function shannonCapture(name, args) {
+    shannonTaskCalls.push({ name, args });
+    if (!shannonTaskClass) throw new Error('Shannon class unknown for this request — cannot route the deliverable');
+    const abs = shannonWriteJson(path.join('deliverables', '.captures', shannonTaskClass + '-' + name + '.json'), args || {});
+    console.log(`✅ [shannon] ${name} → ${abs}`);
+    return { success: true, message: `${name} captured (${shannonTaskClass}).` };
+}
+const SHANNON_DELIVERABLE_TOOLS = [
+    {
+        name: 'todo_write',
+        category: 'shannon',
+        description: 'Create/manage your analysis task list; one todo per source/endpoint to analyze. The harness records them in the workspace scratchpad.',
+        parameters: { type: 'object', properties: { todos: { type: 'array', items: { type: 'object' } } } },
+        handler: async (args) => {
+            shannonTaskCalls.push({ name: 'todo_write', args });
+            const todos = Array.isArray(args?.todos) ? args.todos : [];
+            if (!WS_SHANNON_DIR) return { success: true, message: `Todo list noted (${todos.length} todos) — scratchpad disabled.` };
+            const abs = path.join(WS_SHANNON_DIR, 'scratchpad', (shannonTaskClass || 'scan') + '-todos.jsonl');
+            fs.mkdirSync(path.dirname(abs), { recursive: true });
+            fs.appendFileSync(abs, JSON.stringify({ ts: new Date().toISOString(), todos }) + '\n', 'utf-8');
+            console.log(`✅ [shannon] todo_write → ${abs} (${todos.length} todos)`);
+            return { success: true, message: `Todo list recorded (${todos.length} todos).` };
+        },
+    },
+    {
+        name: 'set_findings_summary',
+        category: 'shannon',
+        description: 'Submit the findings summary (deliverable Sections 1-2): key outcome + dominant patterns for this vulnerability class.',
+        parameters: { type: 'object', properties: { key_outcome: { type: 'string' }, patterns: { type: 'array', items: { type: 'object' } } }, required: ['key_outcome'] },
+        handler: async (args) => shannonCapture('set_findings_summary', args),
+    },
+    {
+        name: 'set_strategic_intelligence',
+        category: 'shannon',
+        description: 'Submit strategic/domain intelligence (deliverable Section 3): class-specific fields (WAF, DB tech, auth method, CSP, http client — see the task text).',
+        parameters: { type: 'object' },
+        handler: async (args) => shannonCapture('set_strategic_intelligence', args),
+    },
+    {
+        name: 'set_safe_vectors',
+        category: 'shannon',
+        description: 'Submit vectors analyzed and confirmed secure (deliverable Section 4): the ones you tested and found safe, not unexamined ones.',
+        parameters: { type: 'object', properties: { vectors: { type: 'array', items: { type: 'object' } } } },
+        handler: async (args) => shannonCapture('set_safe_vectors', args),
+    },
+    {
+        name: 'set_blind_spots',
+        category: 'shannon',
+        description: 'Submit analysis constraints / coverage gaps (deliverable Section 5): what you could not verify and why.',
+        parameters: { type: 'object', properties: { items: { type: 'array', items: { type: 'object' } } } },
+        handler: async (args) => shannonCapture('set_blind_spots', args),
+    },
+    {
+        name: 'submit_exploitation_queue',
+        category: 'shannon',
+        description: 'Submit the final structured list of analyzed vulnerabilities for this class. Call EXACTLY once when analysis is complete. vulnerabilities = array of {ID, vulnerability_type, externally_exploitable, confidence, ...class-specific fields} as specified in the task text.',
+        parameters: { type: 'object', properties: { vulnerabilities: { type: 'array', items: { type: 'object' } } }, required: ['vulnerabilities'] },
+        handler: async (args) => {
+            const entries = Array.isArray(args?.vulnerabilities) ? args.vulnerabilities : [];
+            shannonTaskCalls.push({ name: 'submit_exploitation_queue', args });
+            if (!entries.length) {
+                console.warn('⚠️ [shannon] submit_exploitation_queue with empty vulnerabilities');
+                return { success: false, error: 'vulnerabilities must be a non-empty array of analyzed vulns (each with an ID in your class namespace, e.g. INJ-VULN-01).' };
+            }
+            const cls = shannonClassFromIds(entries) || shannonTaskClass;
+            if (!cls) throw new Error('Cannot determine the vulnerability class for the queue submission');
+            const queue = { ...(args || {}), vulnerabilities: entries };
+            const abs = shannonWriteJson(path.join('deliverables', cls + '_exploitation_queue.json'), queue);
+            console.log(`✅ [shannon] submit_exploitation_queue → ${abs} (${entries.length} vulns, class=${cls})`);
+            return { success: true, message: `Exploitation queue submitted (${entries.length} vulns).` };
+        },
+    },
+];
+for (const d of SHANNON_DELIVERABLE_TOOLS) {
+    if (!TOOL_DEFINITIONS.some((t) => t.name === d.name)) TOOL_DEFINITIONS.push(d);
+}
+
+// ──────────────────────────────────────────────────────
 // TOOL EXECUTOR
 // ──────────────────────────────────────────────────────
 function getToolDefinitions() {
@@ -941,4 +1100,6 @@ module.exports = {
     parseToolCall,
     parseToolCalls,
     cleanProse,
+    setShannonClass,
+    getShannonCalls,
 };
