@@ -18,7 +18,7 @@ const {
     buildFullPrompt, openNewChatAndSeed, getReqBodyChars, getAndClearThinkBuf,
     resetTeeForHandoff, takeThreadSwap, openNewChat, reopenThread,
 } = require('./browser');
-const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse } = require('./tools');
+const { getToolDefinitions, executeTool, parseToolCall, parseToolCalls, cleanProse, setShannonClass, getShannonCalls } = require('./tools');
 const { MultiSignalGatewayGate } = require('./drift_v2');
 
 let driftClean = null;
@@ -359,6 +359,14 @@ let lastReqBodyChars = 0;
 // Shared send path: rate-limit spacing + body refresh + one timeout retry.
 // Module scope so the handoff doc flow (runHandoff) uses the same gate.
 let sendRetriesLeft = 1;
+// 09-04 (t2b run): DeepSeek webchat account message-cap. On "Messages too
+// frequent" the instant pi retry storm (gate spaces only 6s) keeps the cap
+// hot, so every retry fails for minutes. Real quiet beats racing: exponential
+// cooldown on each hit, reset on any successful send.
+let rateLimitBackoffMs = 0;
+let rateLimitResumeAt = Date.now() + (parseInt(process.env.RATE_LIMIT_INITIAL_HOLD_MS, 10) || 0);
+const RATE_LIMIT_COOLDOWN_BASE_MS = 60000;
+const RATE_LIMIT_COOLDOWN_MAX_MS = parseInt(process.env.RATE_LIMIT_COOLDOWN_MAX_MS, 10) || 600000;
 // Post-swap grace: the first request after a handoff always reaches the
 // fresh thread (its seeded body can be ≥ threshold by itself — overhead +
 // doc — and must not re-trigger the pre-send handoff immediately).
@@ -382,16 +390,33 @@ async function countedSend(msg, defs) {
         console.log(`⏱ send gate: waiting ${waitMs}ms (account rate limit spacing)`);
         await sleep(waitMs);
     }
+    const cooldownWait = rateLimitResumeAt - Date.now();
+    if (cooldownWait > 0) {
+        console.log(`⛔ rate-limit cooldown: waiting ${cooldownWait}ms (account cap — letting the bucket refill)`);
+        await sleep(cooldownWait);
+    }
     lastSendAt = Date.now();
     try {
         const r = await sendPrompt(msg, defs);
         lastReqBodyChars = await getReqBodyChars();
+        rateLimitBackoffMs = 0;
+        rateLimitResumeAt = 0;
         return r;
     } catch (e) {
         // 08-13 HARD-CAP SAFETY NET: the pre-send measurement can be blind
         // (page tee armed by an old build, race, fresh-thread overflow) —
         // then the send FAILS with context_length_exceeded and the client
         // got a hard error. Convert that failure into the handoff instead.
+        // 09-04: account burst cap. Cooldown, never hand-off or consume the
+        // timeout retry here — the error is transient and pi's own retry will
+        // land after the quiet window (blocked by the gate above).
+        if (/Messages too frequent|rate_limit_reached/i.test(String(e.message))) {
+            rateLimitBackoffMs = rateLimitBackoffMs
+                ? Math.min(rateLimitBackoffMs * 2, RATE_LIMIT_COOLDOWN_MAX_MS)
+                : RATE_LIMIT_COOLDOWN_BASE_MS;
+            rateLimitResumeAt = Date.now() + rateLimitBackoffMs;
+            console.log(`⛔ DeepSeek account cap hit — cooling down ${rateLimitBackoffMs}ms`);
+        }
         // Grace-guarded: while a handoff is in progress (≤2 min), rethrow so
         // runHandoff's own try/catch falls back to the summary — never a
         // nested handoff recursion on the same full thread.
@@ -464,7 +489,7 @@ if (typeof driftClean === 'function') {
 // The /model picker needs ONE base URL that offers BOTH models:
 //   anymodel             → drive the webchat tab (Gemini, whatever's in chat.js)
 //   everything else      → proxied verbatim to the upstream API (paid DeepSeek),
-//                          so deepseek-v4-flash keeps working from the same session
+//                          so deepseek-flash keeps working from the same session
 //                          (including the pipeline's claude -p swarm).
 const UPSTREAM_ANTHROPIC = {
     base: (process.env.UPSTREAM_ANTHROPIC_BASE_URL || 'https://api.deepseek.com/anthropic').replace(/\/+$/, ''),
@@ -485,7 +510,7 @@ function isWebchatModel(body) {
 // instance dispatches by model name. WEBCHAT_ROUTES="qwen=http://127.0.0.1:8083,kimi=..."
 // maps each webchat model to its own gateway (each drives the logged-in tab
 // in the 9223 GUI browser); anymodel drives THIS instance's deepseek tab;
-// everything else (deepseek-v4-flash) proxies upstream to the paid API.
+// everything else (deepseek-flash) proxies upstream to the paid API.
 const WEBCHAT_ROUTES = {};
 // 08-16 QUOTE-STRIP FIX: the launcher passes
 // WEBCHAT_ROUTES="'gemini webchat'=http://127.0.0.1:8085,..." and the shell
@@ -1841,7 +1866,7 @@ app.get('/v1/models', (req, res) => {
     // prefix and routes on the rest (keys must match WEBCHAT_ROUTES /
     // isWebchatModel exactly — 'deepseek webchat' keeps its space).
     const gatewayRows = [
-        { id: 'claude/deepseek-v4-flash', display_name: 'V4 Flash (paid API)' },
+        { id: 'claude/deepseek-flash', display_name: 'DeepSeek V4.1 Flash (paid API)' },
         { id: 'claude/deepseek webchat', display_name: 'DeepSeek Webchat' },
         { id: 'claude/gemini webchat', display_name: 'Gemini Webchat' },
         { id: 'claude/qwen webchat', display_name: 'Qwen Webchat' },
@@ -1853,7 +1878,7 @@ app.get('/v1/models', (req, res) => {
         data: [
             ...gatewayRows.map((r) => ({ ...r, object: 'model', owned_by: 'webchat-api' })),
             { id: config.modelName, object: 'model', owned_by: 'webchat-api' },
-            { id: 'deepseek-v4-flash', object: 'model', owned_by: 'upstream-proxy' },
+            { id: 'deepseek-flash', object: 'model', owned_by: 'upstream-proxy' },
         ],
     });
 });
@@ -1968,12 +1993,53 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.post('/v1/responses', async (req, res) => {
     try {
         const { model, input, instructions = '', stream, tools } = req.body || {};
+        console.log('[resp-in] model=' + model + ' inputType=' + (Array.isArray(input) ? 'arr' : typeof input) + ' inputLen=' + (input === undefined ? 'undef' : JSON.stringify(input).length) + ' instrLen=' + String(instructions || '').length + ' tools=' + (Array.isArray(tools) ? tools.length : '-') + ' names=' + JSON.stringify((Array.isArray(tools) ? tools : []).map((t) => t && t.name).filter(Boolean)) + ' stream=' + !!stream);
+        if (Array.isArray(input) && input.length) {
+            console.log('[resp-in] item0=' + JSON.stringify(input[0]).slice(0, 300) + ' ||| item1=' + JSON.stringify(input[1] || null).slice(0, 300));
+        }
         const routedModel = String(model || '').replace(/^claude\//, '');
         // Tool names offered by the caller (pi/shannon agents). Our lane model
         // responds in TEXT, so we bridge the Responses-API tool-call contract:
         // the model is told to end its reply with "CALL_TOOL: <name> <json>"
         // and we emit a real function_call item for it on output.
-        const toolNames = Array.isArray(tools) ? tools.map((t) => (t && t.name) || '').filter(Boolean) : [];
+        // 09-04 SHANNON TASK TOOLS: pi executes its custom tools IN-PROCESS
+        // (todo_write / set_findings_summary / set_strategic_intelligence /
+        // set_safe_vectors / set_blind_spots / submit_exploitation_queue, and the
+        // task sub-agent) and does not expose them in the HTTP tools array — the
+        // lane model then believes they do not exist and never calls them (vuln
+        // agents failed output-validation "queue missing"). Declare them here so
+        // the model CAN call them; CALL_TOOL is passed through as a function_call
+        // and pi runs them container-side. Dedupe by name — pi's own defs win.
+        // Defs mirror shannon worker collectors/vuln-collector.ts + queue-schemas.ts.
+        const SHANNON_TASK_TOOLS = [
+            { name: 'task', description: 'Spawn a sub-agent to answer a targeted question about the codebase (code review, data-flow tracing). Pass the question in a query/question argument.', parameters: { type: 'object' } },
+            { name: 'todo_write', description: 'Create/manage your analysis task list; one todo per source/endpoint to analyze.', parameters: { type: 'object', properties: { todos: { type: 'array', items: { type: 'object' } } } } },
+            { name: 'set_findings_summary', description: 'Submit the findings summary (deliverable Sections 1-2): key outcome + dominant patterns.', parameters: { type: 'object', properties: { key_outcome: { type: 'string' }, patterns: { type: 'array', items: { type: 'object' } } }, required: ['key_outcome'] } },
+            { name: 'set_strategic_intelligence', description: 'Submit strategic/domain intelligence (deliverable Section 3): class-specific fields (WAF, DB tech, auth method, CSP, http client — see task text).', parameters: { type: 'object' } },
+            { name: 'set_safe_vectors', description: 'Submit vectors analyzed and confirmed secure (deliverable Section 4).', parameters: { type: 'object', properties: { vectors: { type: 'array', items: { type: 'object' } } } } },
+            { name: 'set_blind_spots', description: 'Submit analysis constraints / coverage gaps (deliverable Section 5).', parameters: { type: 'object', properties: { items: { type: 'array', items: { type: 'object' } } } } },
+            { name: 'submit_exploitation_queue', description: 'Submit the final structured list of analyzed vulnerabilities for this class. Call exactly once when analysis is complete.', parameters: { type: 'object', properties: { vulnerabilities: { type: 'array', items: { type: 'object' } } }, required: ['vulnerabilities'] } },
+        ];
+        const reqTools = Array.isArray(tools) ? tools : [];
+        const mergedTools = reqTools.concat(SHANNON_TASK_TOOLS.filter((e) => !reqTools.some((r) => r && r.name === e.name)));
+        const toolNames = mergedTools.map((t) => (t && t.name) || '').filter(Boolean);
+        // 09-04 FIX #5 CLASS ROUTING: pi runs one agent per vuln class; the
+        // host-side deliverable executors need the class to name the files
+        // (<class>_exploitation_queue.json). Detect it from the task's role
+        // line ("You are an ... Analysis Specialist") — the exact headers pi
+        // uses in its per-class prompts.
+        const SHANNON_CLASS_RE = [
+            [/Injection Analysis Specialist/i, 'injection'],
+            [/Cross-Site Scripting/i, 'xss'],
+            [/Server-Side Request Forgery/i, 'ssrf'],
+            [/Authentication Analysis Specialist/i, 'auth'],
+            [/Authorization Analysis Specialist/i, 'authz'],
+        ];
+        const detectShannonClass = (text) => {
+            if (!text) return '';
+            for (const [re, cls] of SHANNON_CLASS_RE) if (re.test(text)) return cls;
+            return '';
+        };
         const CALL_RE = /CALL_TOOL:\s*([A-Za-z0-9_.-]+)\s*(\{[\s\S]*\})\s*$/m;
         const parseCall = (text) => {
             // Brace-balanced scan: find the LAST CALL_TOOL line, take the first
@@ -2005,6 +2071,11 @@ app.post('/v1/responses', async (req, res) => {
             else if (item && item.type === 'message' && item.content)
                 messages.push({
                     role: item.role === 'assistant' ? 'assistant' : 'user',
+                    content: Array.isArray(item.content) ? item.content.map(toText).join('\n') : String(item.content),
+                });
+            else if (item && item.role && item.content !== undefined)  // 09-04 FIX: pi/shannon sends type-less OpenAI items ({role,content})
+                messages.push({
+                    role: item.role === 'assistant' ? 'assistant' : (item.role === 'system' ? 'system' : 'user'),
                     content: Array.isArray(item.content) ? item.content.map(toText).join('\n') : String(item.content),
                 });
             else if (item && item.type === 'function_call_output' && item.output !== undefined)
@@ -2047,7 +2118,7 @@ app.post('/v1/responses', async (req, res) => {
                 // CALL_TOOL arguments; names alone are not enough (vuln agents
                 // never emitted submit_exploitation_queue → output-validation
                 // failed 15/15). Compact per-tool description + param schema.
-                const schemaText = (config.toolSchemaSlice ? tools.slice(0, config.toolSchemaSlice) : tools).map((t) => {
+                const schemaText = (config.toolSchemaSlice ? mergedTools.slice(0, config.toolSchemaSlice) : mergedTools).map((t) => {
                     const nm = t.name || '';
                     const desc = String(t.description || '').slice(0, 180);
                     let params = '';
@@ -2065,16 +2136,67 @@ app.post('/v1/responses', async (req, res) => {
                     'and optional short analysis text may follow AFTER that line.\n' +
                     'NEVER answer a tool-requiring assignment without the CALL_TOOL line.\n' +
                     'Only when a task explicitly needs no tool, answer in plain text (NO CALL_TOOL line).\n' +
-                    'Never emit code fences, markdown-ish wrappers, or the gateway json-tool block.';
+                    'Never emit code fences, markdown-ish wrappers, or the gateway json-tool block.\n' +
+                    'Read the recon deliverables with read_file at /repos/' + (process.env.GIT_ROOT ? path.basename(process.env.GIT_ROOT) : 'helpotron') + '/.shannon/deliverables/recon_deliverable.md and pre_recon_deliverable.md (the harness translates those paths for you).\n' +
+                    'If an in-process sub-agent/task tool is unavailable, do the source analysis yourself with read_file/list_dir — the harness executes them directly.\n' +
+                    'Your deliverable tools (todo_write, set_findings_summary, set_strategic_intelligence, set_safe_vectors, set_blind_spots, submit_exploitation_queue) are REAL tools in your tool list — the harness executes them directly and writes the workspace deliverables, exactly like read_file. Call submit_exploitation_queue EXACTLY ONCE when your analysis is complete (every analyzed vuln, IDs in your class namespace), then submit_answer with a one-line confirmation. Do NOT put the queue JSON inside submit_answer text.';
             }
-            const text = await enqueue(() =>
-                handleRequest(systemText, prompt, buildExecutableToolDefs(), undefined, undefined,
-                    { formatText })
-            );
+            console.log('[bridge] sysLen=' + String(systemText || '').length + ' promptLen=' + String(prompt || '').length);
+        console.log('[bridge] promptHead=' + String(prompt || '').replace(/\s+/g, ' ').slice(0, 220));
+        console.log('[bridge] promptTail=' + String(prompt || '').replace(/\s+/g, ' ').slice(-220));
+        console.log('[bridge] sysHead=' + String(systemText || '').replace(/\s+/g, ' ').slice(0, 160));
+        const text = await enqueue(() => {
+                // 09-04 FIX #5: stash the class INSIDE the mutex window (one
+                // request at a time) so every shannon deliverable tool executed
+                // during this request routes to the right class file.
+                setShannonClass(detectShannonClass(prompt));
+                return handleRequest(systemText, prompt, buildExecutableToolDefs(), undefined, undefined,
+                    { formatText });
+            });
+            let finalText = String(text || '');
+            // 09-04 FIX #5 PI CAPTURE BRIDGE: the model calls the deliverable
+            // tools through the gateway and the host-side executors already
+            // wrote the files — but pi's collector only sees function_call
+            // ITEMS in the response. Append the calls as CALL_TOOL lines so pi
+            // also executes them and its renderer composes a real
+            // <class>_analysis_deliverable.md from the captured payloads.
+            const shannonCalls = getShannonCalls();
+            if (shannonCalls.length) {
+                finalText = finalText + '\n' + shannonCalls.map((c) => 'CALL_TOOL: ' + c.name + ' ' + JSON.stringify(c.args)).join('\n');
+                console.log('[responses] appended ' + shannonCalls.length + ' CALL_TOOL lines (pi capture bridge)');
+            }
             // Paranoia guard: the lane strips leading whitespace; normalize \r.
-            return { text: String(text || '') };
+            return { text: finalText };
+        };
+        // 09-04 FIX #5: line-based companion to parseCall — reads every
+        // "CALL_TOOL: <name> <single-line-json>" line (the appended capture
+        // bridge block is single-line by construction) and emits one
+        // function_call item per line, so pi captures ALL deliverable calls
+        // (set_* + the queue) in order. Returns null when none parse — the
+        // legacy brace-walk parseCall below then handles the single-call case.
+        const parseCallBlock = (text) => {
+            if (typeof text !== 'string' || !text.includes('CALL_TOOL:')) return null;
+            const calls = [];
+            for (const line of text.split('\n')) {
+                const m = line.match(/^CALL_TOOL:\s*([A-Za-z0-9_.-]+)\s*(.*)$/);
+                if (!m || !toolNames.includes(m[1])) continue;
+                let argsObj = {};
+                const rest = m[2].trim();
+                if (rest) {
+                    try { argsObj = JSON.parse(rest); } catch { continue; }
+                }
+                calls.push({ type: 'function_call', id: 'fc_' + Math.random().toString(36).slice(2, 12),
+                    call_id: 'call_' + Math.random().toString(36).slice(2, 12),
+                    name: m[1], arguments: JSON.stringify(argsObj) });
+            }
+            return calls.length ? calls : null;
         };
         const outputFor = (text) => {
+            const pcAll = parseCallBlock(text);
+            if (pcAll) {
+                console.log('[responses] function_call block emitted:', pcAll.map((c) => c.name).join(', '));
+                return pcAll;
+            }
             const pc = parseCall(text);
             if (pc) {
                 let args = pc.args;
