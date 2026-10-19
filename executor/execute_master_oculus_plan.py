@@ -123,7 +123,7 @@ def load_deepseek_key() -> str:
 
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 DEEPSEEK_API_KEY = load_deepseek_key()
-DEEPSEEK_MODEL_FLASH = "deepseek-v4-flash"  # 2026-08-07 (user): never deepseek-chat
+DEEPSEEK_MODEL_FLASH = "deepseek-flash"  # 2026-08-07 (user): never deepseek-chat
 DEEPSEEK_MODEL_PRO = "deepseek-reasoner"
 
 SEMAPHORE_LIMIT = int(os.getenv("SEMAPHORE_LIMIT", "5"))
