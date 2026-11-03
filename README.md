@@ -488,7 +488,7 @@ plain-English answers.
 Point Codex's `model_provider` at this base URL and set `model` to `anymodel` or
 `webchat` (or the advertised `model` name) — see `GET /v1/models`.
 
-## 🔒 Sandbox (path fence for every file tool)
+## Sandbox (path fence for every file tool)
 
 `read_file`, `write_file`, `list_dir` and `run_bash` all take paths that come
 from a webchat model's output. `sandbox.js` requires every one of them to resolve
@@ -528,7 +528,7 @@ The same caveat applies to every other control in this harness: the sandbox, the
 selector allowlists and the anti-spiral detector are all in-process guardrails.
 Run the harness as a user whose files you are willing to lose.
 
-## ⚠️ Safety gates (read before enabling)
+## Safety gates (read before enabling)
 
 1. **`run_bash` is disabled by default, and double-gated.** Even with
    `BASH_ALLOWED=true` the command must also pass the path fence
@@ -777,7 +777,7 @@ Point `HARNESS_CONFIG` at a different file to use a second config.
 An empty string (or `""`) in the file means "not configured" and falls back to
 the default — it never blanks out a real value.
 
-## ⏳ Rate-limit cooldown
+## Rate-limit cooldown
 
 A webchat account throttles you for sending too fast and answers with
 **"Messages too frequent. Try again later."** (DeepSeek; `finish_reason:
@@ -847,7 +847,7 @@ exchange the tab is never navigated out from under a running tool loop. Set
 Regression tests for both behaviours live in `harness_tests/mutex_and_reset.test.js`
 (Node's built-in runner, no extra dependencies) and are run with `npm test`.
 
-## 🧪 EXPERIMENTAL — Anti-spiral (`ANTI_SPIRAL=true`)
+## Anti-spiral (`ANTI_SPIRAL=true`)
 
 > **Experimental.** Off by default and not enabled in the author's own
 > deployment — no genuine benefit has been observed there yet. Turn it on if you
@@ -877,7 +877,7 @@ On a **second** detection it stops the turn and returns the model's text with a
 warning at the top:
 
 ```
-🛑 [ANTI-SPIRAL] Generation stopped: <what looped>. The loop was cut and the
+[ANTI-SPIRAL] Generation stopped: <what looped>. The loop was cut and the
 model was told to stop narrating and do the work. Partial work may be
 incomplete — re-send to continue.
 ```
@@ -913,9 +913,9 @@ MB of decoded images stays at a few tens.
   Gemini/ChatGPT layouts break without stylesheets)
 - `BLOCKED_URLS_EXTRA='*.js*,*.json*'` strips scripts too for a pure-text
   head — nothing else on the page works, diagnostics only
-- Verify at attach time: the gateway logs `🚫 Asset blocking ON (N patterns)`
+- Verify at attach time: the gateway logs `Asset blocking ON (N patterns)`
 
-**Lean Chrome launch profile** (persistent-CDP mode):
+Lean Chrome launch profile (persistent-CDP mode):
 
 ```bash
 --disable-gpu --disable-dev-shm-usage --disable-background-networking \
@@ -927,14 +927,14 @@ The first three are the memory/CPU wins; the rest stop telemetry, sync and
 audio churn. Headless instances add `--headless=new --no-sandbox` with a
 spoofed UA. Verify a live instance with `tr '\0' ' ' < /proc/<pid>/cmdline`.
 
-**Multiple sites = multiple drivers.** This box runs two persistent Chrome
+Multiple sites = multiple drivers. This box runs two persistent Chrome
 instances: a GUI one (port 9223, watch window) and a `--headless=new` one
-(port 9224). Gemini attaches to the **headless** instance — the GUI instance
+(port 9224). Gemini attaches to the headless instance — the GUI instance
 cannot generate responses (a client-side, pre-network failure reproduced on
 fresh tabs; see the ops guide). Each gateway targets its own tab via
 `TAB_URL_SUBSTRING`, so one driver serves several chats.
 
-See **`docs/OPERATIONS_AND_PERFORMANCE.md`** — the full instruction guide:
+See `docs/OPERATIONS_AND_PERFORMANCE.md` — the full instruction guide:
 architecture (gateways / tabs / drivers), env reference, send-flow internals,
 context handoff, and troubleshooting recipes.
 
@@ -947,12 +947,12 @@ context handoff, and troubleshooting recipes.
 | Tool call not recognized | check the response shape — parser needs a balanced `{"tool","params"}` block |
 | Rate limited | rotate `WEBCHAT_URL` between chats, or run several instances |
 | Browser crashed | restart the server; cookies make reconnect painless |
-| `API Error: Stream idle timeout - no chunks received` / tab goes quiet mid-turn | **known issue, see below** — the webchat SSE stream died mid-generation; restarting the gateway is NOT enough, reload the tab (recovery below) |
+| `API Error: Stream idle timeout - no chunks received` / tab goes quiet mid-turn | known issue, see below — the webchat SSE stream died mid-generation; restarting the gateway is NOT enough, reload the tab (recovery below) |
 
-## ⚠️ Known issue: stream idle timeout / wedged tab (2026-08-15)
+## Known issue: stream idle timeout / wedged tab (2026-08-15)
 
 **Symptom.** A request errors with `API Error: Stream idle timeout - no chunks
-received`, the gateway logs `⚠️ upstream stream error (mid-SSE reset):
+received`, the gateway logs `upstream stream error (mid-SSE reset):
 terminated`, and the tab goes quiet: it stops generating mid-turn, never
 finishes, and every subsequent send queues behind the dead in-flight
 exchange. Restarting the gateway process does **not** help — a fresh instance
@@ -975,7 +975,7 @@ or `stream idle timeout`.
    connect to the tab's `webSocketDebuggerUrl` (WebSocket, send
    `suppress_origin=true` — Chrome rejects cross-origin CDP sockets
    otherwise) and issue `Page.reload`. Wait for the chat input to be found
-   (`✅ Chat input found — logged in.`).
+   (`Chat input found — logged in.`).
 2. **Restart the gateways** by PID (`kill <pid>`) so they re-attach to the
    reloaded tab. Never `pkill -f` — several unrelated processes match.
 3. **Re-stamp lost queue entries.** `injectMainReplies` advances its
@@ -996,7 +996,7 @@ when a stream dies mid-turn, the tab must be reloaded, not just the gateway.
 
 ---
 
-## 🔗 Companion Repositories & Toolchain Dependencies
+## Companion Repositories and Toolchain Dependencies
 
 2. **[`Insane-Custum-Claude-Settings`](https://github.com/ronisaguey-ux/Insane-Custum-Claude-Settings.git)**:
    - Universal Claude Code settings, PreToolUse banned action hooks, and slash commands.
