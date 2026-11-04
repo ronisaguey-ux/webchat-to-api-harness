@@ -638,3 +638,323 @@ const TOOLS: McpToolDefinition[] = [
             if (!gate) return asError('no webchat available');
             const mode = asStr(a.mode) || 'auto';
             if (!harnessesMod.MODES[mode]) return asError('unknown mode "' + mode + '"');
+
+            const env = harnessesMod.envFor([gate]);
+            const argv = harnessesMod.argvFor(h, mode, Array.isArray(a.args) ? a.args.map(String) : []);
+            const cwd = asStr(a.cwd) || process.env.HOME || REPO;
+            const wrote = harnessesMod.prepareConfigFiles(h, [gate], cwd, env);
+
+            const result: Record<string, unknown> = {
+                harness: h.id, gate: gate.id, mode, cwd, env,
+                command: (asStr(h.bin) + ' ' + argv.join(' ')).trim(),
+                configFileWritten: wrote || null,
+                warning: mode === 'yolo' ? 'YOLO: the agent may run anything, including destructive commands.' : null,
+            };
+            if (!a.spawn) {
+                result.spawned = false;
+                result.note = 'Call again with spawn:true to start it for the user.';
+                return asText(result);
+            }
+            try {
+                const child = spawn(asStr(h.bin), argv, { cwd, detached: true, stdio: 'ignore', env: { ...process.env, ...env } });
+                child.unref();
+                result.spawned = true;
+                result.pid = child.pid;
+            } catch (e) {
+                result.spawned = false;
+                result.error = (e as Error).message;
+            }
+            return asText(result);
+        },
+    ),
+    tool(
+        'webchat_launch_config',
+        'Read or write the primed launch config that `webchat connect` executes: which webchats, which harnesses, which permission mode. Set it here so the user only has to run `webchat connect`.',
+        {
+            set: {
+                type: 'object',
+                description: 'Leave out to read. Provide to write, e.g. {"gates":["gemini"],"harnesses":["opencode"],"mode":"auto"}',
+                properties: {
+                    gates: { type: 'array', items: { type: 'string' } },
+                    harnesses: { type: 'array', items: { type: 'string' } },
+                    mode: { type: 'string' }, cwd: { type: 'string' },
+                },
+            },
+        },
+        null,
+        async (a) => {
+            if (!launchMod || !gatesMod) return asError('modules unavailable');
+            const gates = gatesMod.read().gates;
+            if (a.set && typeof a.set === 'object') {
+                const next = launchMod.write(a.set);
+                const v = launchMod.validate(next, gates);
+                return asText({ written: true, launch: next, ready: v.ok, problems: v.problems });
+            }
+            const cfg = launchMod.read();
+            const v = launchMod.validate(cfg, gates);
+            return asText({ launch: cfg, ready: v.ok, problems: v.problems, summary: launchMod.summarize(cfg) });
+        },
+    ),
+    tool(
+        'webchat_doctor',
+        'Check the whole install and report what is wrong: module health, browsers, gateways, connected webchats, and whether the launch config is ready. Use this when something is broken, instead of guessing.',
+        null,
+        null,
+        async () => {
+            const out: {
+                modules: Record<string, string>;
+                gates: Array<Record<string, unknown>>;
+                launch: Record<string, unknown> | null;
+                problems: string[];
+                activeGate?: string;
+                ok?: boolean;
+            } = { modules: {}, gates: [], launch: null, problems: [] };
+            const modules: Array<[string, unknown]> = [
+                ['gates', gatesMod], ['harnesses', harnessesMod], ['settings', settingsMod],
+                ['launchconfig', launchMod], ['daemon', daemonMod],
+            ];
+            for (const [name, m] of modules) {
+                out.modules[name] = m ? 'ok' : 'MISSING';
+                if (!m) out.problems.push('module ' + name + ' failed to load');
+            }
+            if (gatesMod) {
+                const { gates, active } = gatesMod.read();
+                out.activeGate = active;
+                for (const g of gates) {
+                    const probe = await gatesMod.probe(g);
+                    const gw = await httpJson('GET', gatewayBase(g) + '/health', null, 3000);
+                    const conn = await liveConnection(g);
+                    const row: Record<string, unknown> = {
+                        id: g.id, connected: conn.connected, browserRunning: probe.running,
+                        gatewayReachable: gw.ok, gatewayHealthy: Boolean(pick(gw.body, 'browserAlive')),
+                    };
+                    if (!conn.connected && conn.why) row.notConnectedWhy = conn.why;
+                    if (!conn.verified) row.connectedNote = 'could not verify — showing the recorded flag';
+                    // Keep reporting a stored flag that contradicts reality: it is a state the
+                    // user should know about, not something to hide now that we probe instead.
+                    if (g.connected && !conn.connected) {
+                        row.problem = 'marked connected but not usable right now'
+                            + (conn.why ? ` (${conn.why})` : '');
+                        out.problems.push(g.id + ': ' + String(row.problem));
+                    }
+                    (out.gates as Array<Record<string, unknown>>).push(row);
+                }
+                if (!gates.length) out.problems.push('no webchats configured');
+            }
+            if (launchMod && gatesMod) {
+                const cfg = launchMod.read();
+                const v = launchMod.validate(cfg, gatesMod.read().gates);
+                out.launch = { config: cfg, ready: v.ok, problems: v.problems };
+                out.problems.push(...v.problems);
+            }
+            out.ok = out.problems.length === 0;
+            return asText(out);
+        },
+    ),
+
+    // ── platform & per-item control ──────────────────────────────────────────
+    tool(
+        'webchat_platform',
+        'Read or set the target platform (linux | windows). This ONE choice decides the shell a command runs in, how paths are spelled, which command patterns are refused, and which roots the sandbox grants — call it before generating any command or path, so the work matches the machine it is for rather than the machine the harness happens to run on.',
+        { platform: S('Omit to read. Pass "linux" or "windows" to set.') },
+        null,
+        async (a) => {
+            const plat = safeRequireTyped<PlatformModule>('../core/platform');
+            if (!plat) return asError('platform module unavailable');
+            if (a.platform === undefined) {
+                return asText({
+                    platform: plat.current(),
+                    host: plat.hostPlatform(),
+                    shell: plat.shell().name,
+                    syntaxHint: plat.shellHint(),
+                    sandboxRoots: plat.defaultRoots(),
+                });
+            }
+            const norm = plat.normalize(a.platform);
+            if (!norm) return asError('platform must be linux or windows, got "' + a.platform + '"');
+            const res = settingsMod ? settingsMod.saveSetting('platform', norm) : { ok: false, reason: 'settings unavailable' };
+            if (!res.ok) return asError(res.reason);
+            plat.setPlatform(norm);
+            return asText({
+                platform: plat.current(),
+                shell: plat.shell().name,
+                syntaxHint: plat.shellHint(),
+                effective: !res.shadowed,
+                note: res.shadowed
+                    ? res.shadowedBy + ' overrides this — clear it for the file value to apply.'
+                    : 'A running gateway picks this up on restart.',
+            });
+        },
+    ),
+    tool(
+        'webchat_tool_toggle',
+        'Switch one of the webchat model\'s own tools on or off (read_file, run_bash, edit_file, …). A tool switched off is NOT offered to the model at all, so it never tries it and loops on the error. Call webchat_tools_list first to see the real names.',
+        { tool: S('Tool name, e.g. run_bash'), enabled: B('true to offer it, false to switch it off.') },
+        ['tool', 'enabled'],
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            const t = safeRequireTyped<ToolsModule>(require('path').join(__dirname, '..', '..', 'src', 'tools', 'tools'));
+            if (t && !t.getToolDefinitions().some((d) => d.name === a.tool)) {
+                return asError('unknown tool "' + a.tool + '" — known: ' + t.getToolDefinitions().map((d) => d.name).join(', '));
+            }
+            const res = settingsMod.saveSetting('tools.disabled::' + a.tool, Boolean(a.enabled));
+            if (!res.ok) return asError(res.reason);
+            return asText({ tool: a.tool, enabled: Boolean(a.enabled), saved: res.shadowed ? 'but env-shadowed' : true });
+        },
+    ),
+    tool(
+        'webchat_prompt',
+        'Read or set a system prompt. Set `gate` to edit that webchat\'s prompt alone; omit it to edit the shared prompt that applies to any webchat without its own. An empty `text` clears the override.',
+        { gate: S('Webchat id — omit for the shared prompt.'), text: S('The prompt. Omit to read it instead of writing.') },
+        null,
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            const dotted = a.gate ? 'systemPrompt.perMode' : 'systemPrompt.text';
+            if (a.text === undefined) {
+                const loaded = settingsMod.loadRaw();
+                const raw = loaded.raw || {};
+                if (!a.gate) return asText({ shared: settingsMod.getPath(raw, 'systemPrompt.text') || '' });
+                const map = (settingsMod.getPath(raw, 'systemPrompt.perMode') || {}) as Record<string, unknown>;
+                const gateId = asStr(a.gate);
+                return asText({ gate: gateId, prompt: map[gateId] || '', usesSharedFallback: !map[gateId] });
+            }
+            const loaded = settingsMod.loadRaw();
+            const raw = loaded.raw || {};
+            if (!a.gate) {
+                settingsMod.setPath(raw, 'systemPrompt.text', String(a.text));
+            } else {
+                const map = Object.assign({}, settingsMod.getPath(raw, 'systemPrompt.perMode') || {}) as Record<string, unknown>;
+                const gateId = asStr(a.gate);
+                if (String(a.text).trim() === '') delete map[gateId];
+                else map[gateId] = String(a.text);
+                settingsMod.setPath(raw, 'systemPrompt.perMode', map);
+            }
+            settingsMod.saveRaw(raw, loaded.file);
+            return asText({ saved: true, scope: a.gate || 'shared (all webchats without their own)' });
+        },
+    ),
+    tool(
+        'webchat_window',
+        'Move the harness browser window: raise, minimise, maximise, or read its state. Cross-platform over CDP, so it is not X11-only. Use raise when the user must log in by hand, then drop so it stays out of their way.',
+        { action: S('status | raise | drop | maximize'), gate: S('Webchat id. Defaults to the active one.') },
+        ['action'],
+        async (a) => {
+            const { spawnSync } = require('child_process');
+            const script = require('path').join(REPO, 'scripts', 'show-window.sh');
+            const gate = await pickGate(asStr(a.gate));
+            const env = Object.assign({}, process.env);
+            if (gate && gate.cdpPort) env.CDP_PORT = String(gate.cdpPort);
+            const r = spawnSync('bash', [script, a.action], { env, encoding: 'utf-8', timeout: 20000 });
+            const out = ((r.stdout || '') + (r.stderr || '')).trim();
+            if (r.status !== 0) return asError(out || ('window ' + a.action + ' failed'));
+            return asText(out || ('window ' + a.action + ': ok'));
+        },
+    ),
+
+    // ── subagents ────────────────────────────────────────────────────────────
+    // A "webchat subagent" is a task put through a webchat that keeps running while the
+    // caller does something else. webchat_ask BLOCKS for the whole answer (minutes, for a
+    // real task), which makes running three of them impossible from one agent. These
+    // spawn detached processes and hand back a job id instead, so several webchats can
+    // work in parallel and the caller polls for results.
+    tool(
+        'webchat_subagent_spawn',
+        'Start a task on a webchat and return immediately with a job id. The webchat works in the background — this is how you run several webchats in parallel instead of waiting on each. Poll webchat_subagent_list for state, then webchat_subagent_result for the answer.',
+        {
+            prompt: S('The task for the subagent.'),
+            gate: S('Which webchat to use. Defaults to the active one.'),
+            label: S('A short name so you can tell jobs apart.'),
+            timeoutMs: { type: 'number', description: 'Give up after this long. Default 30 min.' },
+        },
+        ['prompt'],
+        async (a) => {
+            const gate = await pickGate(asStr(a.gate));
+            if (!gate) return asError('no webchat available — call webchat_gate_add then webchat_gate_launch');
+            const sub = safeRequireTyped<SubagentsModule>('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            const job = sub.spawn({ prompt: String(a.prompt), gate: gate.id, label: a.label, timeoutMs: a.timeoutMs });
+            return asText({ jobId: job.id, gate: gate.id, state: job.state, hint: 'Poll webchat_subagent_list, then webchat_subagent_result with this id.' });
+        },
+    ),
+    tool(
+        'webchat_subagent_list',
+        'List every subagent job: which are running, done, failed or timed out, how long each has run, and a one-line preview. Call this before spawning duplicates.',
+        { state: S('Optional filter: running | done | failed | timeout') },
+        null,
+        async (a) => {
+            const sub = safeRequireTyped<SubagentsModule>('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            return asText(sub.list({ state: a.state === undefined ? undefined : asStr(a.state) }));
+        },
+    ),
+    tool(
+        'webchat_subagent_result',
+        'Fetch a subagent job\'s answer, or the error it failed with. Waits up to waitMs for a running job to finish, so you can poll without hammering.',
+        {
+            id: S('Job id from webchat_subagent_spawn.'),
+            waitMs: { type: 'number', description: 'How long to wait for it to finish. Default 0 (return immediately). Max 600000.' },
+        },
+        ['id'],
+        async (a) => {
+            const sub = safeRequireTyped<SubagentsModule>('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            const job = await sub.result(asStr(a.id), Math.min(Math.max(Number(a.waitMs) || 0, 0), 600000));
+            if (!job) return asError('no job with id ' + a.id);
+            return asText(job);
+        },
+    ),
+    tool(
+        'webchat_subagent_cancel',
+        'Stop a running subagent job. Safe to call on a job that already finished — it reports that instead of failing.',
+        { id: S('Job id.') },
+        ['id'],
+        async (a) => {
+            const sub = safeRequireTyped<SubagentsModule>('../runtime/subagents');
+            if (!sub) return asError('subagent runtime unavailable');
+            const r = sub.cancel(asStr(a.id));
+            return r.ok ? asText(r) : asError(r.reason || 'cancel failed');
+        },
+    ),
+];
+
+// ── JSON-RPC over stdio ───────────────────────────────────────────────────────
+
+function send(obj: unknown): void {
+    process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+interface JsonRpcRequest {
+    id?: number | string | null;
+    method?: string;
+    params?: { name?: string; arguments?: ToolArgs };
+}
+
+async function handle(msg: JsonRpcRequest): Promise<void> {
+    const id = msg && msg.id;
+    const method = msg && msg.method;
+
+    if (method === 'initialize') {
+        return send({
+            jsonrpc: '2.0', id,
+            result: {
+                protocolVersion: PROTOCOL_VERSION,
+                capabilities: { tools: { listChanged: false } },
+                serverInfo: { name: 'webchat-harness', version: '1.0.0' },
+            },
+        });
+    }
+    // A notification carries no id and expects no reply.
+    if (method === 'notifications/initialized' || method === 'initialized') return;
+
+    if (method === 'tools/list') {
+        return send({
+            jsonrpc: '2.0', id,
+            result: { tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) },
+        });
+    }
+
+    if (method === 'tools/call') {
+        const name = msg.params && msg.params.name;
+        const args: ToolArgs = (msg.params && msg.params.arguments) || {};
+        const t = TOOLS.find((x) => x.name === name);
+        if (!t) {
