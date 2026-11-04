@@ -318,3 +318,323 @@ const asError = (s: unknown): ToolReply => ({ content: [{ type: 'text', text: ty
 
 export interface McpToolDefinition {
     name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+    handler: (args: ToolArgs) => unknown;
+}
+
+// Shorthand for a tool's boilerplate.
+function tool(
+    name: string,
+    description: string,
+    props: Record<string, unknown> | null,
+    required: string[] | null,
+    handler: (args: ToolArgs) => unknown,
+): McpToolDefinition {
+    return {
+        name,
+        description,
+        inputSchema: { type: 'object', properties: props || {}, ...(required ? { required } : {}) },
+        handler,
+    };
+}
+const S = (description: string): { type: string; description: string } => ({ type: 'string', description });
+const B = (description: string): { type: string; description: string } => ({ type: 'boolean', description });
+
+// ── the tools ─────────────────────────────────────────────────────────────────
+
+const TOOLS: McpToolDefinition[] = [
+    // ── discovery ────────────────────────────────────────────────────────────
+    tool(
+        'webchat_status',
+        'Everything about the harness right now: which webchats exist, whether each browser is running, and — for the active one — the live gateway numbers (uptime, sends, in-flight state, latency, pacing, throttle cooldown). Call this first; it tells you whether the rest will work.',
+        { gate: S('Webchat id. Defaults to the active one.') },
+        null,
+        async (a) => {
+            if (!gatesMod) return asError('gates module unavailable');
+            const { gates, active } = gatesMod.read();
+            // The gate the gateway numbers are attached to. NOT `active || gates[0]`: the
+            // recorded active gate goes stale (measured: active=gemini while gemini was
+            // signed out), so the one row carrying live numbers described a dead lane.
+            const defaultGate = await pickGate(asStr(a.gate));
+            const out: Record<string, unknown> = {
+                activeGate: active,
+                defaultGate: defaultGate ? defaultGate.id : null,
+                launch: launchMod ? launchMod.read() : null,
+                gates: [] as Array<Record<string, unknown>>,
+            };
+            for (const g of gates) {
+                const probe = await gatesMod.probe(g);
+                // Verified live, not the stored flag: an agent acts on what it reads here,
+                // and the stored flag outlives the browser it describes.
+                const conn = await liveConnection(g);
+                const row: Record<string, unknown> = {
+                    id: g.id, label: g.label, site: g.site, url: g.url,
+                    connected: conn.connected, browserRunning: probe.running, tabs: probe.tabs,
+                };
+                if (!conn.connected && conn.why) row.notConnectedWhy = conn.why;
+                if (!conn.verified) row.connectedNote = 'could not verify — showing the recorded flag';
+                if (defaultGate && g.id === defaultGate.id) {
+                    const h = await httpJson('GET', gatewayBase(g) + '/metrics', null, 4000);
+                    row.gateway = h.ok && h.body ? h.body : { reachable: false, error: h.error || 'HTTP ' + h.status };
+                    row.default = true;
+                }
+                (out.gates as Array<Record<string, unknown>>).push(row);
+            }
+            if (!gates.length) out.hint = 'No webchats yet. Call webchat_gate_add, then webchat_gate_launch so the user can log in.';
+            return asText(out);
+        },
+    ),
+    tool(
+        'webchat_tools_list',
+        'List the tools the webchat model itself may call (read_file, run_bash, …) and which are switched off by config.',
+        null,
+        null,
+        async () => {
+            // src/tools/tools.ts is not converted yet: reach the source file from dist/.
+            const t = safeRequireTyped<ToolsModule>(require('path').join(__dirname, '..', '..', 'src', 'tools', 'tools'));
+            if (!t) return asError('tools module unavailable');
+            return asText({
+                advertised: t.getExecutableToolDefinitions().map((d) => ({ name: d.name, description: d.description })),
+                all: t.getToolDefinitions().map((d) => ({ name: d.name, available: t.isToolAvailable(d.name) })),
+            });
+        },
+    ),
+
+    // ── webchats ─────────────────────────────────────────────────────────────
+    tool(
+        'webchat_gate_add',
+        'Create a webchat. Sites: gemini, chatgpt, deepseek, kimi, notegpt, or generic — generic opens an EMPTY browser and the user navigates to any site themselves, which is how an unlisted webchat is supported. Each gets its own Chrome profile and ports so several run at once.',
+        { site: S('gemini | chatgpt | deepseek | kimi | notegpt | generic'), label: S('A name to recognise in a list.'), url: S('Override the start URL.') },
+        ['site'],
+        async (a) => {
+            if (!gatesMod) return asError('gates module unavailable');
+            const site = gatesMod.siteById(asStr(a.site));
+            if (!site) return asError('unknown site "' + a.site + '" — known: ' + gatesMod.SITES.map((x) => x.id).join(', '));
+            const { gates } = gatesMod.read();
+            const gate = gatesMod.add({ site: site.id, label: asStr(a.label), url: asStr(a.url) || site.url, cdpPort: 9225 + gates.length, gatewayPort: 8081 + gates.length });
+            // The gate just created is what the caller means next. Without this, every
+            // later tool that omits `gate` falls back to gates[0] — so adding a SECOND
+            // webchat and then launching would launch the first one instead.
+            gatesMod.setActive(gate.id);
+            return asText({ created: gate, next: 'Call webchat_gate_launch so a browser opens for the user to log into.' });
+        },
+    ),
+    tool(
+        'webchat_gate_launch',
+        "Open a webchat's browser VISIBLY on the user's own screen so they can log in. This is the one step that needs a human: we cannot detect a login (a signed-out page can look signed-in), so the user must confirm it.",
+        { gate: S('Webchat id. Defaults to the active one.') },
+        null,
+        async (a) => {
+            if (!gatesMod || !daemonMod) return asError('modules unavailable');
+            const gate = await pickGate(asStr(a.gate));
+            if (!gate) return asError('no such webchat — call webchat_gate_add first');
+            const res = daemonMod.launchBrowser({ cdpPort: gate.cdpPort, profile: asStr(gate.profile), url: asStr(gate.url) || 'about:blank' });
+            if (!res || res.error) return asError({ launched: false, error: (res && res.error) || 'launch failed' });
+            return asText({
+                launched: true, gate: gate.id,
+                tell_the_user: 'A browser window is open for "' + gate.label + '". Log in there, then tell me it is done.',
+                then: 'Call webchat_gate_confirm to record it as connected.',
+            });
+        },
+    ),
+    tool(
+        'webchat_gate_confirm',
+        'Record that the user has logged in. Only call this AFTER the user says they are signed in — the harness cannot verify a login, so this flag is their statement, not ours.',
+        { gate: S('Webchat id. Defaults to the active one.') },
+        null,
+        async (a) => {
+            if (!gatesMod) return asError('gates module unavailable');
+            const gate = await pickGate(asStr(a.gate));
+            if (!gate) return asError('no such webchat');
+            const probe = await gatesMod.probe(gate);
+            gatesMod.update(gate.id, { connected: true, liveTabUrl: probe.liveTabUrl || null, connectedAt: new Date().toISOString() });
+            gatesMod.setActive(gate.id);
+            return asText({
+                connected: gate.id, browserRunning: probe.running, tabs: probe.tabs,
+                warning: probe.running ? null : 'The browser is not answering on its debug port — the user may have closed it.',
+            });
+        },
+    ),
+    tool(
+        'webchat_gate_remove',
+        'Forget a webchat. Its Chrome profile is left on disk, so re-adding it does not require logging in again.',
+        { gate: S('Webchat id.') },
+        ['gate'],
+        async (a) => {
+            if (!gatesMod) return asError('gates module unavailable');
+            return asText({ removed: gatesMod.remove(asStr(a.gate)), gate: a.gate });
+        },
+    ),
+
+    // ── config ───────────────────────────────────────────────────────────────
+    tool(
+        'webchat_config_list',
+        'The harness settings, each with its effective value and WHERE it came from (environment variable, config file, or default). Use this to explain the harness, or before changing anything.',
+        null,
+        null,
+        async () => {
+            if (!settingsMod) return asError('settings module unavailable');
+            const loaded = settingsMod.loadRaw();
+            return asText({
+                file: loaded.file,
+                settings: settingsMod.resolveAll(loaded.raw).map((r) => ({
+                    path: r.setting.path, group: r.group, value: r.value,
+                    source: r.source, shadowedBy: r.shadowedBy || null, help: r.setting.help || null,
+                })),
+            });
+        },
+    ),
+    tool(
+        'webchat_config_get',
+        'Read one setting by dotted path, e.g. permission.mode or tools.disabled.',
+        { path: S('Dotted setting path.') },
+        ['path'],
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            const raw = settingsMod.loadRaw().raw;
+            const row = settingsMod.resolveAll(raw).find((r) => r.setting.path === asStr(a.path));
+            if (!row) return asError('no setting named "' + asStr(a.path) + '"');
+            return asText({ path: row.setting.path, value: row.value, source: row.source, shadowedBy: row.shadowedBy || null });
+        },
+    ),
+    tool(
+        'webchat_config_set',
+        'Change one setting by dotted path. Says whether the write actually took effect — a value shadowed by an environment variable is saved and still ignored, and this reports that instead of claiming success.',
+        { path: S('e.g. permission.mode, tools.disabled, systemPrompt.text'), value: { description: 'The new value. An array for list settings.' } },
+        ['path', 'value'],
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            const res = settingsMod.saveSetting(asStr(a.path), a.value);
+            if (!res.ok) return asError(res.reason);
+            if (res.shadowed) {
+                return asText({
+                    saved: true, effective: false, shadowedBy: res.shadowedBy,
+                    note: 'Written to the config file, but ' + res.shadowedBy + ' overrides it. Clear that variable for this to take effect.',
+                });
+            }
+            return asText({ saved: true, effective: true, value: (res as { value?: unknown }).value });
+        },
+    ),
+
+    // ── putting work through the webchat ─────────────────────────────────────
+    tool(
+        'webchat_config_reset',
+        'Reset one setting to its built-in default. Removes BOTH the config-file value and any environment variable overriding it, and says which it removed — clearing only the file would leave the env var in charge and the setting unchanged, which reads as "reset did nothing".',
+        { path: S('Dotted setting path, e.g. permission.mode. Use webchat_config_list to see them.') },
+        ['path'],
+        async (a) => {
+            if (!settingsMod) return asError('settings module unavailable');
+            if (typeof settingsMod.resetSetting !== 'function') return asError('this build has no resetSetting');
+            const r = settingsMod.resetSetting(asStr(a.path));
+            return r.ok ? asText(r) : asError(r.reason);
+        },
+    ),
+    tool(
+        'webchat_ask',
+        "Send a prompt through a webchat and get the model's answer — this is the 'use a webchat as a subagent' tool. The question goes to the real webchat through the user's own logged-in account, with the harness's tools available to it.",
+        {
+            prompt: S('What to ask, or the task to perform.'),
+            gate: S('Which webchat. Defaults to the active one.'),
+            model: S('Override the model id sent to the gateway.'),
+            timeoutMs: { type: 'number', description: 'How long to wait. Default 15 min — a webchat can genuinely think for minutes.' },
+        },
+        ['prompt'],
+        async (a) => {
+            const gate = await pickGate(asStr(a.gate));
+            if (!gate) return asError('no webchat available — call webchat_gate_add then webchat_gate_launch');
+            const res = await httpJson('POST', gatewayBase(gate) + '/v1/chat/completions', {
+                model: asStr(a.model) || 'webchat/' + gate.id,
+                messages: [{ role: 'user', content: String(a.prompt) }],
+                stream: false,
+            }, asNum(a.timeoutMs, 900000));
+            if (!res.ok) return asError('gateway unreachable on ' + gatewayBase(gate) + ': ' + res.error);
+            if (res.status !== 200) return asError({ status: res.status, body: res.body || String(res.raw).slice(0, 500) });
+            const choices = pick(res.body, 'choices');
+            const firstChoice = Array.isArray(choices) ? choices[0] : undefined;
+            const replyText = pick(firstChoice, 'message', 'content') ?? null;
+            return asText({ gate: gate.id, reply: replyText });
+        },
+    ),
+    tool(
+        'webchat_newchat',
+        'Reset the webchat conversation. Do this before delegating a NEW task — otherwise the model answers inside whatever conversation was already open. The harness verifies the thread actually emptied and refuses if it did not.',
+        { gate: S('Webchat id.') },
+        null,
+        async (a) => {
+            const gate = await pickGate(asStr(a.gate));
+            if (!gate) return asError('no webchat available');
+            const res = await httpJson('POST', gatewayBase(gate) + '/newchat', {}, 180000);
+            if (!res.ok) return asError('gateway unreachable: ' + res.error);
+            return asText({ status: res.status, body: res.body || String(res.raw).slice(0, 300) });
+        },
+    ),
+    tool(
+        'webchat_handoff',
+        'Swap the webchat to a fresh thread AND seed it with a document in one step. Use when a conversation gets long: the model begins the new thread already holding the context you pass.',
+        { content: S('What the new thread should start with.'), gate: S('Webchat id.') },
+        ['content'],
+        async (a) => {
+            const gate = await pickGate(asStr(a.gate));
+            if (!gate) return asError('no webchat available');
+            const res = await httpJson('POST', gatewayBase(gate) + '/handoff', { content: String(a.content) }, 300000);
+            if (!res.ok) return asError('gateway unreachable: ' + res.error);
+            return asText({ status: res.status, body: res.body || String(res.raw).slice(0, 300) });
+        },
+    ),
+    tool(
+        "webchat_call_tool",
+        "Run one of the harness's own tools directly, without a model in between. The user's disabled-tool list and every safety gate still apply — this is the same permission the model gets.",
+        {
+            tool: S('e.g. read_file, list_dir, run_bash, git_status'),
+            args: { type: 'object', description: "The tool's arguments." },
+        },
+        ['tool'],
+        async (a) => {
+            // src/tools/tools.ts is not converted yet: reach the source file from dist/.
+            const t = safeRequireTyped<ToolsModule>(require('path').join(__dirname, '..', '..', 'src', 'tools', 'tools'));
+            if (!t) return asError('tools module unavailable');
+            if (!t.isToolAvailable(asStr(a.tool))) {
+                return asError('"' + a.tool + '" is not available — it is switched off in tools.disabled, or its requirement is unmet.');
+            }
+            return asText(await t.executeTool(asStr(a.tool), a.args || {}));
+        },
+    ),
+
+    // ── launching agents ─────────────────────────────────────────────────────
+    tool(
+        'webchat_harness_list',
+        'The agentic harnesses that can be launched against a webchat, which are installed here, and the permission modes available.',
+        null,
+        null,
+        async () => {
+            if (!harnessesMod) return asError('harnesses module unavailable');
+            return asText({
+                harnesses: harnessesMod.HARNESSES.map((h) => ({
+                    id: h.id, label: h.label, bin: h.bin,
+                    installed: harnessesMod.installed(h), note: h.note, modes: Object.keys(h.modes || {}),
+                })),
+                modes: Object.values(harnessesMod.MODES),
+            });
+        },
+    ),
+    tool(
+        'webchat_launch_agent',
+        'Point an agentic harness (opencode, Claude Code, Codex, Claw Code, aider, …) at the webchat so the agent uses the webchat as its model. Returns the exact command and environment; with spawn=true it starts it detached for the user.',
+        {
+            harness: S('e.g. opencode, claude, codex, claw, aider'),
+            gate: S('Webchat id. Defaults to the active one.'),
+            mode: S('manual | auto | yolo. Default auto.'),
+            cwd: S('Working directory for the agent.'),
+            spawn: B('Actually start it, detached, instead of only returning the command.'),
+            args: { type: 'array', items: { type: 'string' }, description: 'Extra argv for the harness.' },
+        },
+        ['harness'],
+        async (a) => {
+            if (!harnessesMod || !daemonMod) return asError('modules unavailable');
+            const h = harnessesMod.harnessById(asStr(a.harness));
+            if (!h) return asError('unknown harness "' + a.harness + '" — known: ' + harnessesMod.HARNESSES.map((x) => x.id).join(', '));
+            const gate = await pickGate(asStr(a.gate));
+            if (!gate) return asError('no webchat available');
+            const mode = asStr(a.mode) || 'auto';
+            if (!harnessesMod.MODES[mode]) return asError('unknown mode "' + mode + '"');
