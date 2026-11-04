@@ -8,14 +8,14 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "tsc --noEmit -p tsconfig.json && node --check server.js && node --check bin/webchat.js",
-    "test": "node --test --test-concurrency=1 harness_tests/*.test.js && node harness_tests/cli_smoke.js && bash harness_tests/verify-launchers.sh",
-    "test:unit": "node --test --test-concurrency=1 harness_tests/*.test.js",
-    "test:smoke": "node harness_tests/cli_smoke.js && bash harness_tests/verify-launchers.sh",
-    "test:tui": "node harness_tests/cli_smoke.js",
+    "check": "tsc --noEmit -p tsconfig.json && node --check server.js && node --check cli/index.js && node --check src/tools/tools.js && node --check src/browser/browser.js && node --check bin/webchat.js",
+    "test": "npm run build && node --test --test-concurrency=1 harness_tests/*.test.js && node harness_tests/cli_smoke.js && bash harness_tests/verify-launchers.sh",
+    "test:unit": "npm run build && node --test --test-concurrency=1 harness_tests/*.test.js",
+    "test:smoke": "npm run build && node harness_tests/cli_smoke.js && bash harness_tests/verify-launchers.sh",
+    "test:tui": "npm run build && node harness_tests/cli_smoke.js",
     "test:all": "npm run test",
     "webchat": "node bin/webchat.js",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('fs'),path=require('path');const walk=(d)=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(path.join(d,e.name)):[path.join(d,e.name)]);for(const f of walk('src')){if(!f.endsWith('.json'))continue;const out=path.join('dist',path.relative('src',f));fs.mkdirSync(path.dirname(out),{recursive:true});fs.copyFileSync(f,out)}\""
   },
   "dependencies": {
     "cors": "^2.8.5",

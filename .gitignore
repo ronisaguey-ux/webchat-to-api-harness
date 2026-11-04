@@ -107,3 +107,6 @@ node_modules/
 
 # TypeScript build output (npm run build)
 /dist/
+
+# NOTE: the .js shims beside the compiled modules ARE tracked on purpose —
+# they keep every pre-existing require() path working. Do not gitignore them.
