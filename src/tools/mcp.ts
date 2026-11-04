@@ -318,3 +318,189 @@ class McpServer {
         const initRecord = init && typeof init === 'object' ? init as Record<string, unknown> : {};
         this.serverInfo = (initRecord.serverInfo && typeof initRecord.serverInfo === 'object')
             ? initRecord.serverInfo as Record<string, unknown>
+            : {};
+    }
+
+    async listTools(): Promise<McpToolInfo[]> {
+        await this.connect();
+        if (this.tools) return this.tools;
+        const res = await (this.transport as McpTransport).send('tools/list', {});
+        const record = res && typeof res === 'object' ? res as Record<string, unknown> : {};
+        this.tools = Array.isArray(record.tools) ? record.tools as McpToolInfo[] : [];
+        return this.tools;
+    }
+
+    async callTool(toolName: string, args: unknown): Promise<unknown> {
+        await this.connect();
+        return (this.transport as McpTransport).send('tools/call', { name: toolName, arguments: args || {} });
+    }
+
+    close(): void {
+        if (this.transport) this.transport.close();
+        this.transport = null;
+        this.tools = null;
+    }
+}
+
+// The pool owns discovery and routing. Discover is lazy and fail-open: every
+// server is tried once; a failure is logged and that server is dropped from the
+// executable set, never retried on the send path.
+class McpPool {
+    servers: McpServer[];
+    _serverByName: Map<string, McpServer>;
+    _listed: Set<string>;
+    _external: McpExternalTool[];
+    _byName: Map<string, McpExternalTool>;
+
+    constructor(servers: McpServerSpec[] = []) {
+        this.servers = [];
+        this._serverByName = new Map();
+        // Per-server, not one global latch: a server is listed once, and a server that
+        // arrives later (config edited while the gateway runs) is listed on its own.
+        this._listed = new Set();
+        this._external = [];   // [{ name: '<server>.<tool>', _mcp, def }]
+        this._byName = new Map();
+        this._addServers(servers);
+    }
+
+    get configured(): number { return this.servers.length; }
+
+    _addServers(servers: McpServerSpec[] = []): McpServer[] {
+        const added: McpServer[] = [];
+        for (const s of servers) {
+            if (!s || !s.name || this._serverByName.has(s.name)) continue;
+            const srv = new McpServer(s.name, s);
+            this.servers.push(srv);
+            this._serverByName.set(s.name, srv);
+            added.push(srv);
+        }
+        return added;
+    }
+
+    // Drop a server that is no longer in the config, along with every tool it published.
+    // Leaving it advertised would offer the model a tool whose server is gone.
+    _dropServer(srv: McpServer): void {
+        this.servers = this.servers.filter((s) => s !== srv);
+        this._serverByName.delete(srv.name);
+        this._listed.delete(srv.name);
+        const prefix = `${srv.name}.`;
+        this._external = this._external.filter((d) => !String(d.name).startsWith(prefix));
+        for (const k of [...this._byName.keys()]) {
+            if (k.startsWith(prefix)) this._byName.delete(k);
+        }
+        try { srv.close(); } catch { /* already gone */ }
+    }
+
+    async discover(): Promise<McpExternalTool[]> {
+        await this._listServers(this.servers);
+        return this._external;
+    }
+
+    // 2026-09-26 (owner): "any new mcps added should automatically show up".
+    // Discovery used to run once and latch for the life of the process, so an MCP added
+    // to the config while the gateway was running did not exist until a restart — which
+    // reads as the feature being broken. sync() reconciles the pool against the config
+    // it is handed and lists only what is new, so a new entry appears on the next
+    // request. Returns how many servers were added or removed, so a caller can tell
+    // "nothing changed" from "the set moved" without re-serialising every definition.
+    async sync(servers: McpServerSpec[] = []): Promise<number> {
+        const wanted = new Set<string>();
+        for (const s of servers) if (s && s.name) wanted.add(s.name);
+
+        let changes = 0;
+        for (const srv of this.servers.filter((s) => !wanted.has(s.name))) {
+            this._dropServer(srv);
+            changes++;
+        }
+        const added = this._addServers(servers);
+        if (added.length) {
+            await this._listServers(added);
+            changes += added.length;
+        }
+        return changes;
+    }
+
+    async _listServers(list: McpServer[]): Promise<McpExternalTool[]> {
+        for (const srv of list) {
+            if (this._listed.has(srv.name)) continue;
+            this._listed.add(srv.name);
+            try {
+                const tools = await srv.listTools();
+                for (const tool of tools) {
+                    const name = `${srv.name}.${tool.name}`;
+                    const def: McpExternalTool = {
+                        name,
+                        category: 'mcp',
+                        description: `[MCP ${srv.name}] ${tool.description || tool.name}`,
+                        parameters: tool.inputSchema || { type: 'object', properties: {} },
+                        // Marker so executeTool knows to route to the pool.
+                        _mcp: { server: srv.name, tool: tool.name },
+                    };
+                    this._external.push(def);
+                    this._byName.set(name, def);
+                }
+                console.log(`🔌 MCP ${srv.name}: ${tools.length} tool(s) discovered`);
+            } catch (e) {
+                console.log(`⚠️ MCP ${srv.name} unreachable — tools not advertised (${String((e as Error).message).slice(0, 80)})`);
+                srv.close();
+            }
+        }
+        return this._external;
+    }
+
+    externalDefinitions(): Array<Omit<McpExternalTool, '_mcp'>> {
+        return this._external.map(({ _mcp, ...def }) => def);
+    }
+
+    has(name: string): boolean { return this._byName.has(name); }
+
+    async execute(name: string, args: unknown): Promise<McpToolResult> {
+        const def = this._byName.get(name);
+        if (!def) return { success: false, error: `unknown MCP tool: ${name}` };
+        const srv = this._serverByName.get(def._mcp.server);
+        if (!srv) return { success: false, error: `unknown MCP server: ${def._mcp.server}` };
+        try {
+            const result = await srv.callTool(def._mcp.tool, args);
+            // Normalise the MCP result (content blocks / structuredContent) into
+            // the harness's plain-object shape so formatToolResultView can render it.
+            return normalizeMcpResult(result);
+        } catch (e) {
+            return { success: false, error: `MCP ${name}: ${(e as Error).message}` };
+        }
+    }
+
+    closeAll(): void {
+        for (const srv of this.servers) srv.close();
+        this.servers = [];
+        this._serverByName.clear();
+        this._listed.clear();
+        this._external = [];
+        this._byName.clear();
+    }
+}
+
+// A tools/call result is { content: [{type:'text'|'image', text, ...}], isError }.
+// Flatten to something the harness's receipt renderer and the model both read.
+function normalizeMcpResult(result: unknown): McpToolResult {
+    if (!result || typeof result !== 'object') return { success: true, content: String(result) };
+    const record = result as Record<string, unknown>;
+    const content = Array.isArray(record.content) ? record.content : [];
+    if (record.isError) {
+        const err = content.map((c) => {
+            const block = c && typeof c === 'object' ? c as Record<string, unknown> : {};
+            return block.text ? String(block.text) : '';
+        }).join('\n');
+        return { success: false, error: err || 'mcp tool returned an error' };
+    }
+    const parts: string[] = [];
+    for (const block of content) {
+        if (!block || typeof block !== 'object') continue;
+        const b = block as Record<string, unknown>;
+        if (b.type === 'text' && b.text !== undefined) parts.push(String(b.text));
+        else if (b.type === 'image') parts.push(`[image: ${b.mimeType || 'image'}]`);
+        else parts.push(JSON.stringify(block));
+    }
+    return { success: true, content: parts.join('\n') || JSON.stringify(result) };
+}
+
+export = { McpPool, McpServer, normalizeSpec, normalizeMcpResult };
