@@ -318,3 +318,153 @@ const OPENCODE_PERMISSION = {
     // every file change. The majority is allowed now and only RISKY_BASH interrupts.
     // `manual` still asks for everything, so the three modes stay distinct.
     manual: { '*': 'ask', edit: 'ask', bash: 'ask' },
+    auto: {
+        '*': 'allow',
+        // Last matching rule wins, so the catch-all goes first and the dangerous
+        // commands after it.
+        bash: Object.fromEntries([['*', 'allow'], ...RISKY_BASH.map((pat) => [pat, 'ask'])]),
+    },
+    yolo: { '*': 'allow' },
+};
+
+// Write the config a harness needs before it starts. Only opencode needs one, and it
+// is gitignored because it would otherwise leak this machine's base URL into a clone.
+function prepareConfigFiles(
+    h: HarnessDefinition,
+    gates: HarnessGate[],
+    cwd: string,
+    env: Record<string, string>,
+    mode: string = 'manual',
+): string | null {
+    if (h.id !== 'opencode') return null;
+    const file = path.join(cwd, 'opencode.json');
+
+    // Do NOT clobber a config we did not write. opencode merges a config it finds in
+    // the working directory with the user's global one, so overwriting someone's
+    // opencode.json would silently change how THEIR agent behaves — and we only ever
+    // want to add a provider and a permission block. The marker is how the second run
+    // recognises its own file; without it we refuse and say so.
+    if (fs.existsSync(file)) {
+        let existing = null;
+        try { existing = JSON.parse(fs.readFileSync(file, 'utf-8')) as Record<string, unknown>; } catch { existing = null; }
+        if (!existing || existing._webchatHarness !== true) {
+            const err = new Error(
+                `${file} already exists and was not written by the webchat CLI — refusing to overwrite it. ` +
+                `Move it aside, or launch from a different directory.`,
+            ) as Error & { code?: string };
+            err.code = 'REFUSE_OVERWRITE';
+            throw err;
+        }
+    }
+
+    const models: Record<string, { name: string }> = {};
+    for (const g of gates) {
+        // Provider is `webchat`, so the MODEL KEY is what opencode resolves
+        // `webchat/<key>` against — and the only id the gateway answers to is the full
+        // `<site>-webchat`. Keying this by the bare gate id (`deepseek`) produced
+        // `webchat/deepseek-deepseek-webchat`-adjacent mismatches and an unresolvable
+        // selector, which is how a launch silently became GPT-5.6 Terra.
+        const site = g.site || g.id;
+        models[modelIdFor(g)] = { name: `${g.label || site} (${site})` };
+    }
+    // `model` comes from the environment so the caller keeps one source of truth for the
+    // id - but if it is missing the key lands as `undefined`, opencode drops it, and the
+    // agent silently falls back to whatever model it would have used anyway. That is the
+    // exact failure this config exists to prevent, so refuse rather than write it.
+    const bare = env.HARNESS_MODEL_NAME
+        || (gates[0] ? `${gates[0].site || gates[0].id}-webchat` : null);
+    if (!bare) {
+        const err = new Error('no model id for the agent config — the gate list is empty.') as Error & { code?: string };
+        err.code = 'NO_MODEL';
+        throw err;
+    }
+    // The same provider-qualified id the -m flag carries. These two MUST agree: the config
+    // is what opencode uses when no -m is given, and a mismatch means the flag and the
+    // fallback disagree about which model to run.
+    const model = opencodeModelId(bare);
+    const cfg = {
+        $schema: 'https://opencode.ai/config.json',
+        // Marks the file as ours. opencode ignores unknown keys, so this is a comment
+        // that only the CLI reading it back can see.
+        _webchatHarness: true,
+        provider: {
+            webchat: {
+                npm: '@ai-sdk/openai-compatible',
+                name: 'Webchat harness',
+                options: { baseURL: env.OPENAI_BASE_URL },
+                models,
+            },
+        },
+        model,
+        // An agent harness is a different product from this gateway: its plugins and
+        // permissions must not leak into the webchat lane.
+        plugin: [],
+        permission: (OPENCODE_PERMISSION as Record<string, Record<string, string>>)[mode] || OPENCODE_PERMISSION.manual,
+    };
+    try {
+        fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+        // ...and at the path the isolated XDG_CONFIG_HOME resolves, so the agent has a
+        // global config of its OWN rather than none and never falls back to the user's.
+        const xdg = path.join(cwd, '.config', 'opencode');
+        fs.mkdirSync(xdg, { recursive: true });
+        fs.writeFileSync(path.join(xdg, 'opencode.json'), JSON.stringify(cfg, null, 2));
+        return file;
+    } catch {
+        return null;
+    }
+}
+
+// The argv for a harness: its own binary, the mode's flags, then the user's extras.
+function argvFor(h: HarnessDefinition, mode: string, extra: string[] = [], env: Record<string, string> = {}): string[] {
+    const flags = (h.modes && h.modes[mode]) || [];
+    // A harness may need to name its model explicitly (see opencode above). Kept here so
+    // every caller - the real launch and the tests - builds the same command line.
+    const pin = typeof h.modelFlag === 'function' ? h.modelFlag(env) : (h.modelFlag || []);
+    return [...pin, ...flags, ...extra].filter((a): a is string => typeof a === 'string');
+}
+
+// The first harness that is actually installed, preferring the two most common agents.
+// Used to fill in a launch the user has not configured yet, so `webchat connect` sets
+// itself up instead of sending them to another terminal.
+function firstInstalled(preferred: string[] = ['opencode', 'claude']): string | null {
+    for (const id of preferred) {
+        const h = harnessById(id);
+        if (h && installed(h)) return id;
+    }
+    const fallback = HARNESSES.find((h) => installed(h));
+    return fallback ? fallback.id : null;
+}
+
+// The environment a PLAIN opencode needs.
+//
+// opencode merges the config it finds in the working directory with the user's GLOBAL one,
+// so launching from a clean folder was not enough: the global config still supplied a paid
+// provider, the user's own model default, their agents, their system prompts and their
+// memory. The agent the harness launches must be a plain harness with nothing but the
+// webchat provider in it, so opencode is pointed at its own config and data dirs - the
+// user's own opencode is left completely alone, and its keys are not even on the path.
+function isolateHarnessEnv(cwd: string): Record<string, string> {
+    return {
+        XDG_CONFIG_HOME: path.join(cwd, '.config'),
+        XDG_DATA_HOME: path.join(cwd, '.local', 'share'),
+        XDG_CACHE_HOME: path.join(cwd, '.cache'),
+        XDG_STATE_HOME: path.join(cwd, '.local', 'state'),
+    };
+}
+
+export = {
+    firstInstalled,
+    isolateHarnessEnv,
+    RISKY_BASH,
+    MODES,
+    HARNESSES,
+    harnessById,
+    installed,
+    modelIdFor,
+    opencodeModelId,
+    envFor,
+    reachability,
+    prepareConfigFiles,
+    OPENCODE_PERMISSION,
+    argvFor,
+};
