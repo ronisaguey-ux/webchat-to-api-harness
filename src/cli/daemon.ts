@@ -638,3 +638,323 @@ function chromePath(): string | null {
     } catch { /* puppeteer not installed — fine, try the system */ }
     for (const candidate of [
         'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser',
+        '/usr/bin/google-chrome', '/usr/bin/chromium', '/snap/bin/chromium',
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    ]) {
+        if (candidate.startsWith('/')) { if (fs.existsSync(candidate)) return candidate; continue; }
+        try {
+            const found = execFileSync('which', [candidate], { encoding: 'utf-8' }).trim();
+            if (found) return found;
+        } catch { /* not on PATH */ }
+    }
+    return null;
+}
+
+// A port that ANSWERS is not a browser. Anything can hold a debug port — a stale process, an
+// unrelated service — and calling that "browser running" is the same lie as a stale connected
+// flag. It is also self-contradicting: cdpTargets() reads /json/list from the SAME port, so a
+// non-CDP listener made cdpAlive say up while cdpTargets said down, in one frame.
+// Require the body to actually identify CDP before reporting it up.
+const CDP_MARKERS = ['webSocketDebuggerUrl', 'Protocol-Version', 'Browser', 'V8-Version'];
+
+async function cdpAlive(port: number): Promise<Record<string, unknown>> {
+    const res = await httpGet(`http://127.0.0.1:${port}/json/version`, 1500);
+    if (!res.ok) return { up: false, error: res.error };
+    let info: unknown = null;
+    try {
+        info = JSON.parse(String(res.body)) as unknown;
+    } catch {
+        return { up: false, error: `port ${port} answered but is not a CDP endpoint (non-JSON body)` };
+    }
+    if (!info || typeof info !== 'object' || !CDP_MARKERS.some((k) => k in (info as Record<string, unknown>))) {
+        return { up: false, error: `port ${port} answered but is not a CDP endpoint` };
+    }
+    return { up: true, info };
+}
+
+// What tabs the browser has, so the CLI can name the one it found.
+async function cdpTargets(port: number): Promise<CdpTargetList> {
+    const res = await httpGet(`http://127.0.0.1:${port}/json/list`, 2500);
+    if (!res.ok) return { ok: false, error: res.error, pages: [] };
+    try {
+        const parsed = JSON.parse(String(res.body)) as unknown;
+        if (!Array.isArray(parsed)) {
+            // Same rule as cdpAlive(): a JSON body that is not a CDP target list means the
+            // port is NOT a CDP endpoint, and the two readers must never disagree.
+            return { ok: false, error: `port ${port} answered but is not a CDP endpoint`, pages: [] };
+        }
+        return { ok: true, pages: parsed.filter((t) => !!t && typeof t === 'object' && (t as Record<string, unknown>).type === 'page') as CdpTarget[] };
+    } catch (e) {
+        return { ok: false, error: (e as Error).message, pages: [] };
+    }
+}
+
+// Same trap as the gateway pid: isAlive() only answers "may I signal this pid?". A reused pid
+// therefore read as a running browser, so the CLI reported a window that was not there and
+// launchBrowser() would refuse to start a real one. Prove it by argv — a browser we started
+// carries --remote-debugging-port, and the configured profile dir when one was given.
+function pidLooksLikeBrowser(pid: unknown): boolean {
+    if (!pid) return false;
+    try {
+        const argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+        if (!/chrome|chromium/i.test(argv)) return false;
+        return argv.includes('--remote-debugging-port');
+    } catch {
+        return false;   // unreadable means NOT ours; one wasted start beats a false "running"
+    }
+}
+
+function browserRunning(): number | null {
+    const pid = readPid('browser');
+    if (!isAlive(pid)) { if (pid) clearPid('browser'); return null; }
+    if (!pidLooksLikeBrowser(pid)) { clearPid('browser'); return null; }
+    return pid;
+}
+
+export interface LaunchBrowserOptions {
+    cdpPort?: number;
+    port?: number;
+    profile?: string;
+    url?: string;
+    executable?: string;
+    args?: string[];
+    headless?: boolean;
+    display?: string;
+}
+
+function launchBrowser(opts: LaunchBrowserOptions = {}): Record<string, unknown> | null {
+    // Honour the caller's port and profile. Hardcoding 9225/`profileDir()` meant every
+    // gate opened the SAME browser: the second gate's chrome never bound its own port,
+    // and `webchat connect` could only ever see one webchat.
+    const port = Number(opts.cdpPort || opts.port) || 9225;
+    const bin = opts.executable || chromePath();
+    if (!bin) return { started: false, error: 'no Chrome or Chromium found — set CHROME_PATH' };
+
+    // A debugging port is only accepted with a NON-default profile directory.
+    const profile = opts.profile || profileDir();
+    const args = [
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${profile}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-features=Translate',
+        ...(opts.args || []),
+    ];
+    if (opts.headless) args.push('--headless=new');
+    if (opts.url) args.push(opts.url);
+
+    // ── DISPLAY: launch where a HUMAN can see it ─────────────────────────────
+    // The point of this button is that the user signs in themselves, so the window
+    // must appear on the display they are actually looking at. Inheriting
+    // process.env is wrong in two ways:
+    //   * if the caller exported a different DISPLAY (a virtual one, as the gateway
+    //     uses), the login window is invisible and the user cannot sign in;
+    //   * if DISPLAY is unset entirely, Chrome fails with no useful message.
+    // A real desktop display is preferred explicitly, and `headed: false` lets the
+    // gateway opt into a virtual display when the window must NOT be seen.
+    const env = { ...process.env, ...displayEnv() };
+    if (opts.headless) {
+        // Nothing to show: leave the display alone.
+    } else if (opts.display) {
+        env.DISPLAY = opts.display;
+    } else {
+        env.DISPLAY = realDisplay() || '';
+    }
+    if (!env.DISPLAY) {
+        return {
+            started: false,
+            error: 'no display available (DISPLAY is unset and no X socket was found) — '
+                 + 'launch from a desktop session, or install Xvfb for a virtual one',
+        };
+    }
+
+    ensureStateDir();
+    const child = spawn(bin, args, {
+        detached: true,
+        stdio: 'ignore',
+        env,
+    });
+    child.unref();
+    writePid('browser', child.pid ?? 0);
+    return { started: true, pid: child.pid, executable: bin, profile, port, display: env.DISPLAY };
+}
+
+// ── logs ───────────────────────────────────────────────────────────────────
+// Put text on the clipboard.
+//
+// Used by the problem-report screen, where "copy this" has to actually copy — a
+// screen that prints a block and tells the user to select it is not a copyable report.
+//
+// Tries the tools that exist on this box (xclip, xsel, wl-copy for Wayland) and
+// reports failure rather than pretending: the caller offers "save to a file" as the
+// fallback when this returns { ok: false }.
+function onPath(bin: string): boolean {
+    for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+        if (!dir) continue;
+        try {
+            fs.accessSync(path.join(dir, bin), fs.constants.X_OK);
+            return true;
+        } catch { /* keep looking */ }
+    }
+    return false;
+}
+
+function copyToClipboard(text: string): { ok: boolean; via?: string; reason?: string } {
+    const candidates: Array<[string, string[]]> = [
+        ['xclip', ['-selection', 'clipboard']],
+        ['xsel', ['--clipboard', '--input']],
+        ['wl-copy', []],
+    ];
+    for (const [bin, args] of candidates) {
+        if (!onPath(bin)) continue;
+        try {
+            // These tools DO NOT EXIT — they fork and hold the X selection so a paste
+            // has something to read. Waiting for them to finish therefore blocks until
+            // the timeout and then reports failure over a copy that actually worked
+            // (measured: the clipboard held the text while this returned ok:false).
+            //
+            // So: write the text, give it a moment, and treat "still running" as the
+            // expected outcome rather than an error. Only a hard spawn failure or an
+            // immediate non-zero exit counts as a real failure.
+            const child = spawn(bin, args, { detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+            let exitCode: number | null = null;
+            child.on('exit', (c: number | null) => { exitCode = c; });
+            child.stdin.end(String(text));
+            child.unref();
+            // Wait just long enough to catch "xclip: command not found"-style
+            // failures, which put nothing on the clipboard and exit immediately.
+            const deadline = Date.now() + 150;
+            while (Date.now() < deadline && exitCode === null) {
+                try { execFileSync('sleep', ['0.02'], { stdio: 'ignore' }); } catch { /* no sleep */ }
+            }
+            if (exitCode !== null && exitCode !== 0) continue;
+            return { ok: true, via: bin };
+        } catch { /* try the next one */ }
+    }
+    return { ok: false, reason: 'no clipboard tool found (tried xclip, xsel, wl-copy)' };
+}
+
+function tailLines(file: string, n: number = 60): string[] {
+    if (!fs.existsSync(file)) return [];
+    const text = fs.readFileSync(file, 'utf-8');
+    const lines = text.split('\n');
+    return lines.slice(Math.max(0, lines.length - n - 1));
+}
+
+// ── the "which webchat is connected" marker ─────────────────────────────────
+// Written by the CLI's Connect step and read by `webchat connect`, which runs in a
+// SECOND terminal. It is the handoff between the two: without it the second command
+// has no idea which webchat and which browser the user just set up.
+function connectFile(): string { return path.join(stateDir(), 'connected.json'); }
+
+function readConnection(): Record<string, unknown> | null {
+    try {
+        const d = JSON.parse(fs.readFileSync(connectFile(), 'utf-8'));
+        return d && typeof d === 'object' ? normalizeConnection(d) : null;
+    } catch { return null; }
+}
+
+// connected.json has been written in THREE shapes over time, by three different call sites:
+//
+//   {gates:[{id,gatewayPort,cdpPort}], mode, agent, cwd}   the current, correct one
+//   {gate:'deepseek', mode, cdpPort, gatewayPort}          screens-gates.js — singular key
+//   {mode, cdpPort, cdpWsUrl, targetUrl}                   the older single-connection flow,
+//                                                          which named no gate at all
+//
+// Only the first names a gate, so a reader that trusted it reported "nothing connected"
+// after a connect that had genuinely happened — a false negative, which is the same class
+// of dishonesty as a false positive. Normalising on READ fixes every consumer at once,
+// including ones not written yet.
+function normalizeConnection(raw: unknown): Record<string, unknown> | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const src = raw as Record<string, unknown>;
+    const out: Record<string, unknown> = { ...src };
+    if (!Array.isArray(out.gates) || !out.gates.length) {
+        if (src.gate) {
+            out.gates = [{ id: src.gate, gatewayPort: src.gatewayPort, cdpPort: src.cdpPort }];
+        } else if (src.cdpPort) {
+            // No gate named: keep the port so a caller can still match it against the
+            // registry. `id: null` is honest about not knowing, not a fabricated name.
+            out.gates = [{ id: null, cdpPort: src.cdpPort }];
+        } else {
+            out.gates = [];
+        }
+    }
+    return out;
+}
+
+function writeConnection(info: Record<string, unknown>): Record<string, unknown> {
+    ensureStateDir();
+    fs.writeFileSync(connectFile(), JSON.stringify(info, null, 2), { mode: 0o600 });
+    return info;
+}
+
+function clearConnection(): void {
+    try { fs.unlinkSync(connectFile()); } catch { /* already gone */ }
+}
+
+// ── launch a program in its OWN terminal window ─────────────────────────────
+//
+// The agent is an interactive TUI. Handing it this terminal replaces the CLI, so the
+// user loses the thing they were just using; `webchat start` gives it its own window
+// instead and stays where it is. Falls back to a detached process with a log when no
+// terminal emulator is installed - never to taking over the caller's TTY.
+interface TerminalSpec {
+    bin: string;
+    args: (cmd: string) => string[];
+}
+
+const TERMINALS: TerminalSpec[] = [
+    { bin: 'konsole', args: (cmd: string): string[] => ['-e', 'bash', '-lc', cmd] },
+    { bin: 'x-terminal-emulator', args: (cmd: string): string[] => ['-e', 'bash', '-lc', cmd] },
+    { bin: 'gnome-terminal', args: (cmd: string): string[] => ['--', 'bash', '-lc', cmd] },
+    { bin: 'xfce4-terminal', args: (cmd: string): string[] => ['-e', `bash -lc ${JSON.stringify(cmd)}`] },
+    { bin: 'xterm', args: (cmd: string): string[] => ['-e', 'bash', '-lc', cmd] },
+];
+
+function whichTerminal(): TerminalSpec | null {
+    const { spawnSync } = require('child_process');
+    for (const t of TERMINALS) {
+        const r = spawnSync('which', [t.bin], { encoding: 'utf-8' });
+        if (r.status === 0 && String(r.stdout).trim()) return t;
+    }
+    return null;
+}
+
+function shq(s: string): string { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+
+function launchInTerminal({ bin, argv = [], cwd, env = {} }: { bin: string; argv?: string[]; cwd: string; env?: Record<string, string> }): Record<string, unknown> {
+    const { spawn } = require('child_process');
+    const cmd = `cd ${shq(cwd)} && exec ${[bin, ...argv].map(shq).join(' ')}`;
+    const full = { ...process.env, ...env };
+    const term = whichTerminal();
+    try {
+        if (term) {
+            const child = spawn(term.bin, term.args(cmd), {
+                detached: true, stdio: 'ignore', env: { ...full, ...displayEnv() },
+            });
+            child.unref();
+            return { ok: true, how: 'window', terminal: term.bin, pid: child.pid };
+        }
+        // No terminal emulator: run it detached and leave a log, so this TTY is untouched.
+        ensureStateDir();
+        const out = fs.openSync(logFile('agent'), 'a');
+        fs.writeSync(out, `\n─── agent start ${new Date().toISOString()} ───\n`);
+        const child = spawn('bash', ['-lc', cmd], { detached: true, stdio: ['ignore', out, out], env: full });
+        child.unref();
+        return { ok: true, how: 'detached', log: logFile('agent'), pid: child.pid };
+    } catch (e) {
+        return { ok: false, error: (e as Error).message };
+    }
+}
+
+export = {
+    REPO, stateDir, ensureStateDir, profileDir,
+    pidFile, logFile,
+    readPid, isAlive, writePid, clearPid, processExited,
+    httpGet, httpPost, probeGateway,
+    gatewayRunning, startGateway, stopGateway, displayEnv,
+    freePort, isPortFree, freePortPair, distinctPair,
+    startHub, stopHub, hubRunning, pidLooksLikeHub, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
+    chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
+    pidLooksLikeBrowser, pidLooksLikeGateway,
