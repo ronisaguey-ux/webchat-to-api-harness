@@ -15,7 +15,8 @@
     "test:tui": "npm run build && node harness_tests/cli_smoke.js",
     "test:all": "npm run test",
     "webchat": "node bin/webchat.js",
-    "build": "tsc -p tsconfig.json && node -e \"const fs=require('fs'),path=require('path');const walk=(d)=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(path.join(d,e.name)):[path.join(d,e.name)]);for(const f of walk('src')){if(!f.endsWith('.json'))continue;const out=path.join('dist',path.relative('src',f));fs.mkdirSync(path.dirname(out),{recursive:true});fs.copyFileSync(f,out)}\""
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('fs'),path=require('path');const walk=(d)=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(path.join(d,e.name)):[path.join(d,e.name)]);for(const f of walk('src')){if(!f.endsWith('.json'))continue;const out=path.join('dist',path.relative('src',f));fs.mkdirSync(path.dirname(out),{recursive:true});fs.copyFileSync(f,out)}\"",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "cors": "^2.8.5",
