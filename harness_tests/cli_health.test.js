@@ -79,7 +79,7 @@ test('nothing listening is not up', async () => {
 
 test('non-vacuous: the shipped daemon no longer reads the nonexistent `alive` field', () => {
     // A passing behaviour test proves nothing if the old branch is still first.
-    const src = fs.readFileSync(path.join(__dirname, '..', 'cli', 'daemon.js'), 'utf8');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli', 'daemon.ts'), 'utf8');
     assert.doesNotMatch(src, /parsed\.alive\b/, 'the dead `parsed.alive` read must be gone');
     assert.match(src, /parsed\.browserAlive/, 'the real field must be read');
 });

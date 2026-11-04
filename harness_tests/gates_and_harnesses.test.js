@@ -207,7 +207,7 @@ test('MCP tool names are unique and namespaced', () => {
 test('the MCP server never writes a non-JSON line to stdout', () => {
     // Stdout IS the wire. A stray console.log corrupts the stream — measured: a config
     // warning printed straight into it and the client got a parse error.
-    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'tools', 'mcp-server.js'), 'utf-8');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'tools', 'mcp-server.ts'), 'utf-8');
     const guard = src.indexOf('STDOUT IS THE WIRE');
     const firstRequire = src.indexOf("const REPO =");
     assert.ok(guard > -1, 'the stdout guard must exist');
