@@ -94,7 +94,7 @@ test('the delay is read in SECONDS and the settings are CLI-reachable', () => {
     assert.ok(config.malformedRetryDelaySec >= 1 && config.malformedRetryDelaySec < 3600,
         'sane seconds range — a ms value here would be a bug');
     const fs = require('fs');
-    const settingsSrc = fs.readFileSync(path.join(__dirname, '..', 'cli', 'settings.js'), 'utf8');
+    const settingsSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli', 'settings.ts'), 'utf8');
     for (const p of ['limits.maxMalformedRounds', 'limits.malformedRetryEnabled', 'limits.malformedRetryDelaySec', 'limits.malformedMaxRetries']) {
         assert.ok(settingsSrc.includes(p), `${p} must be tunable from the CLI`);
     }

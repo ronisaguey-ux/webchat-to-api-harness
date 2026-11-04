@@ -73,7 +73,7 @@ test('--list reports the same tool count the module and the server do', () => {
 test('the extras merge precedes the --list block in the source', () => {
     // Asserted on the ORDER in the file, because that ordering IS the fix - a later
     // refactor that moves it back would silently re-break the count.
-    const src = require('fs').readFileSync(path.join(REPO, 'src', 'tools', 'mcp-server.js'), 'utf8');
+    const src = require('fs').readFileSync(path.join(REPO, 'src', 'tools', 'mcp-server.ts'), 'utf8');
     const mergeAt = src.indexOf('for (const t of EXTRA)');
     const listAt = src.indexOf("process.argv.includes('--list')");
     assert.ok(mergeAt > 0, 'the extras merge must exist');
