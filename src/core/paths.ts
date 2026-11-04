@@ -1,0 +1,72 @@
+'use strict';
+
+// ── Portable path resolution ────────────────────────────────────────────────
+// The harness used to hardcode absolute paths like
+//   /home/roni/Roni_Workspace/audits_plans/claude_inbox.json
+// which only exist on the author's machine. On any other box (Windows
+// especially) the same string resolves to C:\home\roni\... and every write
+// fails with ENOENT — a user reported exactly that:
+//   "ENOENT: no such file or directory, open
+//    'C:\\home\\roni\\...\\claude_inbox.json'"
+//
+// Resolution order, first hit wins:
+//   1. the explicit env var for that path (WORKSPACE_ROOT, AUDITS_PLANS_DIR, …)
+//   2. WORKSPACE_ROOT, when set
+//   3. the harness's parent directory (the harness normally sits at
+//      <workspace>/webchat-api)
+// Nothing here assumes a username, a drive letter, or a POSIX separator.
+
+import path = require('path');
+import os = require('os');
+
+function envDir(name: string): string | null {
+    const v = process.env[name];
+    return v && String(v).trim() ? path.resolve(String(v).trim()) : null;
+}
+
+function workspaceRoot(): string {
+    return envDir('WORKSPACE_ROOT') || path.resolve(__dirname, '..', '..', '..');
+}
+
+function auditsPlans(): string {
+    return envDir('AUDITS_PLANS_DIR') || path.join(workspaceRoot(), 'audits_plans');
+}
+
+// Every path the harness writes to. Each is env-overridable, and each falls
+// back to a location derived from the workspace root rather than a hardcoded
+// absolute string.
+export interface HarnessPaths {
+    workspaceRoot: () => string;
+    auditsPlans: () => string;
+    mainInboxFile: () => string;
+    mainReplyFile: () => string;
+    mainReplySeenFile: (port?: string | number) => string;
+    webchatInboxFile: () => string;
+    outboxFile: () => string;
+    workflowStateFile: () => string;
+    auditStateFile: () => string;
+    handoffFile: () => string;
+    memoryFile: () => string;
+    bashToolLog: () => string;
+    homeDir: () => string;
+}
+
+const paths: HarnessPaths = {
+    workspaceRoot,
+    auditsPlans,
+
+    mainInboxFile: () => envDir('MAIN_INBOX_FILE') || path.join(auditsPlans(), 'claude_inbox.json'),
+    mainReplyFile: () => envDir('MAIN_REPLY_FILE') || path.join(auditsPlans(), 'claude_webchat_outbox.json'),
+    mainReplySeenFile: (port?: string | number) => envDir('MAIN_REPLY_SEEN_FILE')
+        || path.join(auditsPlans(), '.main_reply_seen_' + (port || process.env.PORT || 8080) + '.json'),
+    webchatInboxFile: () => envDir('WEBCHAT_INBOX_FILE') || path.join(auditsPlans(), 'claude_webchat_inbox.json'),
+    outboxFile: () => envDir('OUTBOX_FILE') || path.join(auditsPlans(), 'claude_outbox.json'),
+    workflowStateFile: () => envDir('WORKFLOW_STATE_FILE') || path.join(auditsPlans(), 'workflow_state.json'),
+    auditStateFile: () => envDir('AUDIT_STATE_FILE') || path.join(auditsPlans(), 'audit_state.json'),
+    handoffFile: () => envDir('HANDOFF_FILE') || path.join(workspaceRoot(), 'handoff_to_new_chat.md'),
+    memoryFile: () => envDir('MEMORY_FILE') || path.join(workspaceRoot(), 'webchat_memory.md'),
+    bashToolLog: () => envDir('BASH_TOOL_LOG') || path.join(path.resolve(__dirname, '..', '..'), 'bash_tool_log.jsonl'),
+    homeDir: () => os.homedir(),
+};
+
+export = paths;
