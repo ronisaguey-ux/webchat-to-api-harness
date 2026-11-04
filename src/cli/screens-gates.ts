@@ -638,3 +638,70 @@ function build(ctx: ScreensCtx): Record<string, (...args: never[]) => unknown> {
         const rows = ctx.rowsOf(st);
         const rowFor = (name: string) => rows.find((r: { setting: { path: string } }) => r.setting.path === toolPath(name));
         // `value` is TRUE WHEN THE TOOL IS AVAILABLE -- resolve() reports
+        // `!off.includes(name)` -- so this is "is on", not "is disabled". Getting that
+        // backwards draws every tick on the wrong row.
+        // A tool with no setting is treated as available rather than crashing: the
+        // catalogue is read from the harness at runtime and can gain a tool before the
+        // schema does.
+        const isOn = (name: string): boolean => {
+            const r = rowFor(name);
+            return Boolean(r && r.value);
+        };
+
+        let names: string[] = [];
+        try {
+            // Ask the harness itself which tools exist, so this list cannot drift from
+            // the real catalogue the way a hand-written copy would.
+            names = (require(path.join(__dirname, '..', '..', 'src', 'tools', 'tools')) as { getToolDefinitions: () => Array<{ name: string }> })
+                .getToolDefinitions().map((t: { name: string }) => t.name);
+        } catch { names = []; }
+
+        const limits = readLimits();
+        const items: Array<{ label: string; hint?: string; value: string }> = names.map((n: string) => ({
+            // `= true` because the switch IS the fact, and a tick is easy to misread at a
+            // glance when the whole list is ticks.
+            label: `${isOn(n) ? '[x]' : '[ ]'} ${n} = ${isOn(n) ? 'true' : 'false'}`,
+            hint: limitHint(limits, n) || (isOn(n) ? 'available' : 'switched off'),
+            value: n,
+        }));
+        const withLimits = Object.keys(limits).filter((k) => limits[k] && limits[k].length).length;
+        items.push({
+            label: 'Limits…',
+            hint: withLimits ? `${withLimits} tool(s) have limits` : 'ban or ask per tool',
+            value: '__limits__',
+        });
+        items.push({ label: 'Done', hint: `${names.filter((n: string) => !isOn(n)).length} switched off`, value: 'done' });
+
+        const pick = await A.menu(items, {
+            title: 'Tools the model may use',
+            footer: ['Enter switches a tool on or off. Esc when you are done.'],
+            startIndex,
+        });
+        if (pick === A.BACK) return;
+        if (pick === 'done') return;
+        if (pick === '__limits__') { await screenLimits(); return screenTools(startIndex); }
+
+        // Persist NOW, on the setting that owns this tool. `isOff` is rebuilt from the
+        // settings on the next call, so an in-memory-only toggle was lost as soon as the
+        // list redrew.
+        const row = rowFor(String(pick));
+        if (row) await ctx.saveSetting(toolPath(String(pick)), !isOn(String(pick)));
+        const at = items.findIndex((i) => i.value === pick);
+        return screenTools(at >= 0 ? at : startIndex);
+    }
+
+    return {
+        screenGates,
+        screenAddGate,
+        screenConnectGate,
+        screenHarnesses,
+        screenMode,
+        screenPlan,
+        screenPickGates,
+        screenTools,
+        screenLimits,
+        screenToolLimits,
+    };
+}
+
+export = { build };
