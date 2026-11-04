@@ -8,21 +8,28 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check src/browser/browser.js && node --check src/tools/tools.js && node --check src/core/config.js && node --check src/runtime/rate_limit.js",
+    "check": "tsc --noEmit -p tsconfig.json && node --check server.js && node --check bin/webchat.js",
     "test": "node --test --test-concurrency=1 harness_tests/*.test.js && node harness_tests/cli_smoke.js && bash harness_tests/verify-launchers.sh",
     "test:unit": "node --test --test-concurrency=1 harness_tests/*.test.js",
     "test:smoke": "node harness_tests/cli_smoke.js && bash harness_tests/verify-launchers.sh",
     "test:tui": "node harness_tests/cli_smoke.js",
     "test:all": "npm run test",
-    "webchat": "node bin/webchat.js"
+    "webchat": "node bin/webchat.js",
+    "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "puppeteer": "^25.10.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "puppeteer": "^25.10.0"
   },
   "bin": {
     "webchat": "./bin/webchat.js"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
   }
 }
