@@ -35,15 +35,15 @@ try {
     loadError = e;
 }
 
-function get(section: string, key: string): unknown {
+function get(section: string, key?: string): unknown {
     const s: unknown = raw[section];
     if (!s || typeof s !== 'object') return undefined;
-    return (s as ConfigSection)[key];
+    return key === undefined ? undefined : (s as ConfigSection)[key];
 }
 
 // A non-empty environment variable always wins. `undefined` from the file means
 // "not configured" and the caller's own default applies.
-function pick(envName: string | null, section: string, key: string): unknown {
+function pick(envName: string | null, section: string, key?: string): unknown {
     if (envName && process.env[envName] !== undefined && process.env[envName] !== '') {
         return process.env[envName];
     }
@@ -51,7 +51,7 @@ function pick(envName: string | null, section: string, key: string): unknown {
 }
 
 // Booleans: env is the string 'true'/'false'; the file is a real boolean.
-function pickBool(envName: string | null, section: string, key: string): boolean | undefined {
+function pickBool(envName: string | null, section: string, key?: string): boolean | undefined {
     const env = envName ? process.env[envName] : undefined;
     if (env !== undefined && env !== '') return String(env).toLowerCase() === 'true';
     const v = get(section, key);
@@ -60,7 +60,7 @@ function pickBool(envName: string | null, section: string, key: string): boolean
 }
 
 // Numbers: env is a string; the file is a number. 0 is a legitimate value.
-function pickNum(envName: string | null, section: string, key: string): number | undefined {
+function pickNum(envName: string | null, section: string, key?: string): number | undefined {
     const env = envName ? process.env[envName] : undefined;
     if (env !== undefined && env !== '') {
         const n = Number(env);
@@ -74,7 +74,7 @@ function pickNum(envName: string | null, section: string, key: string): number |
 
 // Strings, with the empty string treated as "not configured" so a blank entry in
 // the file does not blank out a real default.
-function pickStr(envName: string | null, section: string, key: string): string | undefined {
+function pickStr(envName: string | null, section: string, key?: string): string | undefined {
     const env = envName ? process.env[envName] : undefined;
     if (env !== undefined && env !== '') return env;
     const v = get(section, key);
@@ -83,7 +83,7 @@ function pickStr(envName: string | null, section: string, key: string): string |
 }
 
 // Comma-separated list: env is a string, the file may be an array or a string.
-function pickList(envName: string | null, section: string, key: string): string[] | undefined {
+function pickList(envName: string | null, section: string, key?: string): string[] | undefined {
     const env = envName ? process.env[envName] : undefined;
     if (env !== undefined && env !== '') {
         return env.split(',').map((s: string) => s.trim()).filter(Boolean);
