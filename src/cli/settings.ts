@@ -638,3 +638,323 @@ function envFilePath(explicit?: string): string {
 function loadDotenv(explicit?: string): { file: string; vars: Record<string, string>; missing: boolean; error?: unknown } {
     const file = envFilePath(explicit);
     if (!fs.existsSync(file)) return { file, vars: {}, missing: true };
+    try {
+        return { file, vars: parseEnvFile(fs.readFileSync(file, 'utf-8')), missing: false };
+    } catch (e) {
+        return { file, vars: {}, missing: false, error: e };
+    }
+}
+
+function configFilePath(explicit?: string): string {
+    if (explicit) return path.resolve(explicit);
+    if (process.env.HARNESS_CONFIG) return path.resolve(process.env.HARNESS_CONFIG);
+    const dotenv = loadDotenv();
+    if (dotenv.vars.HARNESS_CONFIG) return path.resolve(dotenv.vars.HARNESS_CONFIG);
+    // The config file lives in src/core and is copied into dist/core by `npm run build`.
+    return path.join(__dirname, '..', 'core', 'harness.config.json');
+}
+
+function loadRaw(explicit?: string): { file: string; raw: Record<string, unknown>; missing: boolean; error?: unknown } {
+    const file = configFilePath(explicit);
+    if (!fs.existsSync(file)) return { file, raw: {}, missing: true };
+    try {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as unknown;
+        return { file, raw: (parsed && typeof parsed === 'object') ? parsed as Record<string, unknown> : {}, missing: false };
+    } catch (e) {
+        return { file, raw: {}, missing: false, error: e };
+    }
+}
+
+// Atomic write, with a one-shot backup of the previous contents. A half-written
+// config is the worst outcome available here: the harness reads it once at boot
+// and a truncated file silently reverts every setting to its default.
+function saveRaw(raw: unknown, explicit?: string): string {
+    const file = configFilePath(explicit);
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+    if (fs.existsSync(file)) {
+        fs.copyFileSync(file, path.join(path.dirname(file), `.${path.basename(file)}.bak-${stamp}`));
+    } else if (!fs.existsSync(path.dirname(file))) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+    }
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(raw, null, 2)}\n`, 'utf-8');
+    fs.renameSync(tmp, file);
+    return file;
+}
+
+// ── Resolution ─────────────────────────────────────────────────────────────
+// Coerce a schema `type` from either an env string or a JSON value.
+function coerce(setting: SettingRow, value: unknown): unknown {
+    if (value === undefined || value === null) return undefined;
+    switch (setting.type) {
+    case 'bool': case 'envbool':
+        return value === true || String(value).toLowerCase() === 'true';
+    case 'number': {
+        const n = Number(value);
+        return Number.isNaN(n) ? undefined : n;
+    }
+    case 'list':
+        if (Array.isArray(value)) return value.map(String);
+        return String(value).split(',').map((s) => s.trim()).filter(Boolean);
+    case 'choice': {
+        // One of a fixed set, matched case-insensitively so `HEADED` and `headed`
+        // are the same answer. An unknown value is REJECTED (undefined) rather than
+        // silently stored: a typo'd mode that falls through to a default is how a
+        // setting looks applied and changes nothing.
+        const want = String(value).trim().toLowerCase();
+        const opts = ((setting.options as unknown[]) || []).map((o: unknown) => String(o).toLowerCase());
+        return opts.includes(want) ? want : undefined;
+    }
+    default:
+        return String(value);
+    }
+}
+
+// What the harness will ACTUALLY see, and who decided it.
+//
+// `dotenv` is the parsed harness/.env. It matters as much as the real
+// environment: at boot the harness calls dotenv.config(), so every line in that
+// file becomes a process.env entry and therefore OUTRANKS harness.config.json.
+// A CLI that ignored this would let you edit `webchat.mode` in the file, save
+// it, and change nothing — on this install WEBCHAT_MODE=gemini sits in .env
+// doing exactly that.
+function resolve(
+    setting: SettingRow,
+    raw: unknown,
+    env: Record<string, string | undefined> = process.env,
+    dotenv: Record<string, string | undefined> = {},
+): Record<string, unknown> {
+    // A per-tool toggle is not its own key: every one of them reads the SAME
+    // `tools.disabled` array and reports whether its own name is in it. Resolved here so
+    // the value shown in the list, the "is it on" question and the writer all agree.
+    if (setting.type === 'tooltoggle') {
+        const list = getPath(raw, 'tools.disabled');
+        const off = Array.isArray(list) ? list : [];
+        return { value: !off.includes(setting.toolName), source: 'file' };
+    }
+    // File-backed settings (memory.contents) read the real file, not config JSON.
+    if (setting.fileBacked) {
+        const file = memoryMod ? memoryMod.memoryFile() : '';
+        let value = '';
+        try { value = fs.readFileSync(file, 'utf-8'); } catch { /* empty memory */ }
+        return { value, source: 'memory', memoryFile: file };
+    }
+    const envKey = typeof setting.env === 'string' ? setting.env : '';
+    const fromProcess = envKey ? env[envKey] : undefined;
+    const fromDotenv = envKey ? dotenv[envKey] : undefined;
+    const envVal = (fromProcess !== undefined && fromProcess !== '') ? fromProcess
+        : ((fromDotenv !== undefined && fromDotenv !== '') ? fromDotenv : undefined);
+    const where = (fromProcess !== undefined && fromProcess !== '') ? 'environment'
+        : ((fromDotenv !== undefined && fromDotenv !== '') ? 'harness/.env' : null);
+    const hasEnv = envVal !== undefined;
+
+    if (setting.type === 'envbool') {
+        // SANDBOX_LOG is inverted: it logs unless explicitly 'false'.
+        if (!hasEnv) return { value: true, source: 'default', detail: 'unset — logging stays on' };
+        return { value: String(envVal).toLowerCase() !== 'false', source: 'env', envWhere: where };
+    }
+    if (setting.envOnly) {
+        // envOnly means the VALUE lives in .env rather than in the config file — it does not
+        // mean the setting has no default. When the var is absent the gateway still applies
+        // its own built-in default, so "unset" describes a setting that is very much in
+        // force: the same number is running, and the display called it missing.
+        //
+        // A setting that carries a default therefore reports that default (source
+        // "default", i.e. "not written to .env; the built-in value applies"). One without a
+        // default — a secret — is genuinely unset until written.
+        if (!hasEnv) {
+            if (setting.default === undefined) return { value: undefined, source: 'unset' };
+            return { value: coerce(setting, setting.default), source: 'default' };
+        }
+        return { value: coerce(setting, envVal), source: 'env', envWhere: where };
+    }
+
+    const fileVal = getPath(raw, setting.path);
+    const hasFile = fileVal !== undefined && fileVal !== null && fileVal !== '';
+
+    if (hasEnv) {
+        return {
+            value: coerce(setting, envVal),
+            source: 'env',
+            envWhere: where,
+            // The load-bearing field: an env var beats the file, so an edit in
+            // the UI would silently do nothing. The UI must say so, and offer to
+            // clear the shadowing line.
+            shadowedBy: setting.env,
+            shadowedWhere: where,
+            shadowedFileValue: hasFile ? coerce(setting, fileVal) : undefined,
+        };
+    }
+    if (hasFile) return { value: coerce(setting, fileVal), source: 'file' };
+    // A per-setting default, so a setting can be documented and honest about what
+    // applies when nothing is set. Without this a new setting reads as `undefined`,
+    // and the UI cannot tell "off" from "not configured" — which matters because
+    // several consumers treat a missing value differently from a false one.
+    if (setting.default !== undefined) {
+        return { value: coerce(setting, setting.default), source: 'default' };
+    }
+    return { value: undefined, source: 'default' };
+}
+
+// Every setting, resolved, in schema order.
+  // dotenv defaults to the REAL .env rather than {}. `.env` is where env-backed settings
+  // live, so a resolve that cannot see it reports `source: "unset"` for a setting that is
+  // in fact configured and in use — the MCP did exactly that (it called resolveAll(raw) with
+  // no dotenv, so an envOnly setting read back as unset the moment it was saved). A display
+  // that says "unset" about a live value is the same lie as a stale connected flag.
+  //
+  //  Pass an explicit object to resolve against a fixture; only omitting the argument loads
+  //  the file, so a test stays isolated and a caller cannot forget.
+  //
+  //  ★ `raw` HAD NO DEFAULT, SO OMITTING IT DID NOT LOAD THE FILE — it resolved against
+  //  `undefined`, and every file-backed setting fell through to its default. The comment above
+  //  described the intent; the signature did the opposite. Measured on this box: the config
+  //  says platform "windows" while resolveAll() reported "linux" (source default), and
+  //  file-backed settings resolved 45 -> 17 without raw. Eight callers passed raw explicitly
+  //  and worked; the one that omitted it was silently wrong.
+  function resolveAll(
+    raw: Record<string, unknown> = loadRaw().raw,
+    env: Record<string, string | undefined> = process.env,
+    dotenv?: Record<string, string | undefined>,
+): Array<Record<string, unknown>> {
+      const dotenvVars = dotenv === undefined ? loadDotenv().vars : dotenv;
+      const rows: Array<Record<string, unknown>> = [];
+      for (const group of SCHEMA) {
+          for (const s of group.settings) {
+              rows.push({ setting: s, group: group.id, groupTitle: group.title, ...resolve(s, raw, env, dotenvVars) });
+          }
+      }
+    return rows;
+}
+
+function countShadowed(rows: Array<Record<string, unknown>>): number {
+    return rows.filter((r) => r.shadowedBy).length;
+}
+
+// The webchat modes the config knows about, with what each carries.
+function listModes(raw: Record<string, unknown> | null | undefined): Array<Record<string, unknown>> {
+    const modes = (raw && typeof raw.webchatModes === 'object' && raw.webchatModes ? raw.webchatModes : {}) as Record<string, Record<string, unknown>>;
+    return Object.entries(modes).map(([id, m]) => ({
+        id,
+        url: (m && m.url) || '',
+        selectors: (m && m.selectors) || {},
+        quirks: (m && m.quirks) || {},
+        threadPattern: (m && m.threadPattern) || '',
+        emptyGraceMs: (m && m.emptyGraceMs) || 0,
+    }));
+}
+
+// Format a value for display.
+function display(setting: SettingRow, value: unknown): string {
+    if (value === undefined || value === null || value === '') return '(not set)';
+    if (setting.type === 'secret') return '••••••••';
+    if (setting.type === 'bool' || setting.type === 'envbool' || setting.type === 'tooltoggle') {
+        return value ? 'on' : 'off';
+    }
+    if (setting.type === 'list') return Array.isArray(value) && value.length ? value.join(', ') : '(none)';
+    return String(value);
+}
+
+// Programmatic write, for screens that save a value without going through the
+// one-setting editor (a checkbox list, for instance).
+//
+// Returns what happened rather than assuming success: a value that is SHADOWED by an
+// environment variable is written to the file and still has no effect, and a caller
+// that reports "saved" there is lying to the user. The return says so.
+    // ── Tour / demo mode ────────────────────────────────────────────────────
+    //
+    // While this is on, every write is accepted and reported as saved but NOTHING is
+    // written to disk. The tutorial sends the user into real screens and tells them to
+    // press things - the fastest way to teach a control panel is to let someone use it -
+    // but being shown around must not leave a trail of half-changed settings behind, and
+    // a user who is only exploring should never have to undo anything afterwards.
+    //
+    // It is deliberately a flag on the WRITER rather than a set of fake screens: the
+    // screens the user sees are the real ones, so what they learn applies. Only the
+    // persistence is mocked.
+    let _demoMode = false;
+    function setDemoMode(on: unknown): boolean {
+        const was = _demoMode;
+        _demoMode = Boolean(on);
+        return was;
+    }
+    function isDemoMode() { return _demoMode; }
+
+    function saveSetting(dotted: string, value: unknown): Record<string, unknown> {
+        // A per-tool toggle writes membership of `tools.disabled`, not a key of its own.
+        // `dotted` arrives as `tools.disabled::<name>` and is translated here, so the
+        // caller works in the same id space the list uses and never has to know the
+        // storage shape.
+        // One entry of a MAP setting, addressed as `<map.path>::<key>`. Clearing with an
+        // empty string removes the key, which is how a per-webchat prompt falls back to
+        // the shared one. Without this the only way to set a single entry was to
+        // read-modify-write the whole object, which is exactly the kind of whole-object
+        // write that loses a concurrent edit.
+        const mapEntry = /^([A-Za-z]+\.[A-Za-z]+)::(.+)$/.exec(dotted);
+        if (mapEntry && BY_PATH.has(mapEntry[1])) {
+            const mapPath = mapEntry[1];
+            const key = mapEntry[2];
+            const loaded0 = loadRaw();
+            const next0 = loaded0.raw || {};
+            const map = Object.assign({}, getPath(next0, mapPath) || {}) as Record<string, unknown>;
+            if (String(value == null ? '' : value).trim() === '') delete map[key];
+            else map[key] = String(value);
+            setPath(next0, mapPath, map);
+            saveRaw(next0, loaded0.file);
+            return { ok: true, value: map[key] || '', shadowed: false, shadowedBy: null };
+        }
+        if (dotted.startsWith('tools.disabled::')) {
+            const name = dotted.slice('tools.disabled::'.length);
+            const loaded = loadRaw();
+            const next = loaded.raw || {};
+            const cur = getPath(next, 'tools.disabled');
+            const set = new Set(Array.isArray(cur) ? cur : []);
+            if (value) set.delete(name); else set.add(name);
+            setPath(next, 'tools.disabled', [...set]);
+            saveRaw(next, loaded.file);
+            return { ok: true, value: !set.has(name), shadowed: false, shadowedBy: null };
+        }
+      if (_demoMode) {
+          // Reported as saved so the screen behaves exactly as it would, and marked so a
+          // caller can say "not really" on screen if it wants to.
+          return { ok: true, demo: true, value, shadowed: false, shadowedBy: null };
+      }
+
+      const setting = BY_PATH.get(dotted);
+      if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
+
+      // ★ THE WRITE TARGET DEPENDS ON THE TYPE, and this used to ignore two of them.
+      // It always wrote to the config JSON, so `memory.contents` went into the config
+      // while the model reads the memory FILE (the write reported success and changed
+      // nothing), and an env-only secret like `__env__.API_TOKEN` went into the config
+      // while the runtime reads .env. Both are "saved but inert" — the worst shape a
+      // settings writer can have, because the caller is told it worked. This is the
+      // single writer for BOTH the CLI and the MCP, so the fix belongs here rather than
+      // in either caller.
+
+      // Env-only: the value lives in .env, never in the config file.
+      if (setting.envOnly) {
+          const file = envFilePath();
+          let text = '';
+          try { text = fs.readFileSync(file, 'utf-8'); } catch { text = ''; }
+          fs.writeFileSync(file, setEnvVar(text, setting.env, String(value)), { mode: 0o600 });
+          return { ok: true, value, shadowed: false, shadowedBy: null, where: file };
+      }
+
+      // File-backed: the value IS a file. Writing it into the config JSON would leave
+      // the real file untouched and the setting would appear to have no effect.
+      if (setting.fileBacked) {
+          if (!memoryMod || typeof memoryMod.writeMemory !== 'function') {
+              return { ok: false, reason: 'the memory module is unavailable, so ' + dotted + ' cannot be written' };
+          }
+          memoryMod.writeMemory(String(value == null ? '' : value));
+          return { ok: true, value, shadowed: false, shadowedBy: null, where: memoryMod.memoryFile() };
+      }
+
+      // loadRaw returns an ENVELOPE ({ file, raw, missing }) — writing that straight
+      // back produces a config containing the envelope instead of the settings, which
+      // silently reverts every value on the next boot. Write `loaded.raw`.
+      const loaded = loadRaw();
+      const next = loaded.raw || {};
+      setPath(next, dotted, value);
+      saveRaw(next, loaded.file);
