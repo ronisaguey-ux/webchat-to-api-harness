@@ -318,3 +318,323 @@ const SCHEMA: Array<{ id: string; title: string; blurb?: string; settings: Setti
             },
             {
                 path: 'webchat.viewportH', label: 'Viewport height', type: 'number', env: 'VIEWPORT_H',
+                advanced: true,
+            },
+            {
+                path: 'webchat.loginWaitSeconds', label: 'Login wait (seconds)', type: 'number', env: 'LOGIN_WAIT_SECONDS',
+                help: 'How long to wait for you to finish signing in on first launch.',
+            },
+            // The send pacing. Deliberately random so the cadence never repeats (a fixed gap
+            // is itself a bot signature), but it is applied to EVERY send and a single agent
+            // turn makes several — so it dominates response time. Measured: 87% of a reply
+            // was this wait, not thinking (model 6.6s, gate 43s mean).
+            //
+            // It was env-only, i.e. invisible and uneditable from this CLI, which is why the
+            // latency looked like the model being slow. Every send pays it, so the default is
+            // a human typing cadence rather than a human being distracted: raise the pair if
+            // you want more padding between messages.
+            {
+                path: 'webchat.sendGapMinMs', label: 'Send gap minimum (ms)', type: 'number', env: 'SEND_GAP_MIN_MS', envOnly: true, default: 3000,
+                help: 'Shortest random wait before a deepseek send. Every send pays this, and one agent turn makes several. 0 disables the random gap.',
+            },
+            {
+                path: 'webchat.sendGapMaxMs', label: 'Send gap maximum (ms)', type: 'number', env: 'SEND_GAP_MAX_MS', envOnly: true, default: 6000,
+                help: 'Longest random wait before a deepseek send. The wait is picked fresh in [min, max] each time so the cadence never repeats.',
+            },
+        ],
+    },
+    {
+        id: 'gates',
+        title: 'Gates & sandbox',
+        blurb: 'What the model is allowed to touch. These are guardrails, not a kernel jail — read the warnings.',
+        settings: [
+            {
+                path: 'features.bashAllowed', label: 'Allow run_bash', type: 'bool', env: 'BASH_ALLOWED', risk: true,
+                help: 'Lets the model execute shell commands. Double-gated: this AND the sandbox bash flag must both be on.',
+            },
+            {
+                path: 'features.sandboxAllowBash', label: 'Sandbox: allow bash', type: 'bool', env: 'SANDBOX_ALLOW_BASH', risk: true,
+                help: 'The second half of the bash gate. A command must also touch only paths inside the sandbox roots.',
+            },
+            {
+                path: 'features.sandbox', label: 'Enable sandbox', type: 'bool', env: 'SANDBOX_ENABLED',
+                help: 'Path fence for file tools and for every path-like token in a bash command. Leave this on.',
+            },
+            {
+                path: 'network.sandboxRoots', label: 'Sandbox roots', type: 'list', env: 'SANDBOX_ROOTS',
+                help: 'Comma-separated directories the model may read and write. Everything else is refused. Empty means no roots, so nothing is reachable.',
+            },
+            {
+                path: 'limits.execTimeoutMs', label: 'Command timeout (ms)', type: 'number', env: 'EXEC_TIMEOUT_MS',
+                help: 'Upper bound on any bash command the model runs.',
+            },
+            {
+                path: 'features.rateLimitCooldownSeconds', label: 'Throttle cooldown (s)', type: 'number', env: 'RATE_LIMIT_COOLDOWN_S',
+                help: 'When the site answers "Messages too frequent", cool that account this long and reply 429 instead of hammering it.',
+            },
+            {
+                path: '__env__.API_TOKEN', label: 'API token', type: 'secret', env: 'API_TOKEN', envOnly: true,
+                help: 'When set, every request needs Authorization: Bearer <token>. Required if you bind beyond localhost.',
+            },
+            {
+                path: '__env__.SANDBOX_LOG', label: 'Log sandbox decisions', type: 'envbool', env: 'SANDBOX_LOG',
+                help: 'Writes each allow/deny decision to the log. Env-only; unset means logging stays on.',
+                advanced: true,
+            },
+        ],
+    },
+    {
+        id: 'loops',
+        title: 'Tool-call loops & limits',
+        blurb: 'How long and how far the model may work before it must answer.',
+        settings: [
+            {
+                path: 'limits.maxToolRounds', label: 'Max tool rounds', type: 'number', env: 'MAX_TOOL_ROUNDS',
+                help: 'Hard ceiling on tool round-trips in one request.',
+            },
+            {
+                path: 'limits.wrapUpRounds', label: 'Wrap-up rounds', type: 'number', env: 'WRAP_UP_ROUNDS',
+                help: 'How many rounds before the ceiling to stop the model and demand its final answer — so running out yields a summary, not an error.',
+            },
+            {
+                path: 'limits.toolContextWindow', label: 'Tool context window (chars)', type: 'number', env: 'TOOL_CONTEXT_WINDOW',
+                help: 'How much of the tool definitions / history is shown to the model.',
+            },
+            {
+                path: 'limits.timeoutMs', label: 'Request timeout (ms)', type: 'number', env: 'TIMEOUT',
+                help: 'Whole-request ceiling. Thinking lanes genuinely cogitate for minutes; 30 minutes is the shipped default.',
+            },
+            {
+                path: 'limits.emptyGraceMs', label: 'Time-to-first-token grace (ms)', type: 'number', env: 'EMPTY_GRACE_MS',
+                help: 'How long a mounted-but-empty response row may stay empty before the send is called aborted. Activity extends it; this is NOT a whole-answer budget.',
+            },
+            {
+                path: 'features.contextHandoff', label: 'Context handoff', type: 'bool', env: 'CONTEXT_HANDOFF_ENABLED',
+                help: 'When the request body grows past the threshold, have the model write a handoff doc, open a fresh chat and seed it.',
+            },
+            {
+                path: 'limits.contextHandoffThreshold', label: 'Handoff threshold (chars)', type: 'number', env: 'CONTEXT_HANDOFF_THRESHOLD',
+                help: 'Measured in request-body characters. ~4 chars per token.',
+            },
+            {
+                path: 'toolBudget.maxToolCalls', label: 'Tool-call budget', type: 'number',
+                help: 'Total tool calls allowed across a whole agent session. Enforced in the opencode layer by plugins/tool-budget.js.',
+            },
+            {
+                path: 'toolBudget.compactEvery', label: 'Compact every N calls', type: 'number',
+                help: 'Compaction cadence for the tool-call history.',
+                advanced: true,
+            },
+            {
+                path: 'limits.antiSpiralMinWords', label: 'Anti-spiral min words', type: 'number',
+                help: 'Responses shorter than this are not treated as a spiral candidate.',
+                advanced: true,
+            },
+            {
+                path: 'limits.maxMalformedRounds', label: 'Malformed-JSON stop threshold', type: 'number', env: 'MAX_MALFORMED_ROUNDS',
+                help: 'How many CONSECUTIVE unparseable tool-JSON replies before the run stops. The counter resets on any good parse, so this bounds a streak, not the total. A malformed reply is always reported back to the model with the exact reason it failed.',
+            },
+            {
+                path: 'limits.malformedRetryEnabled', label: 'Auto-retry after a malformed stop', type: 'bool', env: 'MALFORMED_RETRY_ENABLED',
+                help: 'When the stop threshold is hit, pause and try again by itself instead of ending the run. A model that emitted a bad shape is often fine moments later, so this salvages runs that would otherwise be lost.',
+            },
+            {
+                path: 'limits.malformedRetryDelaySec', label: 'Auto-retry delay (seconds)', type: 'number', env: 'MALFORMED_RETRY_DELAY_SEC',
+                help: 'How long to wait before each automatic retry, in SECONDS — 30, 60, 100. Default 100.',
+            },
+            {
+                path: 'limits.malformedMaxRetries', label: 'Max auto-retries', type: 'number', env: 'MALFORMED_MAX_RETRIES',
+                help: 'How many automatic retries before the run genuinely stops and waits for a wake. 0 stops immediately (same as disabling auto-retry).',
+            },
+            {
+                path: 'features.toolCompactor', label: 'Compact tool results', type: 'bool', env: 'TOOL_COMPACTOR',
+                help: 'Trims big tool results to head+tail before they go back to the model. Errors are never touched.',
+            },
+            {
+                path: 'compactor.maxText', label: 'Compactor text cap (chars)', type: 'number', env: 'COMPACTOR_MAX_TEXT',
+                help: 'A text field longer than this is truncated to head + tail with a marker.',
+                advanced: true,
+            },
+            {
+                path: 'compactor.maxItems', label: 'Compactor item cap', type: 'number', env: 'COMPACTOR_MAX_ITEMS',
+                help: 'A result array longer than this keeps only head + tail items.',
+                advanced: true,
+            },
+        ],
+    },
+    {
+        id: 'behaviour',
+        title: 'Agent behaviour',
+        blurb: 'How the harness talks to the model and what it accepts back.',
+        settings: [
+            {
+                path: 'features.allowPlainText', label: 'Accept plain text replies', type: 'bool', env: 'ALLOW_PLAIN_TEXT',
+                help: 'Off, every reply must be exactly one fenced tool call. On, prose is accepted as the final answer too.',
+            },
+            {
+                path: 'features.noTools', label: 'Research-only (no tools)', type: 'bool', env: 'NO_TOOLS',
+                help: 'Offers the model NO work tools — only submit_answer — so research and plain-English tasks answer directly. Pair with Accept plain text for a pure research lane.',
+            },
+            {
+                path: 'features.memory', label: 'Memory file', type: 'bool', env: 'MEMORY_ENABLED',
+                help: 'Keeps a memory file the model can read/edit (read_memory/edit_memory) and includes it in the system prompt.',
+            },
+            {
+                path: 'memory.maxChars', label: 'Memory size cap (chars)', type: 'number', env: 'MAX_MEMORY_CHARS',
+                help: 'The memory file is capped at this size — it rides into every request.',
+                advanced: true,
+            },
+            {
+                path: 'memory.contents', label: 'Memory contents', type: 'longtext', fileBacked: true,
+                help: 'The memory file itself — edit here, or let the model edit it with edit_memory.',
+            },
+            {
+                path: 'features.ignoreClientSystem', label: 'Ignore caller system prompt', type: 'bool', env: 'IGNORE_CLIENT_SYSTEM',
+                help: 'On, the caller\'s own system message is dropped and only the harness prompt is sent. Required for agent callers whose prompt is their own harness rulebook.',
+            },
+            {
+                path: 'features.narration', label: 'Narration', type: 'bool', env: 'NARRATION',
+                help: 'Asks for a one-line human note before each tool call. Handy when watching by hand; adds tokens to autonomous runs.',
+            },
+            {
+                path: 'features.antiSpiral', label: 'Anti-spiral detection', type: 'bool', env: 'ANTI_SPIRAL',
+                help: 'Detects a model looping on the same reasoning and stops it.',
+            },
+            {
+                path: 'features.passthroughFormat', label: 'Passthrough format', type: 'bool', env: 'PASSTHROUGH_FORMAT',
+                help: 'Do not append the harness output contract — the caller is supplying its own.',
+                advanced: true,
+            },
+            {
+                path: 'features.skipBrowser', label: 'Skip browser', type: 'bool', env: 'SKIP_BROWSER',
+                help: 'Run without a browser at all. Only useful for testing config plumbing.',
+                advanced: true,
+            },
+            {
+                path: 'features.blockedCss', label: 'Block stylesheets', type: 'bool', env: 'BLOCKED_CSS',
+                help: 'Blocks CSS at the CDP layer for speed. SPAs with fragile layouts can break; leave off for Gemini.',
+                advanced: true,
+            },
+            {
+                path: 'network.blockedUrlsExtra', label: 'Extra URL block patterns', type: 'list', env: 'BLOCKED_URLS_EXTRA',
+                help: 'Extra glob patterns to abort at the network layer. Images, fonts and media are already blocked.',
+                advanced: true,
+            },
+        ],
+    },
+    {
+        id: 'advanced',
+        title: 'Selectors & files',
+        blurb: 'The escape hatch for when a site changes its DOM. Comma-separated, first match wins.',
+        settings: [
+            {
+                path: 'webchat.selectors.input', label: 'Input selector', type: 'list', env: 'SELECTOR_INPUT', advanced: true,
+                help: 'The composer.',
+            },
+            { path: 'webchat.selectors.send', label: 'Send selector', type: 'list', advanced: true },
+            { path: 'webchat.selectors.message', label: 'Message selector', type: 'list', advanced: true, help: 'The rows that hold replies.' },
+            { path: 'webchat.selectors.newChat', label: 'New-chat selector', type: 'list', advanced: true },
+            {
+                path: 'webchat.threadPattern', label: 'Thread URL pattern', type: 'string', advanced: true,
+                help: 'Regex proving a new chat got a real thread, e.g. /app/[0-9a-f]{6,} for Gemini.',
+            },
+            { path: 'paths.cookieFile', label: 'Cookie file', type: 'string', env: 'COOKIE_FILE', advanced: true },
+            { path: 'paths.memoryFile', label: 'Memory file path', type: 'string', env: 'MEMORY_FILE', advanced: true, help: 'Where the persistent memory file lives.' },
+        ],
+    },
+];
+
+// Flat index for lookup by dotted path.
+const BY_PATH = new Map();
+for (const group of SCHEMA) {
+    for (const s of group.settings) BY_PATH.set(s.path, { ...s, group: group.id, groupTitle: group.title });
+}
+
+// ── Path helpers ───────────────────────────────────────────────────────────
+function getPath(obj: unknown, dotted: string): unknown {
+    return dotted.split('.').reduce<unknown>((acc, k) => (acc && typeof acc === 'object' ? (acc as Record<string, unknown>)[k] : undefined), obj);
+}
+
+function setPath(obj: Record<string, unknown>, dotted: string, value: unknown): Record<string, unknown> {
+    const keys = dotted.split('.');
+    let cur: Record<string, unknown> = obj;
+    for (const k of keys.slice(0, -1)) {
+        const next = cur[k];
+        if (typeof next !== 'object' || next === null || Array.isArray(next)) cur[k] = {};
+        cur = cur[k] as Record<string, unknown>;
+    }
+    const last = keys[keys.length - 1];
+    if (value === undefined) delete cur[last];
+    else cur[last] = value;
+    return obj;
+}
+
+// ── .env handling ──────────────────────────────────────────────────────────
+function parseEnvFile(text: unknown): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const raw of String(text).split('\n')) {
+        let line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        // dotenv accepts `export KEY=value` in a .env file, so a parser that
+        // does not strip the prefix stores a key literally named "export KEY"
+        // and the real setting is never found.
+        line = line.replace(/^export\s+/, '');
+        const eq = line.indexOf('=');
+        if (eq === -1) continue;
+        const key = line.slice(0, eq).trim();
+        let val = line.slice(eq + 1).trim();
+        // Strip one layer of matching quotes, the way dotenv does.
+        if (val.length >= 2 && ((val[0] === '"' && val.endsWith('"')) || (val[0] === "'" && val.endsWith("'")))) {
+            val = val.slice(1, -1);
+        }
+        out[key] = val;
+    }
+    return out;
+}
+
+// Sets or replaces one key, preserving every other line and every comment.
+function setEnvVar(envText: unknown, key: string, value: unknown): string {
+    const lines = String(envText).split('\n');
+    const re = new RegExp(`^\\s*(export\\s+)?${key}\\s*=`);
+    let replaced = false;
+    const next = lines.map((l) => {
+        if (re.test(l)) {
+            replaced = true;
+            return `${key}=${value}`;
+        }
+        return l;
+    });
+    if (!replaced) {
+        if (next.length && next[next.length - 1].trim() !== '') next.push(`${key}=${value}`);
+        else next.splice(next.length - 1, 0, `${key}=${value}`);
+    }
+    return next.join('\n');
+}
+
+function removeEnvVar(envText: unknown, key: string): string {
+    const re = new RegExp(`^\\s*(export\\s+)?${key}\\s*=`);
+    return String(envText)
+        .split('\n')
+        .filter((l) => !re.test(l))
+        .join('\n');
+}
+
+// ── Config file location ───────────────────────────────────────────────────
+// There are TWO config files on a working install and they are not the same
+// file: `harness/harness.config.json` (in the clone, the template that ships)
+// and the real one OUTSIDE the clone, which `harness/.env` points at via
+// HARNESS_CONFIG. Editing the wrong one looks like the CLI is broken. So the
+// resolution order mirrors what the harness itself does at boot:
+//   1. an explicit path
+//   2. HARNESS_CONFIG in the real environment
+//   3. HARNESS_CONFIG in harness/.env  (what dotenv sets at boot)
+//   4. harness/harness.config.json
+function envFilePath(explicit?: string): string {
+    if (explicit) return path.resolve(explicit);
+    if (process.env.ENV_FILE) return path.resolve(process.env.ENV_FILE);
+    return path.join(__dirname, '..', '.env');
+}
+
+function loadDotenv(explicit?: string): { file: string; vars: Record<string, string>; missing: boolean; error?: unknown } {
+    const file = envFilePath(explicit);
+    if (!fs.existsSync(file)) return { file, vars: {}, missing: true };
