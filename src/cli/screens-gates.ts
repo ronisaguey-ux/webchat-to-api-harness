@@ -318,3 +318,323 @@ function build(ctx: ScreensCtx): Record<string, (...args: never[]) => unknown> {
         const prevConn = D.readConnection() || {};
         D.writeConnection({
             gates: [{ id: updated.id, gatewayPort: updated.gatewayPort, cdpPort: updated.cdpPort }],
+            mode: updated.site,
+            agent: prevConn.agent || null,
+            cdpWsUrl: prevConn.cdpWsUrl || null,
+            targetUrl: prevConn.targetUrl || null,
+            connectedAt: new Date().toISOString(),
+        });
+
+        await panel('Connected', [
+            `${A.green('✓')} ${A.bold(updated.label)} is now a webchat the CLI can use.`,
+            '',
+            A.dim('Next: choose your agentic harness and permission mode, then Launch.'),
+        ], 'Back');
+    }
+
+    // ── Harnesses ────────────────────────────────────────────────────────────
+    async function screenHarnesses(startIndex = 0) {
+        const cfg = LC.read();
+        const chosen = new Set(cfg.harnesses || []);
+
+        A.clear();
+        header(['Agentic harness']);
+        const body = [
+            `Which agent should run against your webchats.`,
+            '',
+            A.dim('Installed ones are marked. You can pick more than one — each gets its'),
+            A.dim('own terminal, because they are interactive programs.'),
+        ];
+        for (const l of A.boxLines('Agentic harness', body)) A.line(l);
+        A.newline();
+
+        // ONE harness (radio, not checkbox): an agentic harness takes over the
+        // terminal, so running two at once is not a thing you can do.
+        const items = H.HARNESSES.map((h) => {
+            const has = H.installed(h);
+            return {
+                label: `${chosen.has(h.id) ? '(●)' : '( )'} ${h.label}`,
+                hint: has ? h.note : `${h.bin} is not installed`,
+                value: h.id,
+            };
+        });
+        items.push({ label: 'Back', value: 'back', hint: '' });
+
+        const pick = await A.menu(items, {
+            title: 'Agentic harness',
+            footer: ['Enter picks the agent to run — one at a time.'],
+            startIndex,
+        });
+        if (pick === A.BACK || pick === 'back') return;
+        const chosenHarness = H.harnessById(pick);
+        if (!chosenHarness || !H.installed(chosenHarness)) {
+            await panel('Not installed', [
+                `${A.bold(chosenHarness ? chosenHarness.label : String(pick))} is not installed.`,
+                '',
+                A.dim(`Install ${chosenHarness ? chosenHarness.bin : String(pick)} first, then pick it here.`),
+            ], 'Back');
+            return screenHarnesses(items.findIndex((i) => i.value === pick));
+        }
+        // Replace, never accumulate — and persist immediately, because the re-entrant
+        // call rebuilds the choice from this file.
+        LC.write({ harnesses: [String(pick)] });
+        return screenHarnesses(items.findIndex((i) => i.value === pick));
+    }
+
+    async function screenMode() {
+        const cfg = LC.read();
+        const pick = await A.menu(
+            [...Object.values(H.MODES).map((m) => ({
+                label: m.label,
+                hint: m.blurb,
+                value: m.id,
+            })), { label: 'Back', value: 'back' }],
+            {
+                title: `Permission mode (now: ${cfg.mode})`,
+                footer: ['This is passed to your harness with the flags it understands.'],
+            },
+        );
+        if (pick === A.BACK || pick === 'back') return;
+        LC.write({ mode: String(pick) });
+    }
+
+    // ── The primed config ────────────────────────────────────────────────────
+    //
+    // This is what `webchat connect` executes. Showing the exact command is the point:
+    // the user can see what will happen, and run it themselves if they prefer.
+    async function screenPlan() {
+        const cfg = LC.read();
+        // Refreshed: this screen DISPLAYS connected state per gate, so it must show what is
+        // true now, not what was recorded when the tab was confirmed.
+        const { gates } = await G.refresh(undefined, 30000);
+        const v = LC.validate(cfg, gates);
+
+        A.clear();
+        header(['Launch']);
+        const body = [];
+
+        body.push(`${A.dim('webchats')}   ${cfg.gates.length
+            ? cfg.gates.map((id) => {
+                const g = gates.find((x) => x.id === id);
+                return g ? (g.connected ? A.green(g.label) : A.yellow(`${g.label} (not connected)`)) : A.red(id);
+            }).join(', ')
+            : A.gray('none selected')}`);
+        body.push(`${A.dim('harness')}    ${cfg.harnesses.length ? cfg.harnesses.join(', ') : A.gray('none selected')}`);
+        body.push(`${A.dim('mode')}       ${cfg.mode}${cfg.mode === 'yolo' ? A.red('  (no gate at all)') : ''}`);
+        body.push(`${A.dim('directory')}  ${shortHome(cfg.cwd)}`);
+
+        if (!v.ok) {
+            body.push('');
+            body.push(A.yellow('Not ready:'));
+            for (const p of v.problems) body.push(`  ${A.gray('·')} ${p}`);
+        }
+        for (const l of A.boxLines('Ready to launch?', body)) A.line(l);
+
+        // The exact command, copy-pasteable, so the click is never the only way.
+        if (v.ok) {
+            A.newline();
+            A.line(`  ${A.dim('webchat connect runs exactly this:')}`);
+            const primary = gates.find((g) => g.id === cfg.gates[0]);
+            const env = H.envFor(cfg.gates
+                .map((id) => gates.find((g) => g.id === id))
+                .filter((g): g is NonNullable<typeof g> => Boolean(g)));
+            A.line(`  ${A.gray(`OPENAI_BASE_URL=${env.OPENAI_BASE_URL} HARNESS_MODEL_NAME=${env.HARNESS_MODEL_NAME}`)}`);
+            for (const hid of cfg.harnesses) {
+                const h = H.harnessById(hid);
+                if (h) A.line(`  ${A.gray(`${h.bin} ${H.argvFor(h, cfg.mode).join(' ')}`.trim())}`);
+            }
+        }
+        A.newline();
+
+        const items = [
+            { label: 'Choose webchats', hint: `${cfg.gates.length} selected`, value: 'pickgates' },
+            { label: 'Choose harness', hint: cfg.harnesses.join(', ') || 'none', value: 'pickh' },
+            { label: 'Permission mode', hint: cfg.mode, value: 'mode' },
+        ];
+        if (v.ok) items.push({ label: 'Launch now', hint: 'same as running webchat connect', value: 'go' });
+        items.push({ label: 'Back', value: 'back', hint: '' });
+
+        const choice = await A.menu(items, { title: 'Launch' });
+        if (choice === A.BACK || choice === 'back') return;
+        if (choice === 'pickgates') await screenPickGates();
+        else if (choice === 'pickh') await screenHarnesses();
+        else if (choice === 'mode') await screenMode();
+        else if (choice === 'go') return 'launch';
+    }
+
+    async function screenPickGates(startIndex = 0) {
+        const cfg = LC.read();
+        // Refreshed: the hint per row says "connected", so it has to be the live answer.
+        const { gates } = await G.refresh(undefined, 30000);
+        const chosen = new Set(cfg.gates || []);
+
+        if (!gates.length) {
+            await panel('No webchats yet', [A.dim('Add one from the Webchats list first.')]);
+            return;
+        }
+
+        const items = gates.map((g) => ({
+            label: `${chosen.has(g.id) ? '[x]' : '[ ]'} ${g.label}`,
+            hint: `${g.site}${g.connected ? ' · connected' : ' · not connected'}`,
+            value: g.id,
+        }));
+        items.push({ label: 'Done', hint: `${chosen.size} selected`, value: 'done' });
+
+        const pick = await A.menu(items, {
+            title: 'Which webchats should this harness use?',
+            footer: [
+                'Enter selects a webchat. The first one selected is the primary.',
+            ],
+            startIndex,
+        });
+        if (pick === A.BACK) return;
+        if (pick === 'done') {
+            // Keep the selection order stable: a Set preserves insertion order, but
+            // re-selecting an already-selected gate would not reorder it. Order
+            // matters because the primary is the first entry.
+            LC.write({ gates: [...chosen] });
+            return;
+        }
+        if (chosen.has(String(pick))) chosen.delete(String(pick));
+        else chosen.add(String(pick));
+        // Persist NOW — the next call rebuilds `chosen` from this file.
+        LC.write({ gates: [...chosen] });
+        const at = items.findIndex((i) => i.value === pick);
+        return screenPickGates(at >= 0 ? at : startIndex);
+    }
+
+    // ── Tools ────────────────────────────────────────────────────────────────
+    // Each tool is its OWN setting (`tools.disabled::<name>`, default false = available).
+    // This used to read one array setting called `tools.disabled`, which the schema does
+    // not have, so the very first row lookup returned undefined and the screen died with
+    // "Cannot read properties of undefined (reading 'value')" before it drew anything.
+    const toolPath = (name: string): string => `tools.disabled::${name}`;
+
+    // ── Per-tool limits ──────────────────────────────────────────────────────
+    // A tool is either on or off; a LIMIT is the finer switch: this tool, but not when
+    // the arguments look like this. Each limit is either a hard ban or an ask-the-user,
+    // and an ask applies in every permission mode — which is what makes it worth having.
+    const LIMIT_PATH = 'tools.limits';
+
+    function readLimits() {
+        const st = ctx.state();
+        const list = S.getPath(st.raw, LIMIT_PATH);
+        const out: Record<string, unknown[]> = {};
+        if (list && typeof list === 'object' && !Array.isArray(list)) {
+            for (const [k, v] of Object.entries(list)) {
+                if (Array.isArray(v)) {
+                    out[k] = v.filter((x) => x && typeof x === 'object' && String(x.match || '').trim())
+                        .map((x) => ({
+                            match: String(x.match),
+                            enforce: x.enforce === 'ask' ? 'ask' : 'ban',
+                            note: x.note ? String(x.note) : '',
+                        }));
+                }
+            }
+        }
+        return out;
+    }
+
+    function limitHint(limits: Record<string, unknown[]>, tool: string): string {
+        const list = (limits[tool] || []) as Array<{ enforce?: string }>;
+        if (!list.length) return '';
+        const bans = list.filter((l: { enforce?: string }) => l.enforce === 'ban').length;
+        const asks = list.length - bans;
+        return [bans ? `${bans} ban` : '', asks ? `${asks} ask` : ''].filter(Boolean).join(' · ');
+    }
+
+    async function writeLimits(limits: Record<string, unknown[]>): Promise<void> {
+        // Drop a tool that has no limits left, so the config does not accumulate empty
+        // keys the screen would then have to explain.
+        const clean: Record<string, unknown[]> = {};
+        for (const [k, v] of Object.entries(limits)) if (v && v.length) clean[k] = v;
+        await ctx.saveSetting(LIMIT_PATH, clean);
+    }
+
+    async function screenLimits() {
+        for (;;) {
+            const limits = readLimits();
+            let names: string[] = [];
+            try {
+                names = (require(path.join(__dirname, '..', '..', 'src', 'tools', 'tools')) as { getToolDefinitions: () => Array<{ name: string }> })
+                    .getToolDefinitions().map((t: { name: string }) => t.name);
+            } catch { names = []; }
+
+            const items: Array<{ label: string; hint?: string; value: string }> = names.map((n: string) => ({
+                label: n,
+                hint: limitHint(limits, n) || 'no limits',
+                value: n,
+            }));
+            items.push({ label: 'Back', value: 'back' });
+
+            const pick = await A.menu(items, {
+                title: 'Limits — which tool?',
+                footer: ['A limit applies to the arguments of one tool. Enter opens its limits.'],
+            });
+            if (pick === A.BACK || pick === 'back') return;
+            await screenToolLimits(String(pick));
+        }
+    }
+
+    async function screenToolLimits(tool: string): Promise<void> {
+        for (;;) {
+            const limits = readLimits();
+            const list = (limits[tool] || []) as Array<{ enforce?: string; match?: string; note?: string; id?: string }>;
+            const items: Array<{ label: string; hint?: string; value: string }> = list.map((l) => ({
+                label: `${l.enforce === 'ban' ? 'BAN' : 'ASK'}  ${l.match}`,
+                hint: l.enforce === 'ban' ? 'refused outright' : 'refused until the user approves',
+                value: `edit:${list.indexOf(l)}`,
+            }));
+            items.push({ label: 'Add a limit', hint: 'a substring, or /a regex/', value: 'add' });
+            items.push({ label: 'Back', value: 'back' });
+
+            const pick = await A.menu(items, {
+                title: `${tool} — limits`,
+                footer: ['BAN refuses the call. ASK refuses it until a human approves, in every mode.'],
+            });
+            if (pick === A.BACK || pick === 'back') return;
+
+            if (pick === 'add') {
+                const match = await A.prompt(`Text to match in ${tool}'s arguments (substring, or /regex/)`, {
+                    hint: 'Matched against every value the model passes to this tool.',
+                });
+                if (!match || !String(match).trim()) continue;
+                const enforce = await A.menu([
+                    { label: 'Hard ban', hint: 'refuse the call outright', value: 'ban' },
+                    { label: 'Ask permission', hint: 'refuse until the user approves, in every mode', value: 'ask' },
+                    { label: 'Back', value: 'back' },
+                ], { title: `How should "${String(match).slice(0, 40)}" be enforced?` });
+                if (enforce !== 'ban' && enforce !== 'ask') continue;
+                const next = readLimits();
+                next[tool] = (next[tool] || []).concat([{ match: String(match).trim(), enforce }]);
+                await writeLimits(next);
+                continue;
+            }
+
+            const idx = Number(String(pick).split(':')[1]);
+            const current = ((readLimits()[tool] || []) as Array<{ enforce?: string; match?: string }>)[idx];
+            if (!current) continue;
+            const action = await A.menu([
+                { label: current.enforce === 'ban' ? 'Change to ASK' : 'Change to BAN', value: 'flip' },
+                { label: 'Delete this limit', value: 'del' },
+                { label: 'Back', value: 'back' },
+            ], { title: `${String(current.enforce).toUpperCase()}  ${current.match}` });
+            const next = readLimits();
+            const arr = next[tool] || [];
+            if (action === 'flip') {
+                arr[idx] = { ...current, enforce: current.enforce === 'ban' ? 'ask' : 'ban' };
+                next[tool] = arr;
+                await writeLimits(next);
+            } else if (action === 'del') {
+                arr.splice(idx, 1);
+                next[tool] = arr;
+                await writeLimits(next);
+            }
+        }
+    }
+
+    async function screenTools(startIndex: number = 0): Promise<void> {
+        const st = ctx.state();
+        const rows = ctx.rowsOf(st);
+        const rowFor = (name: string) => rows.find((r: { setting: { path: string } }) => r.setting.path === toolPath(name));
+        // `value` is TRUE WHEN THE TOOL IS AVAILABLE -- resolve() reports
