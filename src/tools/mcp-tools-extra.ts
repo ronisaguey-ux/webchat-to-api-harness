@@ -318,3 +318,291 @@ const TOOLS = [
             if (res && res.port && res.port !== gate.gatewayPort) {
                 try { if (gatesMod && gatesMod.update) gatesMod.update(gate.id, { gatewayPort: res.port }); } catch { /* keep going */ }
                 gate.gatewayPort = res.port;
+            }
+            const deadline = Date.now() + 20000;
+            for (;;) {
+                const h = await httpJson('GET', gatewayBase(gate) + '/health', null, 3000);
+                if (h.ok && h.status) return asText({ gate: gate.id, restarted: true, health: h.body });
+                if (Date.now() >= deadline) return asText({ gate: gate.id, restarted: true, answered: false });
+                await new Promise<void>((r) => { setTimeout(r, 1000); });
+            }
+        }),
+
+    // ── observation ──────────────────────────────────────────────────────────
+    tool('webchat_health_all',
+        'Health of EVERY webchat in one call: reachable, browser attached, in-flight state, send count, wedge state and any cooldown. Cheaper than calling webchat_status per lane, and it is the first thing to run when something looks slow.',
+        null, null,
+        async () => {
+            const out = [];
+            for (const g of allGates()) {
+                const h = await httpJson('GET', gatewayBase(g) + '/health', null, 4000);
+                const m = await httpJson('GET', gatewayBase(g) + '/metrics', null, 4000);
+                out.push({
+                    gate: g.id,
+                    gatewayPort: g.gatewayPort,
+                    cdpPort: g.cdpPort,
+                    reachable: Boolean(h.ok && h.status),
+                    health: (h.body && h.body) || null,
+                    metrics: (m.body && m.body) || null,
+                    error: h.ok ? null : h.error,
+                });
+            }
+            return asText({ lanes: out });
+        }),
+    tool('webchat_metrics',
+        'The live metrics for one lane: whether a request is in flight and for how long, how many sends have happened, pacing state, and throttle cooldown. This is where requestInFlight lives — it is NOT on /health.',
+        { gate: S('Webchat id. Defaults to the active one.') },
+        null,
+        async (a) => {
+            const gate = activeGate(asStr(a.gate));
+            if (!gate) return asError('no webchat configured');
+            const m = await httpJson('GET', gatewayBase(gate) + '/metrics', null, 5000);
+            if (!m.ok || !m.status) return asError('metrics unreachable on ' + gatewayBase(gate) + ': ' + (m.error || 'HTTP ' + m.status));
+            return asText(m.body);
+        }),
+    tool('webchat_logs',
+        'Read a gateway log. Defaults to the primary gateway log; pass lines to get a tail. Use this to see WHY a request failed — a failed send writes its reason here.',
+        { gate: S('Webchat id. Defaults to the active one.'), lines: N('How many trailing lines. Default 80.'), file: S('Read this log file instead (absolute path).') },
+        null,
+        async (a) => {
+            let file: string | undefined = a.file === undefined ? undefined : String(a.file);
+            if (!file) {
+                const gate = activeGate(asStr(a.gate));
+                const port = (gate && gate.gatewayPort) || 8081;
+                const runtime = runtimeStateDir();
+                const candidates = [
+                    // where the daemon actually writes today
+                    path.join(runtime, 'gateway-' + port + '.log'),
+                    path.join(runtime, 'gateway-' + port + '.err.log'),
+                    path.join(runtime, 'gateway.log'),
+                    // places older checkouts wrote to
+                    '/tmp/opencode/gw_' + port + '.log',
+                    path.join(stateDir(), 'gateway-' + port + '.log'),
+                    path.join(stateDir(), 'gateway.log'),
+                ].filter((f) => { try { return fs.existsSync(f); } catch { return false; } });
+                // Prefer the file the daemon is writing NOW. A stale log that merely
+                // exists is worse than no log: it reads as a real, recent failure.
+                file = candidates.sort((x: string, y: string) => {
+                    try { return fs.statSync(y).mtimeMs - fs.statSync(x).mtimeMs; } catch { return 0; }
+                })[0];
+                if (!file) return asError('no gateway log found (looked in ' + runtime + ' and ' + stateDir() + ')');
+            }
+            if (!file) return asError('no gateway log found');
+            if (!fs.existsSync(file)) return asError('no log at ' + file);
+            const n = Math.min(Math.max(Number(a.lines) || 80, 1), 2000);
+            const text = fs.readFileSync(String(file), 'utf8').split('\n');
+            return asText({ file, lines: n, tail: text.slice(-n).join('\n') });
+        }),
+    tool('webchat_probe_lane',
+        'Send the smallest possible prompt to a lane and time it, to answer "is this lane actually working right now?". Reports OK, the reply, and the elapsed ms — useful before blaming slowness on a lane.',
+        { gate: S('Webchat id. Defaults to the active one.'), timeoutMs: N('Defaults to 120000.') },
+        null,
+        async (a) => {
+            const gate = activeGate(asStr(a.gate));
+            if (!gate) return asError('no webchat configured');
+            const alias = 'webchat/' + gate.id;
+            const t0 = Date.now();
+            const r = await httpJson('POST', aggregateBase() + '/v1/chat/completions', {
+                model: alias,
+                messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+                max_tokens: 10,
+            }, Math.min(Math.max(Number(a.timeoutMs) || 120000, 5000), 600000));
+            const ms = Date.now() - t0;
+            if (!r.ok) return asText({ gate: gate.id, ok: false, elapsedMs: ms, error: r.error });
+            if (r.status !== 200) return asText({ gate: gate.id, ok: false, elapsedMs: ms, status: r.status, body: r.body });
+            const choices = pick(r.body, 'choices');
+            const first = Array.isArray(choices) ? choices[0] : undefined;
+            const content = pick(first, 'message', 'content');
+            return asText({ gate: gate.id, ok: true, elapsedMs: ms, reply: content });
+        }),
+
+    // ── threads / tabs ───────────────────────────────────────────────────────
+    tool('webchat_threads',
+        'List the browser tabs a lane can see, with the URL of each. Use this to find which conversation a lane is pinned to before sending to it.',
+        { gate: S('Webchat id. Defaults to the active one.') },
+        null,
+        async (a) => {
+            const gate = activeGate(asStr(a.gate));
+            if (!gate) return asError('no webchat configured');
+            const r = await httpJson('GET', 'http://127.0.0.1:' + gate.cdpPort + '/json/list', null, 5000);
+            if (!r.ok) return asError('CDP unreachable on ' + gate.cdpPort + ': ' + r.error);
+            let tabs: Array<Record<string, unknown>> = [];
+            try {
+                const parsed = JSON.parse(String(r.raw)) as unknown;
+                tabs = (Array.isArray(parsed) ? parsed : [])
+                    .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object' && (t as Record<string, unknown>).type === 'page')
+                    .map((t) => ({ title: t.title, url: t.url, id: t.id }));
+            }
+            catch { return asError('CDP returned an unparseable target list'); }
+            return asText({ gate: gate.id, tabs });
+        }),
+
+    // ── memory ───────────────────────────────────────────────────────────────
+    tool('webchat_memory_read',
+        'Read the memory file the model shares with you. This is persistent context that is injected into the system prompt on every request.',
+        null, null,
+        async () => {
+            const mem = safeRequireTyped<MemoryModule>('../runtime/memory');
+            if (!mem) return asError('memory module unavailable');
+            return asText({ file: mem.memoryFile(), contents: mem.readMemory() });
+        }),
+    tool('webchat_memory_write',
+        'Replace the memory file. This is what the model will carry into every future task, so keep it to durable facts rather than a transcript.',
+        { contents: S('The new memory contents. An empty string clears it.') },
+        ['contents'],
+        async (a) => {
+            const mem = safeRequireTyped<MemoryModule>('../runtime/memory');
+            if (!mem) return asError('memory module unavailable');
+            mem.writeMemory(String(a.contents == null ? '' : a.contents));
+            return asText({ file: mem.memoryFile(), chars: mem.readMemory().length });
+        }),
+    tool('webchat_memory_append',
+        'Append one line to the memory file. Convenient for recording a fact while working without rewriting the whole file.',
+        { text: S('The line to append.') },
+        ['text'],
+        async (a) => {
+            const mem = safeRequireTyped<MemoryModule>('../runtime/memory');
+            if (!mem) return asError('memory module unavailable');
+            const cur = mem.readMemory();
+            const next = cur.endsWith('\n') || cur === '' ? cur + String(a.text) + '\n' : cur + '\n' + String(a.text) + '\n';
+            mem.writeMemory(next);
+            return asText({ file: mem.memoryFile(), chars: next.length, appended: String(a.text) });
+        }),
+
+    // ── sandbox / safety ─────────────────────────────────────────────────────
+    tool('webchat_sandbox_check',
+        'Ask whether a path or a command would be ALLOWED before trying it. Returns the same verdict the tool loop would reach, so you can see a denial instead of triggering one.',
+        { path: S('A file path to test.'), command: S('A shell command to test instead.') },
+        null,
+        async (a) => {
+            const sandbox = safeRequireTyped<SandboxModule>('../tools/sandbox');
+            if (!sandbox) return asError('sandbox module unavailable');
+            const out: Record<string, unknown> = {};
+            if (a.path) out.path = { value: a.path, verdict: sandbox.checkPath ? sandbox.checkPath(a.path) : 'checkPath not exported' };
+            if (a.command) out.command = { value: a.command, verdict: sandbox.checkCommand(String(a.command)) };
+            if (!a.path && !a.command) out.roots = sandbox.roots;
+            return asText(out);
+        }),
+
+    // ── swarm: fan work across every lane ─────────────────────────────────────
+    // The point of these is throughput. Asking one lane blocks for the whole answer, so a
+    // list of ten tasks costs the sum of ten answers. A swarm spreads the list across every
+    // available lane at once and collects the results, which is the difference between
+    // "ten minutes" and "one minute".
+    tool('webchat_swarm_run',
+        'Run many prompts across ALL available lanes in parallel and return every result. Tasks are distributed round-robin over the lanes that are actually reachable. Use this instead of calling webchat_ask in a loop.',
+        {
+            prompts: { type: 'array', description: 'The list of tasks. Each is an independent prompt.', items: { type: 'string' } },
+            gates: { type: 'array', description: 'Which webchats to use. Defaults to every reachable one.', items: { type: 'string' } },
+            concurrency: N('How many tasks in flight at once. Defaults to the number of lanes.'),
+            timeoutMs: N('Per task, default 300000. Budget generously: a webchat injects a ' +
+                         'DELIBERATE pause before EVERY send (SEND_GAP_MAX_MS — 6s by default, ' +
+                         'so budget ~15s per prompt on one lane, raisable in the CLI settings). ' +
+                         'A caller whose own request budget ' +
+                         'is shorter than the swarm takes sees "Request timed out" over work that ' +
+                         'is still in flight — verified: the same call returns ok=2 in 236s when ' +
+                         'run outside the client. For a long swarm, prefer several small calls.'),
+        },
+        ['prompts'],
+        async (a) => {
+            const swarm = safeRequireTyped<SwarmModule>('../runtime/swarm');
+            if (!swarm) return asError('swarm runtime unavailable');
+            const { runSwarm } = swarm;
+            const out = await runSwarm({
+                prompts: (Array.isArray(a.prompts) ? a.prompts : []).map(String),
+                gates: Array.isArray(a.gates) ? a.gates.map(String) : null,
+                concurrency: a.concurrency === undefined ? undefined : asNum(a.concurrency, 1),
+                timeoutMs: a.timeoutMs === undefined ? undefined : asNum(a.timeoutMs, 300000),
+            });
+            return asText(out);
+        }),
+    tool('webchat_swarm_race',
+        'Send the SAME prompt to every lane at once and return whichever answers first, plus every other answer as it lands. Useful when you want the fastest reply rather than a specific lane.',
+        { prompt: S('The prompt to race.'), gates: { type: 'array', description: 'Which webchats to race. Defaults to every reachable one.', items: { type: 'string' } }, timeoutMs: N('Default 300000.') },
+        ['prompt'],
+        async (a) => {
+            const swarm = safeRequireTyped<SwarmModule>('../runtime/swarm');
+            if (!swarm) return asError('swarm runtime unavailable');
+            const { raceSwarm } = swarm;
+            return asText(await raceSwarm({
+                prompt: String(a.prompt),
+                gates: Array.isArray(a.gates) ? a.gates.map(String) : null,
+                timeoutMs: a.timeoutMs === undefined ? undefined : asNum(a.timeoutMs, 300000),
+            }));
+        }),
+
+    // ── local decision model (Laya) ───────────────────────────────────────────
+    // Laya is a tiny local judgment model: it answers typed questions (choice / score /
+    // noul) in one forward pass with a probability, no text generated. When it is running
+    // it is ~2ms and free, so it belongs in front of any call whose only purpose was to get
+    // a label or a yes/no back.
+    tool('webchat_decide',
+        'Ask a local decision model (Laya, if running) for a typed judgment instead of spending a full LLM turn: classify into your own options, score on an ordered scale, or get a calibrated yes/no. Costs nothing and answers in milliseconds. Returns the answer and its probabilities, or says the model is not reachable.',
+        {
+            state: { type: 'object', description: 'The thing being judged — any JSON object, e.g. {subject, body} or a record.' },
+            questions: { type: 'object', description: 'Typed questions keyed by id. Each: {type: "choice"|"score"|"noul", instructions, criteria}. For noul, criteria must be keyed true/false.' },
+            endpoint: S('Override the Laya endpoint. Default http://127.0.0.1:8000.'),
+        },
+        ['state', 'questions'],
+        async (a) => {
+            const base = String(a.endpoint || process.env.LAYA_ENDPOINT || 'http://127.0.0.1:8000').replace(/\/$/, '');
+            const r = await httpJson('POST', base + '/v1/systemone', { state: a.state, questions: a.questions }, 60000);
+            if (!r.ok) {
+                return asText({
+                    available: false,
+                    endpoint: base,
+                    error: r.error,
+                    howToStart: 'laya-serve (pip install "laya[serve]") binds 127.0.0.1:8000. Without it, use webchat_ask or a lane.',
+                });
+            }
+            if (r.status !== 200) return asText({ available: true, status: r.status, body: r.body || r.raw });
+            return asText({ available: true, endpoint: base, result: r.body });
+        }),
+
+    // ── environment / paths / version ─────────────────────────────────────────
+    tool('webchat_paths',
+        'Every path this harness resolves: the config file it actually reads, the .env, the workspace root, the state directory, the memory file and the Chrome profile. Run this when a setting "does nothing" — it shows WHICH file is in charge.',
+        null, null,
+        async () => {
+            const out: Record<string, unknown> = {};
+            try { out.workspaceRoot = PATHS ? PATHS.workspaceRoot() : null; } catch { /* optional */ }
+            if (settingsMod) {
+                out.configFile = settingsMod.configFilePath();
+                out.envFile = settingsMod.envFilePath();
+            }
+            out.stateDir = stateDir();
+            out.runtimeStateDir = runtimeStateDir();
+            const mem = safeRequireTyped<MemoryModule>('../runtime/memory');
+            if (mem) out.memoryFile = mem.memoryFile();
+            // The daemon puts the profile under its own state dir, so reporting only the
+            // env var reads as "null" on a box whose profile clearly exists.
+            const profile = process.env.CHROME_PROFILE || path.join(runtimeStateDir(), 'chrome-profile');
+            out.chromeProfile = fs.existsSync(profile) ? profile : null;
+            out.repo = REPO;
+            return asText(out);
+        }),
+    tool('webchat_version',
+        'The harness version, Node version, platform, and the git commit this checkout is on — so a report can name exactly what ran.',
+        null, null,
+        async () => {
+            let version: string | null = null; let commit: string | null = null;
+            try {
+                const pkg = require(path.join(REPO, 'package.json')) as { version?: string };
+                version = pkg.version || null;
+            } catch { /* no package.json */ }
+            try {
+                const r = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: REPO, encoding: 'utf-8', timeout: 5000 });
+                if (r.status === 0) commit = String(r.stdout).trim();
+            } catch { /* not a git checkout */ }
+            const plat = safeRequireTyped<{ current: () => string }>('../core/platform');
+            return asText({
+                version: version || '(not set)',
+                commit: commit || '(unknown)',
+                node: process.version,
+                platform: plat ? plat.current() : process.platform,
+                host: process.platform,
+            });
+        }),
+];
+
+export = { TOOLS };
