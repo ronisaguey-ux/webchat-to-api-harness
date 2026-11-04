@@ -958,3 +958,19 @@ export = {
     startHub, stopHub, hubRunning, pidLooksLikeHub, realDisplay, isVirtualDisplay, displayWorks, listGateways, gatewayKey, defaultGatewayPort, stopProcess,
     chromePath, cdpAlive, cdpTargets, browserRunning, launchBrowser,
     pidLooksLikeBrowser, pidLooksLikeGateway,
+    tailLines,
+    copyToClipboard, restoreForExec,
+    launchInTerminal, whichTerminal,
+    connectFile, readConnection, writeConnection, clearConnection,
+    normalizeConnection,
+};
+
+// Hand the terminal back to cooked mode before spawning something that owns the
+// TTY (the agent launcher). The TUI runs raw-mode and with the cursor hidden, so
+// exec'ing without this leaves the child drawing into a raw terminal.
+function restoreForExec(): void {
+    try {
+        if (process.stdin.isTTY && process.stdin.isRaw) process.stdin.setRawMode(false);
+        process.stdout.write('\u001b[?25h');
+    } catch { /* not a TTY */ }
+}
