@@ -104,3 +104,6 @@ cookies.json
 # local dependency links (2026-10-05)
 node_modules
 node_modules/
+
+# TypeScript build output (npm run build)
+/dist/
