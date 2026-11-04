@@ -958,3 +958,92 @@ async function handle(msg: JsonRpcRequest): Promise<void> {
         const args: ToolArgs = (msg.params && msg.params.arguments) || {};
         const t = TOOLS.find((x) => x.name === name);
         if (!t) {
+            // An unknown tool is a PROTOCOL error, not a failed call: the caller asked
+            // for something that was not in the list it was handed.
+            return send({ jsonrpc: '2.0', id, error: { code: -32601, message: 'unknown tool "' + name + '"' } });
+        }
+        try {
+            return send({ jsonrpc: '2.0', id, result: await t.handler(args as ToolArgs) });
+        } catch (e) {
+            // A throwing tool is a failed CALL, not a broken server — the agent should
+            // see the error and be able to try something else.
+            return send({
+                jsonrpc: '2.0', id,
+                result: { content: [{ type: 'text', text: 'Tool "' + name + '" failed: ' + ((e as Error).message ? (e as Error).message : String(e)) }], isError: true },
+            });
+        }
+    }
+
+    if (method === 'ping') return send({ jsonrpc: '2.0', id, result: {} });
+
+    if (id !== undefined) {
+        send({ jsonrpc: '2.0', id, error: { code: -32601, message: 'method not found: ' + method } });
+    }
+}
+
+// ★ THIS MERGE MUST PRECEDE THE `--list` BLOCK BELOW, and it did not before.
+// `--list` is the documented way to see the surface, and it exits immediately — so with the
+// merge further down the file it printed "26 tools" while the running server answered
+// tools/list with 43. The CLI's Agent access screen requires this module (43) and `--list`
+// is run directly (26), so the two disagreed about the same fact, and the one a user reads to
+// decide what the server can do was the wrong one.
+// The operational half of the surface (lifecycle, logs, health, memory, sandbox, swarm,
+// the local decision model). Kept in its own file so this one stays readable; merged here
+// so a client sees ONE tool list.
+const EXTRA = (() => {
+    try { return (require('./mcp-tools-extra') as { TOOLS?: McpToolDefinition[] }).TOOLS || []; } catch (e) {
+        // A failure here must not take the whole server down, or the client cannot even be
+        // told what is missing — but it must be visible, not silent.
+        process.stderr.write('mcp-server: extra tools failed to load: ' + (e as Error).message + '\n');
+        return [];
+    }
+})();
+for (const t of EXTRA) {
+    if (!TOOLS.some((x) => x.name === t.name)) TOOLS.push(t);
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+/** Run the server on stdio, or print the catalogue with --list.
+ *
+ *  Exported because this file is ALSO reachable through its original path
+ *  (src/tools/mcp-server.js), which is a thin shim over the compiled module: an MCP
+ *  client spawns that path, so the shim — not this module — is `require.main`. */
+function main(): void {
+    // Let a human see the surface without wiring it into anything.
+    if (process.argv.includes('--list')) {
+        process.stdout.write('webchat-harness MCP — ' + TOOLS.length + ' tools\n\n');
+        for (const t of TOOLS) {
+            process.stdout.write(t.name + '\n    ' + String(t.description).split('.')[0] + '.\n');
+        }
+        process.exit(0);
+    }
+
+    let buf = '';
+    process.stdin.setEncoding('utf-8');
+    process.stdin.on('data', (chunk: string) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            let msg: JsonRpcRequest;
+            try {
+                msg = JSON.parse(line) as JsonRpcRequest;
+            } catch {
+                // A malformed line is not worth killing the session over.
+                send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } });
+                continue;
+            }
+            // Deliberately not awaited: JSON-RPC allows concurrent requests, and a slow
+            // webchat_ask must not block a status call behind it.
+            handle(msg);
+        }
+    });
+    process.stdin.on('end', () => process.exit(0));
+}
+
+if (require.main === module) main();
+
+export = { TOOLS, handle, main };
