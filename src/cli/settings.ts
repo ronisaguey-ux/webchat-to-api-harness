@@ -958,3 +958,66 @@ function display(setting: SettingRow, value: unknown): string {
       const next = loaded.raw || {};
       setPath(next, dotted, value);
       saveRaw(next, loaded.file);
+    // Re-resolve so the caller learns whether the file write actually took effect.
+    const after = resolve(setting, next);
+    const shadowed = Boolean(after && after.shadowedBy);
+    return {
+        ok: true,
+        value: after ? after.value : value,
+        shadowed,
+        shadowedBy: shadowed ? after.shadowedBy : null,
+    };
+}
+
+    // Reset one setting to its built-in default.
+    //
+    // "Reset" has to strip EVERY layer that could be holding a value, not just the config
+    // file: a setting can be set in the file, shadowed by an environment variable, or both.
+    // Removing only the file value leaves the env var in charge and the setting unchanged,
+    // which reads as "reset did nothing". So this removes the file entry AND the env var,
+    // and reports which of the two it actually removed.
+    function resetSetting(dotted: string): Record<string, unknown> {
+        const setting = BY_PATH.get(dotted);
+        if (!setting) return { ok: false, reason: `unknown setting "${dotted}"` };
+
+        const removed: string[] = [];
+        const { raw, file } = loadRaw();
+        const next = raw || {};
+        if (getPath(next, dotted) !== undefined) {
+            setPath(next, dotted, undefined);
+            saveRaw(next, file);
+            removed.push(path.basename(file));
+        }
+        if (setting.env) {
+            const envFile = envFilePath();
+            let text = '';
+            try { text = fs.readFileSync(envFile, 'utf-8'); } catch { text = ''; }
+            const without = removeEnvVar(text, setting.env);
+            if (without !== text) {
+                fs.writeFileSync(envFile, without, { mode: 0o600 });
+                removed.push(path.basename(envFile));
+            }
+            delete process.env[setting.env];
+        }
+        const after = resolve(setting, loadRaw().raw || {});
+        return {
+            ok: true,
+            path: dotted,
+            value: after ? after.value : setting.default,
+            removedFrom: removed,
+            note: removed.length
+                ? 'Removed from ' + removed.join(' and ') + '.'
+                : 'Already at the default — nothing to remove.',
+        };
+    }
+
+    export = {
+        SCHEMA, BY_PATH,
+        getPath, setPath,
+        parseEnvFile, setEnvVar, removeEnvVar,
+        envFilePath, loadDotenv,
+        configFilePath, loadRaw, saveRaw,
+        coerce, resolve, resolveAll, countShadowed, saveSetting, resetSetting,
+        setDemoMode, isDemoMode,
+        listModes, display,
+    };
